@@ -1,192 +1,88 @@
-name: 🚀 FluxMQ Cross-Platform Release
+name: 🚀 FluxMQ Cross-Platform Release (Fixed)
 
 on:
   push:
     tags: ['v*.*.*']
-  release:
-    types: [created]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Release tag'
-        required: true
-        default: 'v1.0.0'
 
-env:
-  CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-C target-cpu=native"
+permissions:
+  contents: write
 
 jobs:
-  # 1️⃣ 빌드 매트릭스 잡
-  build:
-    name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
+  release:
+    name: Release - ${{ matrix.platform.os_name }}
     strategy:
-      fail-fast: false
       matrix:
-        include:
-          # Linux x64 (가장 중요한 타겟)
-          - target: x86_64-unknown-linux-gnu
+        platform:
+          - os_name: Linux-x86_64
             os: ubuntu-latest
-            name: fluxmq-linux-x64
-            cross: false
+            target: x86_64-unknown-linux-musl
 
-          # Linux ARM64 (AWS Graviton, ARM 서버)
-          - target: aarch64-unknown-linux-gnu
+          - os_name: Linux-aarch64
             os: ubuntu-latest
-            name: fluxmq-linux-arm64
-            cross: true
+            target: aarch64-unknown-linux-musl
 
-          # macOS Intel
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            name: fluxmq-macos-x64
-            cross: false
-
-          # macOS Apple Silicon
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            name: fluxmq-macos-arm64
-            cross: false
-
-          # Windows x64
-          - target: x86_64-pc-windows-msvc
+          - os_name: Windows-x86_64
             os: windows-latest
-            name: fluxmq-windows-x64.exe
-            cross: false
+            target: x86_64-pc-windows-msvc
 
+          - os_name: macOS-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+
+          - os_name: macOS-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+
+    runs-on: ${{ matrix.platform.os }}
     steps:
-      - name: 📥 Checkout code
+      - name: 📥 Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: 🦀 Setup Rust toolchain
-        uses: actions-rs/toolchain@v1
+      - name: 🏗️ Build binary
+        uses: houseabsolute/actions-rust-cross@v0
         with:
-          profile: minimal
+          command: "build"
+          target: ${{ matrix.platform.target }}
           toolchain: stable
-          target: ${{ matrix.target }}
-          override: true
-
-      - name: ⚡ Setup Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: 🔧 Install cross (for ARM builds)
-        if: matrix.cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
-      - name: 🏗️ Build optimized binary
-        run: |
-          if [[ "${{ matrix.cross }}" == "true" ]]; then
-            cross build --release --target ${{ matrix.target }} --bin fluxmq
-          else
-            cargo build --release --target ${{ matrix.target }} --bin fluxmq
-          fi
-        working-directory: core
+          args: "--locked --release"
+          strip: true
+          working-directory: core
 
       - name: 📦 Package binary
         shell: bash
         run: |
-          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            mv core/target/${{ matrix.target }}/release/fluxmq.exe ${{ matrix.name }}
-          else
-            mv core/target/${{ matrix.target }}/release/fluxmq ${{ matrix.name }}
-            chmod +x ${{ matrix.name }}
+          cd core
+          bin_suffix=""
+          if [[ "${{ matrix.platform.target }}" == *"-windows-"* ]]; then
+            bin_suffix=".exe"
           fi
 
-      - name: ✅ Test binary (non-cross builds only)
-        if: '!matrix.cross'
-        shell: bash
-        run: |
-          ./${{ matrix.name }} --version
-          ./${{ matrix.name }} --help
+          bin_name="fluxmq${bin_suffix}"
+          bin_path="target/${{ matrix.platform.target }}/release/${bin_name}"
 
-      - name: 📄 Generate checksums
+          # Create release name
+          release_name="fluxmq-${{ matrix.platform.os_name }}${bin_suffix}"
+          cp "${bin_path}" "../${release_name}"
+
+      - name: 📄 Generate checksum
         shell: bash
         run: |
-          if command -v sha256sum >/dev/null; then
-            sha256sum ${{ matrix.name }} > ${{ matrix.name }}.sha256
-          else
-            shasum -a 256 ${{ matrix.name }} > ${{ matrix.name }}.sha256
+          release_name="fluxmq-${{ matrix.platform.os_name }}"
+          if [[ "${{ matrix.platform.target }}" == *"-windows-"* ]]; then
+            release_name="${release_name}.exe"
           fi
 
-      - name: 🆙 Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.name }}
-          path: |
-            ${{ matrix.name }}
-            ${{ matrix.name }}.sha256
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${release_name}" > "${release_name}.sha256"
+          else
+            shasum -a 256 "${release_name}" > "${release_name}.sha256"
+          fi
 
-  # 2️⃣ 릴리스 게시 잡
-  release:
-    name: 📦 Create GitHub Release
-    needs: build
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-
-    steps:
-      - name: 📥 Checkout code
-        uses: actions/checkout@v4
-
-      - name: ⬇️ Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: 📝 Generate release notes
-        id: release_notes
-        run: |
-          cat << EOF > RELEASE_NOTES.md
-          # 🚀 FluxMQ ${GITHUB_REF#refs/tags/}
-
-          ## ⚡ Performance Highlights
-          - **Ultra-High Throughput**: 601,379+ msg/sec with MegaBatch optimization
-          - **100% Kafka Compatibility**: Full Java Kafka client support
-          - **Cross-Platform**: Native binaries for all major platforms
-
-          ## 📦 Downloads
-          Choose the binary for your platform:
-
-          ### Linux
-          - **x64**: \`fluxmq-linux-x64\` - Intel/AMD 64-bit servers
-          - **ARM64**: \`fluxmq-linux-arm64\` - ARM servers (AWS Graviton, etc.)
-
-          ### macOS
-          - **x64**: \`fluxmq-macos-x64\` - Intel Macs
-          - **ARM64**: \`fluxmq-macos-arm64\` - Apple Silicon Macs
-
-          ### Windows
-          - **x64**: \`fluxmq-windows-x64.exe\` - Windows servers/desktops
-
-          ## 🚀 Quick Start
-          \`\`\`bash
-          # Linux/macOS
-          chmod +x fluxmq-*
-          ./fluxmq-* --port 9092 --enable-consumer-groups
-
-          # Windows
-          fluxmq-windows-x64.exe --port 9092 --enable-consumer-groups
-          \`\`\`
-
-          ## ✅ Verification
-          All binaries include SHA256 checksums for integrity verification.
-
-          ---
-
-          **Full Changelog**: https://github.com/gosuda/fluxmq/compare/v1.0.0...${GITHUB_REF#refs/tags/}
-          EOF
-
-      - name: 🎉 Create GitHub Release
+      - name: 🎉 Release
         uses: softprops/action-gh-release@v1
         with:
-          files: artifacts/*/*
-          body_path: RELEASE_NOTES.md
-          name: FluxMQ ${{ github.ref_name }}
-          draft: false
-          prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
+          files: |
+            fluxmq-${{ matrix.platform.os_name }}*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
