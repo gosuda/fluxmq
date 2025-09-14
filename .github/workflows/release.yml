@@ -46,8 +46,7 @@ jobs:
         with:
           use-cross: true
           command: build
-          args: --release --target ${{ matrix.target }}
-        working-directory: core
+          args: --release --target ${{ matrix.target }} --manifest-path core/Cargo.toml
 
       - name: 📦 Package
         shell: bash
