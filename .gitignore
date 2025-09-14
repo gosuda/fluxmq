@@ -1,0 +1,5 @@
+target/
+data/
+node_modules/
+kafka-4.1.0-src/
+claude.md

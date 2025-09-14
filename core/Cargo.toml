@@ -1,0 +1,75 @@
+[package]
+name = "fluxmq"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description.workspace = true
+
+[[bin]]
+name = "fluxmq"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+memmap2.workspace = true
+crc32fast.workspace = true
+
+# Concurrency
+crossbeam = { workspace = true }
+parking_lot = { workspace = true }
+
+# Low-level networking
+socket2 = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging and monitoring
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+metrics = { workspace = true }
+
+# Configuration
+config = { workspace = true }
+clap = { workspace = true }
+
+# Random number generation
+rand = { workspace = true }
+
+# CPU and memory optimization
+num_cpus = "1.16"
+crossbeam-channel = "0.5"
+
+# TLS support
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+
+# Configuration
+toml = { workspace = true }
+dashmap.workspace = true
+
+# Time utilities for examples
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+criterion = { workspace = true }
+tempfile = { workspace = true }
