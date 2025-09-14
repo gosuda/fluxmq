@@ -202,12 +202,26 @@ crate::FluxmqError::Network("Batch processing channel closed".to_string())
                 MessageBatch::new(key.0.clone(), key.1)
             });
             
-            // Add messages to batch
-            for message in pending.messages {
-                batch_ref.add_message(message, pending.response_tx);
-                // Note: We break early since oneshot can only be used once
-                // In real implementation, we'd need to handle multiple messages differently
-                break;
+            // Handle multiple messages properly
+            if pending.messages.len() == 1 {
+                // Single message - add normally
+                if let Some(message) = pending.messages.into_iter().next() {
+                    batch_ref.add_message(message, pending.response_tx);
+                }
+            } else {
+                // Multiple messages - add all but only use response channel for first
+                let mut messages_iter = pending.messages.into_iter();
+                
+                // Add first message with response channel
+                if let Some(first_message) = messages_iter.next() {
+                    batch_ref.add_message(first_message, pending.response_tx);
+                }
+                
+                // Add remaining messages with dummy channels (they'll be handled in flush)
+                for message in messages_iter {
+                    let (dummy_tx, _dummy_rx) = oneshot::channel();
+                    batch_ref.add_message(message, dummy_tx);
+                }
             }
             
             // Check if batch is ready for flushing
