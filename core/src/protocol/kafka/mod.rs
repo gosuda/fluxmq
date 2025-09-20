@@ -52,10 +52,6 @@ pub const API_KEY_PRODUCE: i16 = 0;
 pub const API_KEY_FETCH: i16 = 1;
 pub const API_KEY_LIST_OFFSETS: i16 = 2;
 pub const API_KEY_METADATA: i16 = 3;
-pub const API_KEY_LEADER_AND_ISR: i16 = 4;
-pub const API_KEY_STOP_REPLICA: i16 = 5;
-pub const API_KEY_UPDATE_METADATA: i16 = 6;
-pub const API_KEY_CONTROLLED_SHUTDOWN: i16 = 7;
 
 /// Kafka API Keys - Consumer group APIs
 pub const API_KEY_OFFSET_COMMIT: i16 = 8;
@@ -76,6 +72,9 @@ pub const API_KEY_DELETE_TOPICS: i16 = 20;
 pub const API_KEY_DESCRIBE_CONFIGS: i16 = 32;
 pub const API_KEY_ALTER_CONFIGS: i16 = 33;
 pub const API_KEY_SASL_AUTHENTICATE: i16 = 36;
+
+/// KIP-714 - Client metrics and observability
+pub const API_KEY_GET_TELEMETRY_SUBSCRIPTIONS: i16 = 71;
 
 /// Protocol detection magic bytes
 /// Kafka requests typically start with message length > 0 and reasonable API keys (0-50)
@@ -112,10 +111,6 @@ pub fn is_kafka_request(data: &[u8]) -> bool {
             | API_KEY_FETCH
             | API_KEY_LIST_OFFSETS
             | API_KEY_METADATA
-            | API_KEY_LEADER_AND_ISR
-            | API_KEY_STOP_REPLICA
-            | API_KEY_UPDATE_METADATA
-            | API_KEY_CONTROLLED_SHUTDOWN
             | API_KEY_OFFSET_COMMIT
             | API_KEY_OFFSET_FETCH
             | API_KEY_LIST_GROUPS

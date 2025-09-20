@@ -1,5 +1,14 @@
 #![allow(dead_code)]
 use crate::performance::numa_allocator::{init_thread_local_numa_allocator, NumaAwareAllocator};
+
+// Global allocator configuration for maximum performance
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// Custom high-performance allocators for FluxMQ
 ///
 /// Implements specialized allocators to achieve 400k+ msg/sec throughput:
@@ -686,6 +695,18 @@ impl CustomAllocatorManager {
     }
 }
 
+/// Get information about the currently active global allocator
+pub fn get_global_allocator_info() -> &'static str {
+    #[cfg(feature = "jemalloc")]
+    return "jemalloc (TiKV) - High-performance allocator optimized for server workloads";
+
+    #[cfg(feature = "mimalloc")]
+    return "mimalloc (Microsoft) - Fast allocator with excellent security features";
+
+    #[cfg(not(any(feature = "jemalloc", feature = "mimalloc")))]
+    return "System default (glibc malloc/macOS malloc) - Standard system allocator";
+}
+
 #[derive(Debug, Clone)]
 pub struct CustomAllocatorStats {
     pub arena: ArenaStats,
@@ -700,6 +721,13 @@ impl CustomAllocatorStats {
         let mut report = String::new();
 
         report.push_str("Custom Allocator Statistics:\n\n");
+
+        // Global allocator information
+        report.push_str(&format!(
+            "Global Allocator: {}\n",
+            get_global_allocator_info()
+        ));
+        report.push_str("\n");
 
         // Arena allocator
         report.push_str(&format!(
@@ -751,4 +779,41 @@ impl CustomAllocatorStats {
 
         report
     }
+}
+
+/// Configure jemalloc for optimal FluxMQ performance
+#[cfg(feature = "jemalloc")]
+pub fn configure_jemalloc_optimizations() {
+    // jemalloc can be tuned via environment variables or mallctl calls
+    // For production FluxMQ deployments, consider these optimizations:
+
+    tracing::info!("🚀 jemalloc global allocator active - optimized for server workloads");
+    tracing::info!("💡 For optimal performance, consider setting:");
+    tracing::info!("   MALLOC_CONF=background_thread:true,metadata_thp:auto,dirty_decay_ms:5000");
+
+    // Note: In practice, you might use mallctl() calls here to configure jemalloc
+    // programmatically instead of relying on environment variables
+}
+
+/// Configure mimalloc for optimal FluxMQ performance
+#[cfg(feature = "mimalloc")]
+pub fn configure_mimalloc_optimizations() {
+    tracing::info!("🚀 mimalloc global allocator active - Microsoft's high-performance allocator");
+    tracing::info!(
+        "💡 mimalloc provides excellent out-of-the-box performance for messaging workloads"
+    );
+
+    // mimalloc generally doesn't need manual tuning - it's designed to be fast by default
+}
+
+/// Initialize global allocator optimizations if available
+pub fn initialize_global_allocator_optimizations() {
+    #[cfg(feature = "jemalloc")]
+    configure_jemalloc_optimizations();
+
+    #[cfg(feature = "mimalloc")]
+    configure_mimalloc_optimizations();
+
+    #[cfg(not(any(feature = "jemalloc", feature = "mimalloc")))]
+    tracing::info!("📦 Using system default allocator - consider enabling 'jemalloc' or 'mimalloc' feature for better performance");
 }

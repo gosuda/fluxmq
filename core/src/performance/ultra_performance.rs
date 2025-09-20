@@ -6,6 +6,7 @@ use crate::performance::{
     lockfree_storage::LockFreeMessageStorage,
     mmap_storage::{MMapStorageConfig, MemoryMappedStorage},
     network_simple::SimpleNetworkOptimizer,
+    numa_allocator::{init_thread_local_numa_allocator, NumaAwareAllocator},
     simd_optimizations::SIMDBatchProcessor,
 };
 /// Ultra-high performance system combining all optimizations for 400k+ msg/sec
@@ -84,6 +85,9 @@ pub struct UltraPerformanceBroker {
     // Java client-optimized arena memory allocation
     arena_allocator: ArenaAllocator,
 
+    // NUMA-aware memory allocation for ultra-performance
+    numa_allocator: Arc<NumaAwareAllocator>,
+
     // Fallback storage for compatibility
     messages: Arc<RwLock<HashMap<(String, PartitionId), Vec<(Offset, Message)>>>>,
     next_offset: Arc<RwLock<HashMap<(String, PartitionId), Offset>>>,
@@ -144,6 +148,7 @@ impl UltraPerformanceBroker {
             simd_processor: SIMDBatchProcessor::new(),
             io_optimizer: IOOptimizationManager::new(),
             arena_allocator: ArenaAllocator::with_config(arena_config),
+            numa_allocator: init_thread_local_numa_allocator(),
             messages: Arc::new(RwLock::new(HashMap::new())),
             next_offset: Arc::new(RwLock::new(HashMap::new())),
             total_messages: AtomicU64::new(0),
@@ -689,6 +694,18 @@ impl UltraPerformanceBroker {
     pub fn get_arena_stats(&self) -> String {
         let stats = self.arena_allocator.get_stats();
         stats.report()
+    }
+
+    /// Get NUMA allocator statistics for monitoring
+    pub fn get_numa_stats(&self) -> String {
+        let numa_stats = self.numa_allocator.get_comprehensive_stats();
+        numa_stats.report()
+    }
+
+    /// Get SIMD batch processor statistics for monitoring
+    pub fn get_simd_stats(&self) -> String {
+        let simd_stats = self.simd_processor.get_batch_stats();
+        simd_stats.report()
     }
 
     /// Update performance metrics

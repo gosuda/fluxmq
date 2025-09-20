@@ -1,10 +1,10 @@
-use super::{BrokerId, LogEntry, ReplicationConfig, ReplicationMessage};
+use super::{BrokerId, LogEntry, ReplicationConfig, ReplicationMessage, ReplicationNetworkManager};
 use crate::protocol::{Message, Offset, PartitionId, TopicName};
 use crate::storage::HybridStorage;
 use crate::Result;
 use crossbeam::channel;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tokio::time::interval;
@@ -31,6 +31,9 @@ pub struct LeaderState {
     /// Channel for receiving replication responses
     response_rx: Arc<tokio::sync::Mutex<Option<channel::Receiver<ReplicationMessage>>>>,
     _response_tx: channel::Sender<ReplicationMessage>,
+
+    /// Network manager for sending replication messages
+    network_manager: Arc<RwLock<Option<Weak<ReplicationNetworkManager>>>>,
 }
 
 /// Progress tracking for a follower
@@ -85,6 +88,7 @@ impl LeaderState {
             match_index: Arc::new(RwLock::new(match_index)),
             response_rx: Arc::new(tokio::sync::Mutex::new(Some(response_rx))),
             _response_tx: response_tx,
+            network_manager: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -176,7 +180,7 @@ impl LeaderState {
         let prev_log_offset = if next_index > 0 { next_index - 1 } else { 0 };
         let leader_commit = self.get_commit_index(storage.clone()).await?;
 
-        let _request = ReplicationMessage::ReplicateRequest {
+        let request = ReplicationMessage::ReplicateRequest {
             topic: self.topic.clone(),
             partition: self.partition,
             leader_epoch: self.term,
@@ -185,16 +189,44 @@ impl LeaderState {
             leader_commit,
         };
 
-        // In a real implementation, this would send over network to the follower
-        debug!(
-            "Sending {} entries to follower {} for {}:{}, prev_offset: {}, commit: {}",
-            entries.len(),
-            follower_id,
-            self.topic,
-            self.partition,
-            prev_log_offset,
-            leader_commit
-        );
+        // Send the actual replication request over network
+        if let Some(network_manager) = self.get_network_manager().await {
+            match network_manager
+                .send_replication_message(follower_id, request)
+                .await
+            {
+                Ok(_) => {
+                    debug!(
+                        "Successfully sent {} entries to follower {} for {}:{}, prev_offset: {}, commit: {}",
+                        entries.len(),
+                        follower_id,
+                        self.topic,
+                        self.partition,
+                        prev_log_offset,
+                        leader_commit
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to send replication request to follower {}: {}",
+                        follower_id, e
+                    );
+                    // Mark follower as potentially offline for health check
+                    self.mark_follower_unhealthy(follower_id).await;
+                }
+            }
+        } else {
+            // Fallback for local testing without network
+            debug!(
+                "No network manager available, simulating send of {} entries to follower {} for {}:{}, prev_offset: {}, commit: {}",
+                entries.len(),
+                follower_id,
+                self.topic,
+                self.partition,
+                prev_log_offset,
+                leader_commit
+            );
+        }
 
         Ok(())
     }
@@ -234,17 +266,42 @@ impl LeaderState {
             follower_states.keys().copied().collect()
         };
 
-        let _heartbeat = ReplicationMessage::Heartbeat {
+        let heartbeat = ReplicationMessage::Heartbeat {
             leader_id: self.broker_id,
             term: self.term,
             commit_index,
         };
 
-        for follower_id in followers {
-            debug!(
-                "Sending heartbeat to follower {} for {}:{}, term: {}, commit: {}",
-                follower_id, self.topic, self.partition, self.term, commit_index
-            );
+        if let Some(network_manager) = self.get_network_manager().await {
+            for follower_id in followers {
+                match network_manager
+                    .send_replication_message(follower_id, heartbeat.clone())
+                    .await
+                {
+                    Ok(_) => {
+                        debug!(
+                            "Successfully sent heartbeat to follower {} for {}:{}, term: {}, commit: {}",
+                            follower_id, self.topic, self.partition, self.term, commit_index
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to send heartbeat to follower {}: {}",
+                            follower_id, e
+                        );
+                        // Mark follower as potentially offline
+                        self.mark_follower_unhealthy(follower_id).await;
+                    }
+                }
+            }
+        } else {
+            // Fallback for local testing without network
+            for follower_id in followers {
+                debug!(
+                    "No network manager available, simulating heartbeat to follower {} for {}:{}, term: {}, commit: {}",
+                    follower_id, self.topic, self.partition, self.term, commit_index
+                );
+            }
         }
 
         Ok(())
@@ -395,6 +452,34 @@ impl LeaderState {
         }
 
         isr
+    }
+
+    /// Set the network manager for this leader
+    pub async fn set_network_manager(&self, network_manager: Arc<ReplicationNetworkManager>) {
+        let mut nm = self.network_manager.write().await;
+        *nm = Some(Arc::downgrade(&network_manager));
+    }
+
+    /// Get the network manager if available
+    async fn get_network_manager(&self) -> Option<Arc<ReplicationNetworkManager>> {
+        let nm = self.network_manager.read().await;
+        if let Some(weak_nm) = nm.as_ref() {
+            weak_nm.upgrade()
+        } else {
+            None
+        }
+    }
+
+    /// Mark a follower as unhealthy for faster detection
+    async fn mark_follower_unhealthy(&self, follower_id: BrokerId) {
+        let mut followers = self.follower_states.write().await;
+        if let Some(progress) = followers.get_mut(&follower_id) {
+            progress.is_alive = false;
+            warn!(
+                "Marked follower {} as unhealthy for {}:{}",
+                follower_id, self.topic, self.partition
+            );
+        }
     }
 }
 

@@ -20,7 +20,7 @@ use crate::{
 };
 use std::sync::Arc;
 use tokio::sync::broadcast::error::RecvError;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Enhanced topic description structure for detailed metadata
 #[derive(Debug, Clone)]
@@ -332,18 +332,54 @@ impl MessageHandler {
                 .topic_manager
                 .partition_exists(&request.topic, request.partition)
             {
-                let topic_clone = request.topic.clone();
-                return Ok(Response::Produce(ProduceResponse {
-                    correlation_id: request.correlation_id,
-                    topic: request.topic,
-                    partition: request.partition,
-                    base_offset: 0,
-                    error_code: 3, // Unknown topic or partition
-                    error_message: Some(format!(
-                        "Partition {} does not exist for topic {}",
-                        request.partition, topic_clone
-                    )),
-                }));
+                // Try to auto-create the topic if it doesn't exist
+                match self.topic_manager.ensure_topic_exists(&request.topic) {
+                    Ok(_) => {
+                        info!(
+                            "Auto-created topic '{}' for produce request from Java client",
+                            request.topic
+                        );
+                        // Update metrics after topic creation
+                        self.update_topic_metrics();
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to auto-create topic '{}' for produce request: {}",
+                            request.topic, e
+                        );
+                        let topic_clone = request.topic.clone();
+                        return Ok(Response::Produce(ProduceResponse {
+                            correlation_id: request.correlation_id,
+                            topic: request.topic,
+                            partition: request.partition,
+                            base_offset: 0,
+                            error_code: 3, // Unknown topic or partition
+                            error_message: Some(format!(
+                                "Partition {} does not exist for topic {} and auto-creation failed: {}",
+                                request.partition, topic_clone, e
+                            )),
+                        }));
+                    }
+                }
+
+                // Check again if partition exists after auto-creation
+                if !self
+                    .topic_manager
+                    .partition_exists(&request.topic, request.partition)
+                {
+                    let topic_clone = request.topic.clone();
+                    return Ok(Response::Produce(ProduceResponse {
+                        correlation_id: request.correlation_id,
+                        topic: request.topic,
+                        partition: request.partition,
+                        base_offset: 0,
+                        error_code: 3, // Unknown topic or partition
+                        error_message: Some(format!(
+                            "Partition {} does not exist for topic {} even after auto-creation",
+                            request.partition, topic_clone
+                        )),
+                    }));
+                }
             }
             request.partition
         };
@@ -1045,6 +1081,7 @@ impl MessageHandler {
         topic: &str,
         partition: PartitionId,
     ) -> Option<(i16, String)> {
+        // First check if topic exists
         if let Some(topic_metadata) = self.topic_manager.get_topic(topic) {
             if partition >= topic_metadata.num_partitions {
                 Some((
@@ -1058,7 +1095,38 @@ impl MessageHandler {
                 None // Valid topic and partition
             }
         } else {
-            Some((3, format!("Topic {} does not exist", topic)))
+            // Topic doesn't exist, try to auto-create it
+            match self.topic_manager.ensure_topic_exists(topic) {
+                Ok(_) => {
+                    info!(
+                        "Auto-created topic '{}' for fetch request from Java client",
+                        topic
+                    );
+                    // Check partition validity after auto-creation
+                    if let Some(topic_metadata) = self.topic_manager.get_topic(topic) {
+                        if partition >= topic_metadata.num_partitions {
+                            Some((
+                                3,
+                                format!(
+                                    "Partition {} does not exist for auto-created topic {} (has {} partitions)",
+                                    partition, topic, topic_metadata.num_partitions
+                                ),
+                            ))
+                        } else {
+                            None // Valid topic and partition after auto-creation
+                        }
+                    } else {
+                        Some((3, format!("Topic {} auto-creation succeeded but topic not found", topic)))
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to auto-create topic '{}' for fetch request: {}",
+                        topic, e
+                    );
+                    Some((3, format!("Topic {} does not exist and auto-creation failed: {}", topic, e)))
+                }
+            }
         }
     }
 

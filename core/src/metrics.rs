@@ -322,8 +322,8 @@ impl ThroughputMetrics {
 
     #[inline(always)]
     pub fn record_consumed(&self, count: u64, bytes: u64) {
-        self.messages_consumed.0.fetch_add(count, Ordering::Relaxed);
-        self.bytes_consumed.0.fetch_add(bytes, Ordering::Relaxed);
+        self.messages_consumed.0.fetch_add(count, Ordering::Release);
+        self.bytes_consumed.0.fetch_add(bytes, Ordering::Release);
     }
 
     pub fn calculate_rates(&self) {

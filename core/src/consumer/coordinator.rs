@@ -20,7 +20,8 @@ pub struct ConsumerGroupCoordinator {
     groups: Arc<RwLock<HashMap<ConsumerGroupId, ConsumerGroupMetadata>>>,
     /// Topic manager for partition information
     topic_manager: Arc<TopicManager>,
-    /// Storage for offset commits
+    /// Storage for offset commits (future use)
+    #[allow(dead_code)]
     storage: Option<Arc<HybridStorage>>,
     /// In-memory offset storage for fast access
     offset_storage: Arc<RwLock<HashMap<(ConsumerGroupId, TopicName, PartitionId), ConsumerOffset>>>,
@@ -77,6 +78,56 @@ struct SerializableGroupMember {
     pub assigned_partitions: Vec<TopicPartition>,
     pub last_heartbeat: u64, // Unix timestamp in seconds
     pub is_leader: bool,
+}
+
+/// Serializable version of ConsumerOffset that handles SystemTime
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SerializableConsumerOffset {
+    pub group_id: ConsumerGroupId,
+    pub topic: TopicName,
+    pub partition: PartitionId,
+    pub offset: i64,
+    pub metadata: Option<String>,
+    pub commit_timestamp: u64,         // Unix timestamp in seconds
+    pub expire_timestamp: Option<u64>, // Unix timestamp in seconds
+}
+
+impl From<&ConsumerOffset> for SerializableConsumerOffset {
+    fn from(offset: &ConsumerOffset) -> Self {
+        Self {
+            group_id: offset.group_id.clone(),
+            topic: offset.topic.clone(),
+            partition: offset.partition,
+            offset: offset.offset,
+            metadata: offset.metadata.clone(),
+            commit_timestamp: offset
+                .commit_timestamp
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            expire_timestamp: offset.expire_timestamp.map(|ts| {
+                ts.duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            }),
+        }
+    }
+}
+
+impl From<SerializableConsumerOffset> for ConsumerOffset {
+    fn from(offset: SerializableConsumerOffset) -> Self {
+        Self {
+            group_id: offset.group_id,
+            topic: offset.topic,
+            partition: offset.partition,
+            offset: offset.offset,
+            metadata: offset.metadata,
+            commit_timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(offset.commit_timestamp),
+            expire_timestamp: offset
+                .expire_timestamp
+                .map(|ts| SystemTime::UNIX_EPOCH + Duration::from_secs(ts)),
+        }
+    }
 }
 
 impl ConsumerGroupCoordinator {
@@ -1194,15 +1245,22 @@ impl ConsumerGroupCoordinator {
                 expire_timestamp,
             };
 
+            // Clone before moving for disk persistence
+            let consumer_offset_for_disk = consumer_offset.clone();
             offset_storage.insert(key, consumer_offset);
 
-            // TODO: Persist to disk storage if available
-            if let Some(_storage) = &self.storage {
-                // For now, skip disk persistence - would be implemented later
-                debug!(
-                    "Would persist offset to disk: group={}, topic={}, partition={}, offset={}",
-                    group_id, offset.topic, offset.partition, offset.offset
-                );
+            // Persist to disk storage if available
+            if self.metadata_dir.is_some() {
+                if let Err(e) = self
+                    .persist_offset_to_disk(&group_id, &consumer_offset_for_disk)
+                    .await
+                {
+                    error!(
+                        "Failed to persist offset to disk for group {}, topic {}, partition {}: {}",
+                        group_id, offset.topic, offset.partition, e
+                    );
+                    // Continue execution - disk persistence failure shouldn't block the operation
+                }
             }
         }
 
@@ -1771,5 +1829,155 @@ impl ConsumerGroupCoordinator {
         }
 
         Ok(topics)
+    }
+
+    /// Save consumer offset to disk storage
+    async fn persist_offset_to_disk(
+        &self,
+        group_id: &ConsumerGroupId,
+        consumer_offset: &ConsumerOffset,
+    ) -> Result<()> {
+        if let Some(metadata_dir) = &self.metadata_dir {
+            let offsets_dir = metadata_dir.join("offsets");
+
+            // Ensure offsets directory exists
+            if let Err(e) = fs::create_dir_all(&offsets_dir).await {
+                error!(
+                    "Failed to create offsets directory {:?}: {}",
+                    offsets_dir, e
+                );
+                return Err(crate::FluxmqError::Storage(e));
+            }
+
+            let group_file = offsets_dir.join(format!("{}.json", group_id));
+
+            // Read existing offsets for this group
+            let mut group_offsets: Vec<SerializableConsumerOffset> = if group_file.exists() {
+                match fs::read_to_string(&group_file).await {
+                    Ok(content) => match serde_json::from_str(&content) {
+                        Ok(offsets) => offsets,
+                        Err(e) => {
+                            warn!(
+                                "Failed to parse existing offsets for group {}: {}",
+                                group_id, e
+                            );
+                            Vec::new()
+                        }
+                    },
+                    Err(e) => {
+                        warn!(
+                            "Failed to read existing offsets for group {}: {}",
+                            group_id, e
+                        );
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+
+            // Update or add the offset
+            let serializable_offset = SerializableConsumerOffset::from(consumer_offset);
+            let key = (consumer_offset.topic.as_str(), consumer_offset.partition);
+
+            // Remove existing offset for same topic-partition
+            group_offsets.retain(|offset| (offset.topic.as_str(), offset.partition) != key);
+
+            // Add the new offset
+            group_offsets.push(serializable_offset);
+
+            // Write back to disk
+            match serde_json::to_string_pretty(&group_offsets) {
+                Ok(json_content) => {
+                    if let Err(e) = fs::write(&group_file, json_content).await {
+                        error!("Failed to write offsets to {:?}: {}", group_file, e);
+                        return Err(crate::FluxmqError::Storage(e));
+                    }
+                    debug!(
+                        "Persisted offset to disk: group={}, topic={}, partition={}, offset={}",
+                        group_id,
+                        consumer_offset.topic,
+                        consumer_offset.partition,
+                        consumer_offset.offset
+                    );
+                }
+                Err(e) => {
+                    error!("Failed to serialize offsets for group {}: {}", group_id, e);
+                    return Err(crate::FluxmqError::Json(e));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Load consumer offsets from disk storage on startup
+    pub async fn load_offsets_from_disk(&self) -> Result<()> {
+        if let Some(metadata_dir) = &self.metadata_dir {
+            let offsets_dir = metadata_dir.join("offsets");
+
+            if !offsets_dir.exists() {
+                debug!("Offsets directory does not exist: {:?}", offsets_dir);
+                return Ok(());
+            }
+
+            let mut entries = match fs::read_dir(&offsets_dir).await {
+                Ok(entries) => entries,
+                Err(e) => {
+                    warn!("Failed to read offsets directory {:?}: {}", offsets_dir, e);
+                    return Ok(());
+                }
+            };
+
+            let mut total_loaded = 0;
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+
+                if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                    continue;
+                }
+
+                let _group_id = match path.file_stem().and_then(|s| s.to_str()) {
+                    Some(id) => id.to_string(),
+                    None => continue,
+                };
+
+                // Read and parse the group's offset file
+                match fs::read_to_string(&path).await {
+                    Ok(content) => {
+                        match serde_json::from_str::<Vec<SerializableConsumerOffset>>(&content) {
+                            Ok(serializable_offsets) => {
+                                let mut offset_storage = self.offset_storage.write().await;
+
+                                for serializable_offset in serializable_offsets {
+                                    let consumer_offset = ConsumerOffset::from(serializable_offset);
+                                    let key = (
+                                        consumer_offset.group_id.clone(),
+                                        consumer_offset.topic.clone(),
+                                        consumer_offset.partition,
+                                    );
+                                    offset_storage.insert(key, consumer_offset);
+                                    total_loaded += 1;
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to parse offset file {:?}: {}", path, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to read offset file {:?}: {}", path, e);
+                    }
+                }
+            }
+
+            if total_loaded > 0 {
+                info!("Loaded {} consumer offsets from disk storage", total_loaded);
+            } else {
+                debug!("No consumer offsets found on disk");
+            }
+        }
+
+        Ok(())
     }
 }

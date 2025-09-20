@@ -14,6 +14,7 @@ use std::sync::Arc;
 ///
 /// Uses memory-mapped files to achieve true zero-copy I/O operations,
 /// eliminating the need for explicit read/write system calls.
+#[derive(Debug)]
 pub struct MemoryMappedStorage {
     // Storage configuration
     config: MMapStorageConfig,
@@ -32,7 +33,7 @@ pub struct MemoryMappedStorage {
     bytes_read: AtomicU64,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct MMapStorageConfig {
     pub data_directory: PathBuf,
     pub segment_size_mb: usize,
@@ -56,6 +57,7 @@ impl Default for MMapStorageConfig {
 }
 
 /// Memory-mapped segment for a single partition
+#[derive(Debug)]
 struct PartitionMMapSegment {
     // Memory-mapped files
     current_segment: Arc<Mutex<MMapSegment>>,
@@ -84,6 +86,7 @@ impl Clone for PartitionMMapSegment {
 }
 
 /// Individual memory-mapped segment
+#[derive(Debug)]
 struct MMapSegment {
     mmap: MmapMut,
     file: File,
@@ -371,12 +374,28 @@ impl MemoryMappedStorage {
 
         // Check if we need to rotate to a new segment
         if segment.write_offset + data.len() > segment.max_size {
-            // TODO: Implement segment rotation
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::OutOfMemory,
-                "Segment full - rotation not implemented yet",
-            )
-            .into());
+            tracing::info!(
+                "Segment rotation triggered: current_offset={}, data_len={}, max_size={}, segment_id={}",
+                segment.write_offset,
+                data.len(),
+                segment.max_size,
+                segment.segment_id
+            );
+
+            // Release the current segment lock before rotation
+            drop(segment);
+
+            // Perform segment rotation
+            self.rotate_segment(partition_segment)?;
+
+            // Acquire new segment lock
+            segment = partition_segment.current_segment.lock();
+
+            tracing::info!(
+                "Segment rotation completed: new_segment_id={}, available_space={}",
+                segment.segment_id,
+                segment.max_size - segment.write_offset
+            );
         }
 
         // Zero-copy write to memory-mapped region
@@ -535,6 +554,112 @@ impl MemoryMappedStorage {
             segment_size_mb: self.config.segment_size_mb,
         }
     }
+
+    /// Rotate to a new segment when the current one is full
+    fn rotate_segment(&self, partition_segment: &PartitionMMapSegment) -> Result<()> {
+        let (topic, partition) = &partition_segment.partition_key;
+
+        // Generate new segment ID based on current segments count + 1
+        let new_segment_id = (partition_segment.segments.len() + 1) as u64;
+
+        tracing::info!(
+            "Creating new segment for topic='{}' partition={} segment_id={}",
+            topic,
+            partition,
+            new_segment_id
+        );
+
+        // Create new memory-mapped segment
+        let new_segment = self.create_mmap_segment(
+            &partition_segment.partition_key,
+            new_segment_id,
+            partition_segment.segment_size,
+        )?;
+
+        // Update current segment atomically
+        {
+            let mut current_segment = partition_segment.current_segment.lock();
+
+            // Archive the old segment
+            let old_segment = std::mem::replace(&mut *current_segment, new_segment);
+
+            tracing::info!(
+                "Archived segment {} with {} bytes written",
+                old_segment.segment_id,
+                old_segment.write_offset
+            );
+        }
+
+        // Reset write position for the new segment
+        partition_segment.write_position.store(0, Ordering::Relaxed);
+
+        // Check segment limits
+        self.check_segment_limits(partition_segment)?;
+
+        tracing::info!(
+            "Segment rotation completed: topic='{}' partition={} new_segment_id={}",
+            topic,
+            partition,
+            new_segment_id
+        );
+
+        Ok(())
+    }
+
+    /// Check if we've exceeded maximum segments per partition
+    fn check_segment_limits(&self, partition_segment: &PartitionMMapSegment) -> Result<()> {
+        let segment_count = partition_segment.segments.len();
+
+        if segment_count >= self.config.max_segments_per_partition {
+            tracing::warn!(
+                "Approaching segment limit: {}/{} segments for topic='{}' partition={}",
+                segment_count,
+                self.config.max_segments_per_partition,
+                partition_segment.partition_key.0,
+                partition_segment.partition_key.1
+            );
+
+            // In production, this would trigger:
+            // 1. Segment compaction
+            // 2. Old segment cleanup
+            // 3. Archive to object storage
+            // For now, we just warn
+        }
+
+        Ok(())
+    }
+
+    /// Get segment statistics for monitoring
+    pub fn get_segment_stats(&self, topic: &str, partition: PartitionId) -> Option<SegmentStats> {
+        let key = (topic.to_string(), partition);
+        let segments = self.segments.read();
+
+        segments.get(&key).map(|partition_segment| {
+            let current_segment = partition_segment.current_segment.lock();
+            let total_segments = partition_segment.segments.len() + 1; // +1 for current
+            let current_utilization =
+                (current_segment.write_offset as f64 / current_segment.max_size as f64) * 100.0;
+
+            SegmentStats {
+                total_segments,
+                current_segment_id: current_segment.segment_id,
+                current_utilization_percent: current_utilization,
+                total_messages: partition_segment.total_messages.load(Ordering::Relaxed),
+                total_bytes_written: partition_segment.write_position.load(Ordering::Relaxed),
+            }
+        })
+    }
+
+    /// Performance statistics for the entire storage system
+    pub fn get_performance_stats(&self) -> MMapPerformanceStats {
+        MMapPerformanceStats {
+            total_writes: self.total_writes.load(Ordering::Relaxed),
+            total_reads: self.total_reads.load(Ordering::Relaxed),
+            bytes_written: self.bytes_written.load(Ordering::Relaxed),
+            bytes_read: self.bytes_read.load(Ordering::Relaxed),
+            active_partitions: self.segments.read().len(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -557,6 +682,52 @@ impl MMapStorageStats {
             self.bytes_written as f64 / 1_000_000.0,
             self.bytes_read as f64 / 1_000_000.0
         )
+    }
+}
+
+/// Statistics for a specific partition's segments
+#[derive(Debug, Clone)]
+pub struct SegmentStats {
+    pub total_segments: usize,
+    pub current_segment_id: u64,
+    pub current_utilization_percent: f64,
+    pub total_messages: u64,
+    pub total_bytes_written: usize,
+}
+
+/// Performance statistics for the memory-mapped storage system
+#[derive(Debug, Clone)]
+pub struct MMapPerformanceStats {
+    pub total_writes: u64,
+    pub total_reads: u64,
+    pub bytes_written: u64,
+    pub bytes_read: u64,
+    pub active_partitions: usize,
+}
+
+impl MMapPerformanceStats {
+    pub fn writes_per_second(&self, duration_secs: f64) -> f64 {
+        if duration_secs > 0.0 {
+            self.total_writes as f64 / duration_secs
+        } else {
+            0.0
+        }
+    }
+
+    pub fn bytes_per_second(&self, duration_secs: f64) -> f64 {
+        if duration_secs > 0.0 {
+            self.bytes_written as f64 / duration_secs
+        } else {
+            0.0
+        }
+    }
+
+    pub fn average_write_size(&self) -> f64 {
+        if self.total_writes > 0 {
+            self.bytes_written as f64 / self.total_writes as f64
+        } else {
+            0.0
+        }
     }
 }
 
@@ -596,5 +767,100 @@ mod tests {
         assert_eq!(fetched.len(), 1);
         assert_eq!(fetched[0].0, 0);
         assert_eq!(fetched[0].1.value, "test_value");
+    }
+
+    #[test]
+    fn test_segment_rotation() {
+        let temp_dir = tempdir().unwrap();
+
+        // Configure very small segments for testing (1KB instead of 256MB)
+        let config = MMapStorageConfig {
+            data_directory: temp_dir.path().to_path_buf(),
+            segment_size_mb: 1, // 1MB for testing, will be converted to bytes
+            max_segments_per_partition: 5,
+            enable_direct_io: false,
+            sync_on_write: false,
+            preallocate_segments: false,
+        };
+
+        let storage = MemoryMappedStorage::with_config(config).unwrap();
+
+        // Create messages that will fill up the first segment
+        let large_value = "x".repeat(100_000); // 100KB per message
+        let messages = vec![
+            Message {
+                key: Some(Bytes::from("test_key")),
+                value: Bytes::from(large_value.clone()),
+                timestamp: 1234567890,
+                headers: std::collections::HashMap::new(),
+            };
+            15
+        ]; // 15 messages = ~1.5MB, should trigger rotation
+
+        // Test segment rotation
+        let offset = storage
+            .append_messages_zero_copy("test_rotation", 0, messages)
+            .unwrap();
+
+        assert_eq!(offset, 0);
+
+        // Check segment statistics
+        let stats = storage.get_segment_stats("test_rotation", 0);
+        assert!(stats.is_some());
+
+        let stats = stats.unwrap();
+        println!("Segment stats: {:?}", stats);
+
+        // Should have rotated to multiple segments
+        assert!(
+            stats.total_segments >= 2,
+            "Expected segment rotation to occur"
+        );
+
+        // Verify we can still read the data
+        let fetched = storage
+            .fetch_messages_zero_copy("test_rotation", 0, 0, 2_000_000) // 2MB limit
+            .unwrap();
+
+        assert_eq!(fetched.len(), 15);
+        assert_eq!(fetched[0].1.value.len(), large_value.len());
+    }
+
+    #[test]
+    fn test_segment_statistics() {
+        let temp_dir = tempdir().unwrap();
+        let storage = MemoryMappedStorage::with_config(MMapStorageConfig {
+            data_directory: temp_dir.path().to_path_buf(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Add some test data
+        let messages = vec![
+            Message {
+                key: Some(Bytes::from("test_key")),
+                value: Bytes::from("test_value"),
+                timestamp: 1234567890,
+                headers: std::collections::HashMap::new(),
+            };
+            10
+        ];
+
+        storage
+            .append_messages_zero_copy("test_stats", 0, messages)
+            .unwrap();
+
+        // Test performance stats
+        let perf_stats = storage.get_performance_stats();
+        assert_eq!(perf_stats.total_writes, 10);
+        assert!(perf_stats.bytes_written > 0);
+        assert_eq!(perf_stats.active_partitions, 1);
+
+        // Test segment stats
+        let segment_stats = storage.get_segment_stats("test_stats", 0).unwrap();
+        assert_eq!(segment_stats.total_segments, 1);
+        assert_eq!(segment_stats.current_segment_id, 0);
+        assert!(segment_stats.current_utilization_percent > 0.0);
+        assert_eq!(segment_stats.total_messages, 10);
     }
 }

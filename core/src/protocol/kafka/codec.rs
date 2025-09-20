@@ -17,12 +17,12 @@ use tracing::{debug, warn, info, error};
 
 use super::messages::*;
 use crate::protocol::kafka::{
-    API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_DELETE_TOPICS, 
-    API_KEY_DESCRIBE_GROUPS, API_KEY_FETCH, API_KEY_FIND_COORDINATOR, 
-    API_KEY_HEARTBEAT, API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP, API_KEY_LIST_GROUPS, 
-    API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_OFFSET_COMMIT, API_KEY_OFFSET_FETCH, 
+    API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_DELETE_TOPICS,
+    API_KEY_DESCRIBE_GROUPS, API_KEY_FETCH, API_KEY_FIND_COORDINATOR,
+    API_KEY_HEARTBEAT, API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP, API_KEY_LIST_GROUPS,
+    API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_OFFSET_COMMIT, API_KEY_OFFSET_FETCH,
     API_KEY_PRODUCE, API_KEY_SYNC_GROUP,
-    API_KEY_LEADER_AND_ISR, API_KEY_STOP_REPLICA, API_KEY_UPDATE_METADATA, API_KEY_CONTROLLED_SHUTDOWN,
+    API_KEY_GET_TELEMETRY_SUBSCRIPTIONS,
 };
 
 #[derive(Debug, Error)]
@@ -159,22 +159,6 @@ impl KafkaCodec {
                 let request = Self::decode_metadata_request(header, &mut cursor)?;
                 Ok(KafkaRequest::Metadata(request))
             }
-            API_KEY_LEADER_AND_ISR => {
-                // Placeholder - return error for now
-                return Err(KafkaCodecError::UnsupportedApiKey(api_key));
-            }
-            API_KEY_STOP_REPLICA => {
-                // Placeholder - return error for now  
-                return Err(KafkaCodecError::UnsupportedApiKey(api_key));
-            }
-            API_KEY_UPDATE_METADATA => {
-                // Placeholder - return error for now
-                return Err(KafkaCodecError::UnsupportedApiKey(api_key));
-            }
-            API_KEY_CONTROLLED_SHUTDOWN => {
-                // Placeholder - return error for now
-                return Err(KafkaCodecError::UnsupportedApiKey(api_key));
-            }
             API_KEY_OFFSET_COMMIT => {
                 let request = Self::decode_offset_commit_request(header, &mut cursor)?;
                 Ok(KafkaRequest::OffsetCommit(request))
@@ -239,6 +223,21 @@ impl KafkaCodec {
                 let request = Self::decode_sasl_authenticate_request(header, &mut cursor)?;
                 Ok(KafkaRequest::SaslAuthenticate(request))
             }
+            API_KEY_GET_TELEMETRY_SUBSCRIPTIONS => {
+                // Simple implementation - just return a basic request
+                // Client instance ID (16 bytes UUID)
+                if cursor.remaining() < 16 {
+                    return Err(KafkaCodecError::InvalidFormat("GET_TELEMETRY_SUBSCRIPTIONS insufficient data".to_string()));
+                }
+                let mut client_instance_id = [0u8; 16];
+                cursor.copy_to_slice(&mut client_instance_id);
+
+                let request = KafkaGetTelemetrySubscriptionsRequest {
+                    header,
+                    client_instance_id,
+                };
+                Ok(KafkaRequest::GetTelemetrySubscriptions(request))
+            }
             _ => Err(KafkaCodecError::UnsupportedVersion(api_key, api_version)),
         }
     }
@@ -266,22 +265,6 @@ impl KafkaCodec {
                           first_12_bytes[8], first_12_bytes[9], first_12_bytes[10], first_12_bytes[11]);
                 }
             },
-            KafkaResponse::LeaderAndIsr(_resp) => {
-                // Placeholder - not implemented yet
-                return Err(KafkaCodecError::InvalidFormat("LEADER_AND_ISR response encoding not implemented".to_string()));
-            }
-            KafkaResponse::StopReplica(_resp) => {
-                // Placeholder - not implemented yet  
-                return Err(KafkaCodecError::InvalidFormat("STOP_REPLICA response encoding not implemented".to_string()));
-            }
-            KafkaResponse::UpdateMetadata(_resp) => {
-                // Placeholder - not implemented yet
-                return Err(KafkaCodecError::InvalidFormat("UPDATE_METADATA response encoding not implemented".to_string()));
-            }
-            KafkaResponse::ControlledShutdown(_resp) => {
-                // Placeholder - not implemented yet
-                return Err(KafkaCodecError::InvalidFormat("CONTROLLED_SHUTDOWN response encoding not implemented".to_string()));
-            }
             KafkaResponse::OffsetCommit(resp) => {
                 Self::encode_offset_commit_response(resp, &mut buf)?
             }
@@ -316,6 +299,48 @@ impl KafkaCodec {
             }
             KafkaResponse::SaslAuthenticate(resp) => {
                 Self::encode_sasl_authenticate_response(resp, &mut buf)?
+            }
+            KafkaResponse::GetTelemetrySubscriptions(resp) => {
+                // Simple telemetry response encoding
+                // Header
+                buf.put_i32(resp.header.correlation_id);
+
+                // Body
+                buf.put_i32(resp.throttle_time_ms);
+                buf.put_i16(resp.error_code);
+                buf.extend_from_slice(&resp.client_instance_id);
+                buf.put_i32(resp.subscription_id);
+
+                // Accepted compression types array
+                buf.put_i32(resp.accepted_compression_types.len() as i32);
+                for compression_type in &resp.accepted_compression_types {
+                    buf.put_i8(*compression_type);
+                }
+
+                buf.put_i32(resp.push_interval_ms);
+                buf.put_i32(resp.telemetry_max_bytes);
+                buf.put_u8(if resp.delta_temporality { 1 } else { 0 });
+
+                // Requested metrics array
+                buf.put_i32(resp.requested_metrics.len() as i32);
+                for metric in &resp.requested_metrics {
+                    let metric_bytes = metric.as_bytes();
+                    buf.put_i16(metric_bytes.len() as i16);
+                    buf.extend_from_slice(metric_bytes);
+                }
+            }
+            // Obsolete cluster management APIs (removed in Kafka 4.0)
+            KafkaResponse::LeaderAndIsr(_) => {
+                return Err(KafkaCodecError::UnsupportedApiKey(4)); // API key 4
+            }
+            KafkaResponse::StopReplica(_) => {
+                return Err(KafkaCodecError::UnsupportedApiKey(5)); // API key 5
+            }
+            KafkaResponse::UpdateMetadata(_) => {
+                return Err(KafkaCodecError::UnsupportedApiKey(6)); // API key 6
+            }
+            KafkaResponse::ControlledShutdown(_) => {
+                return Err(KafkaCodecError::UnsupportedApiKey(7)); // API key 7
             }
         }
 

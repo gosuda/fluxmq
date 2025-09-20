@@ -1,5 +1,8 @@
+pub mod cluster;
 pub mod follower;
 pub mod leader;
+pub mod network;
+pub mod raft;
 
 #[cfg(test)]
 mod tests;
@@ -12,8 +15,13 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
 
+pub use cluster::{ClusterConfig, ClusterCoordinator, ClusterStatus};
 pub use follower::{FollowerState, FollowerSync};
 pub use leader::{LeaderState, ReplicationManager};
+pub use network::{NetworkConfig, NetworkStats, ReplicationNetwork, ReplicationNetworkManager};
+pub use raft::{
+    PersistentState, RaftConfig, RaftLogEntry, RaftMessage, RaftNode, RaftState, VolatileState,
+};
 
 /// Unique identifier for broker nodes
 pub type BrokerId = u32;

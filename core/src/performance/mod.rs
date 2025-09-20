@@ -33,9 +33,14 @@
 //! - [`thread_affinity`] - CPU thread pinning for consistent performance
 //! - [`quick_wins`] - Immediate optimizations with measurable gains
 //!
-//! ### Network Layer  
+//! ### Network Layer
 //! - [`network_simple`] - Basic network optimizations
 //! - [`advanced_networking`] - Zero-copy networking and buffer management
+//! - [`sendfile_zero_copy`] - Kernel-level zero-copy using sendfile/splice
+//! - [`io_uring_zero_copy`] - Ultra-high performance Linux io_uring networking
+//!
+//! ### File Operations
+//! - [`copy_file_range_zero_copy`] - Kernel-level file-to-file copying
 //!
 //! ### Integrated Systems
 //! - [`ultra_performance`] - Integrated hybrid 3-tier storage system
@@ -76,13 +81,18 @@
 
 pub mod advanced_networking;
 pub mod arena_allocator;
+pub mod copy_file_range_zero_copy; // Kernel-level file-to-file copying
+pub mod cross_platform_zero_copy; // Unified cross-platform zero-copy interface
+pub mod fetch_sendfile; // Integration of sendfile for Fetch responses
 pub mod io_optimizations;
+pub mod io_uring_zero_copy; // Ultra-high performance Linux io_uring networking
 pub mod lockfree_storage;
 pub mod memory;
 pub mod mmap_storage;
 pub mod network_simple;
 pub mod object_pool;
 pub mod quick_wins;
+pub mod sendfile_zero_copy; // Kernel-level zero-copy using sendfile/splice
 pub mod simd_optimizations;
 pub mod smart_pointers;
 pub mod ultra_performance;

@@ -70,10 +70,12 @@
 
 pub mod acl;
 pub mod broker;
+pub mod compression;
 pub mod config;
 pub mod consumer;
 pub mod http_server;
 pub mod metrics;
+pub mod monitoring;
 pub mod performance;
 pub mod protocol;
 pub mod replication;
@@ -88,6 +90,10 @@ pub use consumer::{
 };
 pub use http_server::HttpMetricsServer;
 pub use metrics::{MetricsRegistry, MetricsSnapshot};
+pub use monitoring::{
+    AdvancedDashboard, AlertManager, AlertSeverity, DashboardConfig, PerformanceAlert,
+    PerformanceAnalyzer, SystemResourceMonitor,
+};
 pub use protocol::{
     FetchRequest, FetchResponse, Message, MetadataRequest, MetadataResponse, Offset,
     ProduceRequest, ProduceResponse, Request, Response,

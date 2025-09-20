@@ -605,6 +605,7 @@ pub enum KafkaRequest {
     AlterConfigs(KafkaAlterConfigsRequest),
     SaslHandshake(KafkaSaslHandshakeRequest),
     SaslAuthenticate(KafkaSaslAuthenticateRequest),
+    GetTelemetrySubscriptions(KafkaGetTelemetrySubscriptionsRequest),
 }
 
 /// Unified Kafka response enum
@@ -634,6 +635,7 @@ pub enum KafkaResponse {
     AlterConfigs(KafkaAlterConfigsResponse),
     SaslHandshake(KafkaSaslHandshakeResponse),
     SaslAuthenticate(KafkaSaslAuthenticateResponse),
+    GetTelemetrySubscriptions(KafkaGetTelemetrySubscriptionsResponse),
 }
 
 impl KafkaRequest {
@@ -664,6 +666,7 @@ impl KafkaRequest {
             KafkaRequest::AlterConfigs(_) => 33,
             KafkaRequest::SaslHandshake(_) => 17,
             KafkaRequest::SaslAuthenticate(_) => 36,
+            KafkaRequest::GetTelemetrySubscriptions(_) => 71,
         }
     }
 
@@ -694,6 +697,7 @@ impl KafkaRequest {
             KafkaRequest::AlterConfigs(req) => req.correlation_id,
             KafkaRequest::SaslHandshake(req) => req.correlation_id,
             KafkaRequest::SaslAuthenticate(req) => req.correlation_id,
+            KafkaRequest::GetTelemetrySubscriptions(req) => req.header.correlation_id,
         }
     }
 
@@ -724,6 +728,7 @@ impl KafkaRequest {
             KafkaRequest::AlterConfigs(req) => req.api_version,
             KafkaRequest::SaslHandshake(_) => 0, // No header in SASL, use default
             KafkaRequest::SaslAuthenticate(_) => 0, // No header in SASL, use default
+            KafkaRequest::GetTelemetrySubscriptions(req) => req.header.api_version,
         }
     }
 }
@@ -756,6 +761,7 @@ impl KafkaResponse {
             KafkaResponse::StopReplica(resp) => resp.header.correlation_id,
             KafkaResponse::UpdateMetadata(resp) => resp.header.correlation_id,
             KafkaResponse::ControlledShutdown(resp) => resp.header.correlation_id,
+            KafkaResponse::GetTelemetrySubscriptions(resp) => resp.header.correlation_id,
         }
     }
 }
@@ -973,67 +979,186 @@ pub struct KafkaAlterConfigsResourceResponse {
 }
 
 // ============================================================================
-// LEADER_AND_ISR API (ApiKey = 4) - Placeholder
+// LEADER_AND_ISR API (ApiKey = 4) - Replication Leadership Coordination
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaLeaderAndIsrRequest {
     pub header: KafkaRequestHeader,
-    // Placeholder - not implemented yet
+    pub controller_id: i32,
+    pub controller_epoch: i32,
+    pub partition_states: Vec<KafkaLeaderAndIsrPartitionState>,
+    pub live_leaders: Vec<KafkaLeaderAndIsrLiveLeader>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaLeaderAndIsrPartitionState {
+    pub topic: String,
+    pub partition: i32,
+    pub controller_epoch: i32,
+    pub leader: i32,
+    pub leader_epoch: i32,
+    pub isr: Vec<i32>,
+    pub zk_version: i32,
+    pub replicas: Vec<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaLeaderAndIsrLiveLeader {
+    pub id: i32,
+    pub host: String,
+    pub port: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaLeaderAndIsrResponse {
     pub header: KafkaResponseHeader,
-    // Placeholder - not implemented yet
+    pub error_code: i16,
+    pub partitions: Vec<KafkaLeaderAndIsrPartitionResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaLeaderAndIsrPartitionResponse {
+    pub topic: String,
+    pub partition: i32,
+    pub error_code: i16,
 }
 
 // ============================================================================
-// STOP_REPLICA API (ApiKey = 5) - Placeholder
+// STOP_REPLICA API (ApiKey = 5) - Replica Stopping and Removal
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaStopReplicaRequest {
     pub header: KafkaRequestHeader,
-    // Placeholder - not implemented yet
+    pub controller_id: i32,
+    pub controller_epoch: i32,
+    pub broker_epoch: i64,
+    pub delete_partitions: bool,
+    pub topics: Vec<KafkaStopReplicaTopicState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaStopReplicaTopicState {
+    pub topic: String,
+    pub partition_states: Vec<KafkaStopReplicaPartitionState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaStopReplicaPartitionState {
+    pub partition: i32,
+    pub leader_epoch: i32,
+    pub delete_partition: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaStopReplicaResponse {
     pub header: KafkaResponseHeader,
-    // Placeholder - not implemented yet
+    pub error_code: i16,
+    pub partition_errors: Vec<KafkaStopReplicaPartitionError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaStopReplicaPartitionError {
+    pub topic: String,
+    pub partition: i32,
+    pub error_code: i16,
 }
 
 // ============================================================================
-// UPDATE_METADATA API (ApiKey = 6) - Placeholder
+// UPDATE_METADATA API (ApiKey = 6) - Cluster Metadata Updates
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaUpdateMetadataRequest {
     pub header: KafkaRequestHeader,
-    // Placeholder - not implemented yet
+    pub controller_id: i32,
+    pub controller_epoch: i32,
+    pub broker_epoch: i64,
+    pub partition_states: Vec<KafkaUpdateMetadataPartitionState>,
+    pub live_brokers: Vec<KafkaUpdateMetadataBroker>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaUpdateMetadataPartitionState {
+    pub topic: String,
+    pub partition: i32,
+    pub controller_epoch: i32,
+    pub leader: i32,
+    pub leader_epoch: i32,
+    pub isr: Vec<i32>,
+    pub zk_version: i32,
+    pub replicas: Vec<i32>,
+    pub offline_replicas: Vec<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaUpdateMetadataBroker {
+    pub broker_id: i32,
+    pub endpoints: Vec<KafkaUpdateMetadataEndpoint>,
+    pub rack: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaUpdateMetadataEndpoint {
+    pub port: i32,
+    pub host: String,
+    pub listener_name: String,
+    pub security_protocol: i16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaUpdateMetadataResponse {
     pub header: KafkaResponseHeader,
-    // Placeholder - not implemented yet
+    pub error_code: i16,
 }
 
 // ============================================================================
-// CONTROLLED_SHUTDOWN API (ApiKey = 7) - Placeholder
+// CONTROLLED_SHUTDOWN API (ApiKey = 7) - Graceful Broker Shutdown
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaControlledShutdownRequest {
     pub header: KafkaRequestHeader,
-    // Placeholder - not implemented yet
+    pub broker_id: i32,
+    pub broker_epoch: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaControlledShutdownResponse {
     pub header: KafkaResponseHeader,
-    // Placeholder - not implemented yet
+    pub error_code: i16,
+    pub partitions_remaining: Vec<KafkaRemainingPartition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaRemainingPartition {
+    pub topic: String,
+    pub partition: i32,
+}
+
+// ============================================================================
+// GET_TELEMETRY_SUBSCRIPTIONS API (ApiKey = 71) - KIP-714
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaGetTelemetrySubscriptionsRequest {
+    pub header: KafkaRequestHeader,
+    pub client_instance_id: [u8; 16], // UUID bytes
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaGetTelemetrySubscriptionsResponse {
+    pub header: KafkaResponseHeader,
+    pub throttle_time_ms: i32,
+    pub error_code: i16,
+    pub client_instance_id: [u8; 16], // UUID bytes
+    pub subscription_id: i32,
+    pub accepted_compression_types: Vec<i8>,
+    pub push_interval_ms: i32,
+    pub telemetry_max_bytes: i32,
+    pub delta_temporality: bool,
+    pub requested_metrics: Vec<String>,
 }
 
 #[cfg(test)]

@@ -26,6 +26,7 @@ futures = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+bincode = "1.3"
 bytes = { workspace = true }
 memmap2.workspace = true
 crc32fast.workspace = true
@@ -36,6 +37,7 @@ parking_lot = { workspace = true }
 
 # Low-level networking
 socket2 = { workspace = true }
+libc = "0.2.175"               # For sendfile/splice system calls
 
 # Error handling
 thiserror = { workspace = true }
@@ -54,8 +56,8 @@ clap = { workspace = true }
 rand = { workspace = true }
 
 # CPU and memory optimization
-num_cpus = "1.16"
-crossbeam-channel = "0.5"
+num_cpus = "1.17.0"
+crossbeam-channel = "0.5.15"
 
 # TLS support
 tokio-rustls = { workspace = true }
@@ -69,7 +71,20 @@ dashmap.workspace = true
 # Time utilities for examples
 chrono = { workspace = true }
 
+# Compression support
+lz4_flex = "0.11.5"
+snap = "1.1.1"
+flate2 = "1.1.2"
+zstd = "0.13.3"
+
+# Http
+atomic_http = "0.6.3"
+
 [dev-dependencies]
 tokio-test = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
+
+# Platform-specific dependencies
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.6" # Linux io_uring for kernel bypass networking

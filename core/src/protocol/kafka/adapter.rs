@@ -134,29 +134,31 @@ impl ProtocolAdapter {
                 let fluxmq_req = Self::convert_sasl_authenticate_request(req)?;
                 Ok(Request::SaslAuthenticate(fluxmq_req))
             }
-            KafkaRequest::LeaderAndIsr(_req) => {
-                // Not implemented yet - return error
+            KafkaRequest::GetTelemetrySubscriptions(_req) => {
+                // GET_TELEMETRY_SUBSCRIPTIONS is handled internally, no FluxMQ conversion needed
                 Err(AdapterError::UnsupportedOperation(
-                    "LEADER_AND_ISR not implemented".to_string(),
+                    "GET_TELEMETRY_SUBSCRIPTIONS handled internally".to_string(),
                 ))
+            }
+            KafkaRequest::LeaderAndIsr(_req) => {
+                // LEADER_AND_ISR: Cluster management API handled separately
+                // This API is used for leader election and replica assignment
+                Err(AdapterError::UnsupportedApi(6, 0))
             }
             KafkaRequest::StopReplica(_req) => {
-                // Not implemented yet - return error
-                Err(AdapterError::UnsupportedOperation(
-                    "STOP_REPLICA not implemented".to_string(),
-                ))
+                // STOP_REPLICA: Cluster management API handled separately
+                // This API is used for stopping and removing replicas
+                Err(AdapterError::UnsupportedApi(5, 0))
             }
             KafkaRequest::UpdateMetadata(_req) => {
-                // Not implemented yet - return error
-                Err(AdapterError::UnsupportedOperation(
-                    "UPDATE_METADATA not implemented".to_string(),
-                ))
+                // UPDATE_METADATA: Cluster management API handled separately
+                // This API is used for cluster metadata synchronization
+                Err(AdapterError::UnsupportedApi(6, 0))
             }
             KafkaRequest::ControlledShutdown(_req) => {
-                // Not implemented yet - return error
-                Err(AdapterError::UnsupportedOperation(
-                    "CONTROLLED_SHUTDOWN not implemented".to_string(),
-                ))
+                // CONTROLLED_SHUTDOWN: Cluster management API handled separately
+                // This API is used for graceful broker shutdown coordination
+                Err(AdapterError::UnsupportedApi(7, 0))
             }
         }
     }
@@ -913,15 +915,479 @@ impl ProtocolAdapter {
     // HELPER METHODS
     // ========================================================================
 
-    /// Parse Kafka record batch into FluxMQ messages
+    /// Parse Kafka record batch into FluxMQ messages with compression support
     fn parse_kafka_record_batch(records_bytes: &Bytes) -> Result<Vec<Message>> {
-        // This is a simplified implementation
-        // In a real implementation, we'd need to properly parse the Kafka record batch format
-        // For now, we'll create a single message from the raw bytes
+        if records_bytes.is_empty() {
+            return Ok(vec![]);
+        }
 
+        use crate::compression::{decompress_fast, CompressionType};
+
+        // First, try to detect the record batch format by checking the magic byte
+        // Modern Kafka uses RecordBatch format (magic byte 2), older versions use legacy format (magic 0/1)
+
+        // RecordBatch format starts with:
+        // baseOffset(8) + batchLength(4) + partitionLeaderEpoch(4) + magic(1) + ...
+        if records_bytes.len() >= 17 {
+            let magic_byte_offset = 16; // After baseOffset(8) + batchLength(4) + partitionLeaderEpoch(4)
+            let magic = records_bytes[magic_byte_offset];
+
+            tracing::debug!(
+                "Kafka record magic byte detected: {}, buffer_len: {}",
+                magic,
+                records_bytes.len()
+            );
+
+            if magic == 2 {
+                // Modern RecordBatch format - delegate to new parser
+                return Self::parse_record_batch_v2(records_bytes);
+            }
+        }
+
+        // Fallback to legacy record format parsing (magic 0/1)
+        tracing::debug!("Using legacy record format parser");
+        let mut messages = Vec::new();
+        let mut cursor = 0usize;
+
+        while cursor + 14 < records_bytes.len() {
+            // Minimum record size
+            // Parse Kafka legacy record format:
+            // offset (8) + message_size (4) + crc (4) + magic (1) + attributes (1) + key_length (4) + value_length (4) + value
+
+            // Skip offset (8 bytes)
+            cursor += 8;
+
+            // Read message size (4 bytes)
+            if cursor + 4 > records_bytes.len() {
+                break;
+            }
+            let _message_size = i32::from_be_bytes([
+                records_bytes[cursor],
+                records_bytes[cursor + 1],
+                records_bytes[cursor + 2],
+                records_bytes[cursor + 3],
+            ]) as usize;
+            cursor += 4;
+
+            // Skip CRC (4 bytes)
+            cursor += 4;
+
+            // Read magic byte (1 byte)
+            if cursor >= records_bytes.len() {
+                break;
+            }
+            let magic = records_bytes[cursor];
+            tracing::debug!("Legacy record magic byte: {}", magic);
+            cursor += 1;
+
+            // Read attributes (1 byte) - contains compression info
+            if cursor >= records_bytes.len() {
+                break;
+            }
+            let attributes = records_bytes[cursor];
+            cursor += 1;
+
+            // Read key_length (4 bytes) - handle null keys properly
+            if cursor + 4 > records_bytes.len() {
+                tracing::warn!(
+                    "Insufficient data for key_length: cursor={}, buffer_len={}",
+                    cursor,
+                    records_bytes.len()
+                );
+                break;
+            }
+            let key_length_i32 = i32::from_be_bytes([
+                records_bytes[cursor],
+                records_bytes[cursor + 1],
+                records_bytes[cursor + 2],
+                records_bytes[cursor + 3],
+            ]);
+            cursor += 4;
+
+            // Handle null key (-1 in Kafka protocol)
+            if key_length_i32 < 0 {
+                tracing::debug!("Null key encountered (length={}), skipping key data", key_length_i32);
+                // Null key, continue to value processing
+            } else {
+                // Skip key data (we're not processing keys in this simplified parser)
+                let key_length = key_length_i32 as usize;
+                if cursor + key_length > records_bytes.len() {
+                    tracing::warn!(
+                        "Insufficient data for key: cursor={}, key_length={}, buffer_len={}",
+                        cursor,
+                        key_length,
+                        records_bytes.len()
+                    );
+                    break;
+                }
+                cursor += key_length;
+            }
+
+            // Read value_length (4 bytes)
+            if cursor + 4 > records_bytes.len() {
+                tracing::warn!(
+                    "Insufficient data for value_length: cursor={}, buffer_len={}",
+                    cursor,
+                    records_bytes.len()
+                );
+                break;
+            }
+            let value_length_i32 = i32::from_be_bytes([
+                records_bytes[cursor],
+                records_bytes[cursor + 1],
+                records_bytes[cursor + 2],
+                records_bytes[cursor + 3],
+            ]);
+            cursor += 4;
+
+            // Handle null value (-1 in Kafka protocol)
+            if value_length_i32 < 0 {
+                tracing::debug!("Null value encountered (length={}), skipping", value_length_i32);
+                // For null values, create an empty message and continue
+                let message = Message {
+                    timestamp: 0,
+                    key: None,
+                    value: bytes::Bytes::new(),
+                    headers: std::collections::HashMap::new(),
+                };
+                messages.push(message);
+                continue;
+            }
+
+            let value_length = value_length_i32 as usize;
+
+            // Read value data
+            if cursor + value_length > records_bytes.len() {
+                tracing::warn!(
+                    "Insufficient data for value: cursor={}, value_length={}, buffer_len={}",
+                    cursor,
+                    value_length,
+                    records_bytes.len()
+                );
+                break;
+            }
+            let value_data = &records_bytes[cursor..cursor + value_length];
+            cursor += value_length;
+
+            // Check compression type from attributes (lower 3 bits)
+            let compression_type = match attributes & 0x07 {
+                0 => CompressionType::None,   // No compression
+                1 => CompressionType::Gzip,   // GZIP
+                2 => CompressionType::Snappy, // Snappy
+                3 => CompressionType::Lz4,    // LZ4
+                4 => CompressionType::Zstd,   // ZSTD
+                _ => {
+                    tracing::warn!(
+                        "Unknown compression type: {}, treating as uncompressed",
+                        attributes & 0x07
+                    );
+                    CompressionType::None
+                }
+            };
+
+            // Decompress if needed
+            let final_value = match compression_type {
+                CompressionType::None => Bytes::copy_from_slice(value_data),
+                _ => match decompress_fast(value_data, compression_type, None) {
+                    Ok(decompressed) => decompressed,
+                    Err(e) => {
+                        tracing::warn!("Decompression failed: {}, using compressed data as-is", e);
+                        Bytes::copy_from_slice(value_data)
+                    }
+                },
+            };
+
+            // Create FluxMQ message
+            let message = Message {
+                key: None, // Assuming null key for simplicity
+                value: final_value,
+                timestamp: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+                headers: HashMap::new(),
+            };
+
+            messages.push(message);
+        }
+
+        // Fallback: if parsing failed, create single message from raw data
+        if messages.is_empty() && !records_bytes.is_empty() {
+            tracing::warn!("Failed to parse Kafka records, creating single message from raw data");
+            let message = Message {
+                key: None,
+                value: records_bytes.clone(),
+                timestamp: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+                headers: HashMap::new(),
+            };
+            messages.push(message);
+        }
+
+        tracing::debug!(
+            "Parsed {} messages from Kafka record batch with compression support",
+            messages.len()
+        );
+        Ok(messages)
+    }
+
+    /// Parse modern Kafka RecordBatch format (magic byte 2)
+    /// RecordBatch format introduced in Kafka 0.11.0
+    fn parse_record_batch_v2(records_bytes: &Bytes) -> Result<Vec<Message>> {
+        tracing::debug!(
+            "Parsing RecordBatch v2 format (magic=2), buffer_len: {}",
+            records_bytes.len()
+        );
+
+        if records_bytes.len() < 61 {
+            tracing::warn!(
+                "RecordBatch buffer too small: {} bytes (minimum 61 required)",
+                records_bytes.len()
+            );
+            return Ok(vec![]);
+        }
+
+        let mut messages = Vec::new();
+
+        // RecordBatch format:
+        // baseOffset(8) + batchLength(4) + partitionLeaderEpoch(4) + magic(1) +
+        // crc(4) + attributes(2) + lastOffsetDelta(4) + firstTimestamp(8) +
+        // maxTimestamp(8) + producerId(8) + producerEpoch(2) + baseSequence(4) +
+        // recordsCount(4) + records...
+
+        // Skip to magic byte (already verified as 2)
+        let mut cursor = 16usize;
+        let magic = records_bytes[cursor];
+        cursor += 1;
+
+        if magic != 2 {
+            return Err(AdapterError::InvalidFormat(format!(
+                "Expected magic byte 2, got {}",
+                magic
+            )));
+        }
+
+        // Skip CRC (4 bytes)
+        cursor += 4;
+
+        // Read attributes (2 bytes) - contains compression info
+        if cursor + 2 > records_bytes.len() {
+            return Err(AdapterError::InvalidFormat(
+                "Buffer too small for attributes".to_string(),
+            ));
+        }
+        let attributes = u16::from_be_bytes([records_bytes[cursor], records_bytes[cursor + 1]]);
+        cursor += 2;
+
+        let compression_type = attributes & 0x7; // Lower 3 bits
+
+        tracing::debug!(
+            "RecordBatch attributes: {:#06x}, compression_type: {}",
+            attributes,
+            compression_type
+        );
+
+        // Skip: lastOffsetDelta(4) + firstTimestamp(8) + maxTimestamp(8) +
+        //       producerId(8) + producerEpoch(2) + baseSequence(4)
+        cursor += 34;
+
+        // Read records count
+        if cursor + 4 > records_bytes.len() {
+            return Err(AdapterError::InvalidFormat(
+                "Buffer too small for records count".to_string(),
+            ));
+        }
+        let records_count = i32::from_be_bytes([
+            records_bytes[cursor],
+            records_bytes[cursor + 1],
+            records_bytes[cursor + 2],
+            records_bytes[cursor + 3],
+        ]);
+        cursor += 4;
+
+        tracing::debug!("RecordBatch contains {} records", records_count);
+
+        if records_count <= 0 {
+            tracing::warn!("RecordBatch has no records: {}", records_count);
+            return Ok(messages);
+        }
+
+        // Get the remaining records data
+        let records_data = &records_bytes[cursor..];
+
+        // Decompress records if necessary
+        let decompressed_data = match compression_type {
+            0 => {
+                // No compression
+                tracing::debug!("No compression, using records data directly");
+                records_data.to_vec()
+            }
+            1 => {
+                // Gzip compression
+                tracing::debug!("Decompressing Gzip compressed records");
+                Self::decompress_gzip(records_data)?
+            }
+            2 => {
+                // Snappy compression
+                tracing::debug!("Decompressing Snappy compressed records");
+                Self::decompress_snappy(records_data)?
+            }
+            3 => {
+                // LZ4 compression
+                tracing::debug!("Decompressing LZ4 compressed records");
+                Self::decompress_lz4(records_data)?
+            }
+            4 => {
+                // ZSTD compression
+                tracing::debug!("Decompressing ZSTD compressed records");
+                Self::decompress_zstd(records_data)?
+            }
+            _ => {
+                return Err(AdapterError::InvalidFormat(format!(
+                    "Unsupported compression type: {}",
+                    compression_type
+                )));
+            }
+        };
+
+        // Convert decompressed data to Bytes for parsing
+        let decompressed_bytes = Bytes::from(decompressed_data);
+        let mut decompressed_cursor = 0usize;
+
+        tracing::debug!(
+            "Decompressed {} bytes of records data (compression_type={})",
+            decompressed_bytes.len(),
+            compression_type
+        );
+
+        // Parse individual records from decompressed data
+        for i in 0..records_count {
+            match Self::parse_single_record_v2(&decompressed_bytes, &mut decompressed_cursor) {
+                Ok(Some(message)) => {
+                    messages.push(message);
+                    tracing::trace!("Successfully parsed record {}/{}", i + 1, records_count);
+                }
+                Ok(None) => {
+                    tracing::trace!(
+                        "Skipped record {}/{} (control record)",
+                        i + 1,
+                        records_count
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to parse record {}/{}: {}", i + 1, records_count, e);
+                    // Continue parsing remaining records
+                    break;
+                }
+            }
+        }
+
+        tracing::debug!(
+            "Successfully parsed RecordBatch v2: {} messages from {} records",
+            messages.len(),
+            records_count
+        );
+
+        Ok(messages)
+    }
+
+    /// Parse a single record from RecordBatch v2 format
+    fn parse_single_record_v2(
+        records_bytes: &Bytes,
+        cursor: &mut usize,
+    ) -> Result<Option<Message>> {
+        if *cursor >= records_bytes.len() {
+            return Err(AdapterError::InvalidFormat(
+                "Cursor beyond buffer end".to_string(),
+            ));
+        }
+
+        // Record format:
+        // length(varint) + attributes(1) + timestampDelta(varint) + offsetDelta(varint) +
+        // keyLength(varint) + key + valueLength(varint) + value + headersCount(varint) + headers
+
+        // Read record length (varint)
+        let record_length = Self::read_varint_from_bytes(records_bytes, cursor)?;
+
+        if record_length <= 0 {
+            return Err(AdapterError::InvalidFormat(format!(
+                "Invalid record length: {}",
+                record_length
+            )));
+        }
+
+        let record_start = *cursor;
+        let record_end = record_start + record_length as usize;
+
+        // Read attributes (1 byte)
+        if *cursor >= records_bytes.len() {
+            return Err(AdapterError::InvalidFormat(
+                "Buffer too small for record attributes".to_string(),
+            ));
+        }
+        let _attributes = records_bytes[*cursor];
+        *cursor += 1;
+
+        // Skip timestampDelta and offsetDelta (varints)
+        Self::read_varint_from_bytes(records_bytes, cursor)?; // timestampDelta
+        Self::read_varint_from_bytes(records_bytes, cursor)?; // offsetDelta
+
+        // Read key
+        let key_length = Self::read_varint_from_bytes(records_bytes, cursor)?;
+        let key = if key_length > 0 {
+            if *cursor + key_length as usize > records_bytes.len() {
+                return Err(AdapterError::InvalidFormat(
+                    "Buffer too small for record key".to_string(),
+                ));
+            }
+            let key_bytes = records_bytes[*cursor..*cursor + key_length as usize].to_vec();
+            *cursor += key_length as usize;
+            Some(Bytes::from(key_bytes))
+        } else {
+            None
+        };
+
+        // Read value
+        let value_length = Self::read_varint_from_bytes(records_bytes, cursor)?;
+        let value = if value_length > 0 {
+            if *cursor + value_length as usize > records_bytes.len() {
+                return Err(AdapterError::InvalidFormat(
+                    "Buffer too small for record value".to_string(),
+                ));
+            }
+            let value_bytes = records_bytes[*cursor..*cursor + value_length as usize].to_vec();
+            *cursor += value_length as usize;
+            Bytes::from(value_bytes)
+        } else {
+            Bytes::new()
+        };
+
+        // Skip headers for now
+        let headers_count = Self::read_varint_from_bytes(records_bytes, cursor)?;
+        for _ in 0..headers_count {
+            // Skip header key and value
+            let header_key_len = Self::read_varint_from_bytes(records_bytes, cursor)?;
+            *cursor += header_key_len as usize;
+            let header_value_len = Self::read_varint_from_bytes(records_bytes, cursor)?;
+            *cursor += header_value_len as usize;
+        }
+
+        // Ensure we're at the expected position
+        if *cursor != record_end {
+            tracing::warn!(
+                "Record parsing position mismatch: expected {}, actual {}",
+                record_end,
+                *cursor
+            );
+            *cursor = record_end;
+        }
+
+        // Create FluxMQ message
         let message = Message {
-            key: None,
-            value: records_bytes.clone(),
+            key,
+            value,
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -929,7 +1395,200 @@ impl ProtocolAdapter {
             headers: HashMap::new(),
         };
 
-        Ok(vec![message])
+        Ok(Some(message))
+    }
+
+    /// Read a varint from bytes at cursor position
+    fn read_varint_from_bytes(bytes: &Bytes, cursor: &mut usize) -> Result<i32> {
+        let mut value = 0i32;
+        let mut shift = 0;
+
+        loop {
+            if shift >= 32 {
+                return Err(AdapterError::InvalidFormat("Varint too large".to_string()));
+            }
+
+            if *cursor >= bytes.len() {
+                return Err(AdapterError::InvalidFormat(
+                    "Failed to read varint byte".to_string(),
+                ));
+            }
+
+            let byte = bytes[*cursor];
+            *cursor += 1;
+
+            value |= ((byte & 0x7F) as i32) << shift;
+
+            if (byte & 0x80) == 0 {
+                break;
+            }
+
+            shift += 7;
+        }
+
+        Ok(value)
+    }
+
+    /// Decompress LZ4 compressed data
+    fn decompress_lz4(compressed_data: &[u8]) -> Result<Vec<u8>> {
+        use std::io::Read;
+
+        // Method 1: Try LZ4 Frame format (recommended by docs, likely what Kafka uses)
+        let mut frame_decoder = lz4_flex::frame::FrameDecoder::new(compressed_data);
+        let mut frame_result = Vec::new();
+        if frame_decoder.read_to_end(&mut frame_result).is_ok() && !frame_result.is_empty() {
+            tracing::debug!(
+                "LZ4 decompression successful (frame format): {} -> {} bytes",
+                compressed_data.len(),
+                frame_result.len()
+            );
+            return Ok(frame_result);
+        }
+
+        // Method 2: Try size-prepended format
+        if let Ok(decompressed) = lz4_flex::decompress_size_prepended(compressed_data) {
+            tracing::debug!(
+                "LZ4 decompression successful (size-prepended): {} -> {} bytes",
+                compressed_data.len(),
+                decompressed.len()
+            );
+            return Ok(decompressed);
+        }
+
+        // Method 3: Try with different potential uncompressed sizes
+        for uncompressed_size in [1024, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288] {
+            if let Ok(decompressed) = lz4_flex::decompress(compressed_data, uncompressed_size) {
+                tracing::debug!(
+                    "LZ4 decompression successful (estimated size {}): {} -> {} bytes",
+                    uncompressed_size,
+                    compressed_data.len(),
+                    decompressed.len()
+                );
+                return Ok(decompressed);
+            }
+        }
+
+        // Method 4: Try to extract uncompressed size from data prefix (Kafka-specific)
+        if compressed_data.len() >= 4 {
+            // Try big-endian size prefix
+            let potential_size = u32::from_be_bytes([
+                compressed_data[0],
+                compressed_data[1],
+                compressed_data[2],
+                compressed_data[3]
+            ]) as usize;
+
+            // Reasonable size check (max 10MB uncompressed)
+            if potential_size > 0 && potential_size < 10_485_760 {
+                if let Ok(decompressed) = lz4_flex::decompress(&compressed_data[4..], potential_size) {
+                    tracing::debug!(
+                        "LZ4 decompression successful (BE size prefix {}): {} -> {} bytes",
+                        potential_size,
+                        compressed_data.len(),
+                        decompressed.len()
+                    );
+                    return Ok(decompressed);
+                }
+            }
+
+            // Try little-endian size prefix
+            let potential_size_le = u32::from_le_bytes([
+                compressed_data[0],
+                compressed_data[1],
+                compressed_data[2],
+                compressed_data[3]
+            ]) as usize;
+
+            if potential_size_le > 0 && potential_size_le < 10_485_760 {
+                if let Ok(decompressed) = lz4_flex::decompress(&compressed_data[4..], potential_size_le) {
+                    tracing::debug!(
+                        "LZ4 decompression successful (LE size prefix {}): {} -> {} bytes",
+                        potential_size_le,
+                        compressed_data.len(),
+                        decompressed.len()
+                    );
+                    return Ok(decompressed);
+                }
+            }
+        }
+
+        tracing::error!(
+            "LZ4 decompression failed with all methods, data size: {} bytes, first 16 bytes: {:02x?}",
+            compressed_data.len(),
+            compressed_data.get(..16).unwrap_or(compressed_data)
+        );
+        Err(AdapterError::InvalidFormat(
+            "LZ4 decompression failed: unable to decompress with any method".to_string(),
+        ))
+    }
+
+    /// Decompress Snappy compressed data
+    fn decompress_snappy(compressed_data: &[u8]) -> Result<Vec<u8>> {
+        match snap::raw::Decoder::new().decompress_vec(compressed_data) {
+            Ok(decompressed) => {
+                tracing::debug!(
+                    "Snappy decompression successful: {} -> {} bytes",
+                    compressed_data.len(),
+                    decompressed.len()
+                );
+                Ok(decompressed)
+            }
+            Err(e) => {
+                tracing::error!("Snappy decompression failed: {}", e);
+                Err(AdapterError::InvalidFormat(format!(
+                    "Snappy decompression failed: {}",
+                    e
+                )))
+            }
+        }
+    }
+
+    /// Decompress Gzip compressed data
+    fn decompress_gzip(compressed_data: &[u8]) -> Result<Vec<u8>> {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let mut decoder = GzDecoder::new(compressed_data);
+        let mut decompressed = Vec::new();
+
+        match decoder.read_to_end(&mut decompressed) {
+            Ok(_) => {
+                tracing::debug!(
+                    "Gzip decompression successful: {} -> {} bytes",
+                    compressed_data.len(),
+                    decompressed.len()
+                );
+                Ok(decompressed)
+            }
+            Err(e) => {
+                tracing::error!("Gzip decompression failed: {}", e);
+                Err(AdapterError::InvalidFormat(format!(
+                    "Gzip decompression failed: {}",
+                    e
+                )))
+            }
+        }
+    }
+
+    /// Decompress ZSTD compressed data
+    fn decompress_zstd(compressed_data: &[u8]) -> Result<Vec<u8>> {
+        match zstd::decode_all(compressed_data) {
+            Ok(decompressed) => {
+                tracing::debug!(
+                    "ZSTD decompression successful: {} -> {} bytes",
+                    compressed_data.len(),
+                    decompressed.len()
+                );
+                Ok(decompressed)
+            }
+            Err(e) => {
+                tracing::error!("ZSTD decompression failed: {}", e);
+                Err(AdapterError::InvalidFormat(format!(
+                    "ZSTD decompression failed: {}",
+                    e
+                )))
+            }
+        }
     }
 
     /// Convert Kafka CreateTopics request to FluxMQ format
@@ -1243,7 +1902,7 @@ impl ProtocolAdapter {
     }
 
     /// Encode FluxMQ messages as proper Kafka record batch format (KIP-98)
-    /// Using a simplified approach that focuses on compatibility
+    /// Using a simplified approach that focuses on compatibility with optional compression
     fn encode_messages_as_record_batch(messages: &[(u64, Message)]) -> Bytes {
         if messages.is_empty() {
             return Bytes::new();
@@ -1255,40 +1914,65 @@ impl ProtocolAdapter {
         for (offset, message) in messages {
             let value_bytes = &message.value;
 
+            // Determine optimal compression based on message size
+            use crate::compression::{compress_fast, CompressionType};
+            let compression_type = if value_bytes.len() > 1024 {
+                // Use LZ4 compression for messages > 1KB
+                CompressionType::Lz4
+            } else {
+                // No compression for small messages
+                CompressionType::None
+            };
+
+            // Apply compression if needed
+            let (final_value_bytes, attributes) = match compression_type {
+                CompressionType::None => (value_bytes.clone(), 0u8), // No compression
+                CompressionType::Lz4 => {
+                    match compress_fast(value_bytes, CompressionType::Lz4) {
+                        Ok(compressed) => (compressed, 3u8), // LZ4 = 0x03 in attributes
+                        Err(e) => {
+                            tracing::warn!("Compression failed: {}, using uncompressed", e);
+                            (value_bytes.clone(), 0u8)
+                        }
+                    }
+                }
+                _ => (value_bytes.clone(), 0u8), // Fallback to no compression
+            };
+
             // Message format for magic byte 0/1 (legacy format):
             // offset (8 bytes) + message_size (4 bytes) + crc (4 bytes) + magic (1 byte) + attributes (1 byte) + key_length (4 bytes) + value_length (4 bytes) + value
             records.extend_from_slice(&(*offset as i64).to_be_bytes());
 
-            // Message size = 4 (crc) + 1 (magic) + 1 (attributes) + 4 (key_length) + 4 (value_length) + value.len()
-            let message_size = 4 + 1 + 1 + 4 + 4 + value_bytes.len();
+            // Message size = 4 (crc) + 1 (magic) + 1 (attributes) + 4 (key_length) + 4 (value_length) + final_value.len()
+            let message_size = 4 + 1 + 1 + 4 + 4 + final_value_bytes.len();
             records.extend_from_slice(&(message_size as i32).to_be_bytes());
 
             // Calculate CRC32 for the message payload (magic + attributes + key_length + value_length + value)
             let mut crc_hasher = Hasher::new();
             crc_hasher.update(&[0]); // magic byte
-            crc_hasher.update(&[0]); // attributes
+            crc_hasher.update(&[attributes]); // compression attributes
             crc_hasher.update(&(-1i32).to_be_bytes()); // key length (-1 for null)
-            crc_hasher.update(&(value_bytes.len() as i32).to_be_bytes()); // value length
-            crc_hasher.update(value_bytes); // value data
+            crc_hasher.update(&(final_value_bytes.len() as i32).to_be_bytes()); // compressed value length
+            crc_hasher.update(&final_value_bytes); // compressed value data
             let crc = crc_hasher.finalize();
             records.extend_from_slice(&crc.to_be_bytes());
 
             // Magic byte = 0 (oldest format for maximum compatibility)
             records.push(0);
 
-            // Attributes (no compression, no timestamp)
-            records.push(0);
+            // Attributes with compression info: lower 3 bits = compression type
+            records.push(attributes);
 
             // Key length = -1 (null key)
             records.extend_from_slice(&(-1i32).to_be_bytes());
 
-            // Value length and value
-            records.extend_from_slice(&(value_bytes.len() as i32).to_be_bytes());
-            records.extend_from_slice(value_bytes);
+            // Compressed value length and value
+            records.extend_from_slice(&(final_value_bytes.len() as i32).to_be_bytes());
+            records.extend_from_slice(&final_value_bytes);
         }
 
         tracing::debug!(
-            "Created simple legacy records with {} bytes for {} messages",
+            "Created Kafka records with {} bytes for {} messages (with compression support)",
             records.len(),
             messages.len()
         );

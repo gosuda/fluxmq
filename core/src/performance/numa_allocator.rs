@@ -110,6 +110,13 @@ struct NodeMemoryPool {
     pool_misses: AtomicUsize,
 }
 
+// Raw pointers are safe in this context because:
+// 1. They are managed exclusively within the memory pool
+// 2. Only used for returning memory to the system allocator
+// 3. Protected by mutexes for thread safety
+unsafe impl Send for NodeMemoryPool {}
+unsafe impl Sync for NodeMemoryPool {}
+
 impl NodeMemoryPool {
     fn new(node_id: usize) -> Self {
         Self {

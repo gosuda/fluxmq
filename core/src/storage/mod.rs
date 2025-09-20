@@ -36,6 +36,8 @@ pub mod log;
 pub mod segment;
 pub mod tests;
 
+use crate::performance::mmap_storage::{MMapStorageConfig, MemoryMappedStorage};
+
 use segment::{SegmentConfig, SegmentManager};
 use tracing::{debug, error, info, trace, warn};
 
@@ -301,12 +303,17 @@ impl Partition {
     }
 }
 
-/// Hybrid storage combining in-memory performance with disk persistence
+/// Advanced hybrid storage with 3-tier architecture:
+/// 1. Memory Tier: In-memory for hot data and real-time operations
+/// 2. Memory-Mapped Tier: 256MB memory-mapped segments for zero-copy I/O
+/// 3. Persistent Tier: Append-only log files with CRC integrity checking
 #[derive(Debug)]
 pub struct HybridStorage {
-    // In-memory storage for fast operations
+    // Tier 1: In-memory storage for hot data
     memory: Arc<InMemoryStorage>,
-    // Background persistence to disk
+    // Tier 2: Memory-mapped storage for zero-copy I/O
+    mmap_storage: Arc<MemoryMappedStorage>,
+    // Tier 3: Background persistence to disk
     #[allow(dead_code)] // Used for cleanup and management operations
     base_dir: String,
     #[allow(dead_code)] // Used for direct segment access in replication
@@ -319,7 +326,7 @@ pub struct HybridStorage {
 }
 
 impl HybridStorage {
-    /// Create a new hybrid storage instance
+    /// Create a new 3-tier hybrid storage instance
     pub fn new<P: AsRef<str>>(base_dir: P) -> Result<Self> {
         let base_dir = base_dir.as_ref().to_string();
         std::fs::create_dir_all(&base_dir)?;
@@ -330,7 +337,23 @@ impl HybridStorage {
         // Create message notification broadcast channel (capacity 1024)
         let (message_notifier, _) = broadcast::channel(1024);
 
+        // Tier 1: In-memory storage
         let memory = Arc::new(InMemoryStorage::new());
+
+        // Tier 2: Memory-mapped storage configuration
+        let mmap_config = MMapStorageConfig {
+            data_directory: std::path::PathBuf::from(&base_dir).join("mmap"),
+            segment_size_mb: 256, // 256MB segments
+            max_segments_per_partition: 1000,
+            enable_direct_io: true,
+            sync_on_write: false, // Async for performance
+            preallocate_segments: true,
+        };
+
+        // Initialize memory-mapped storage
+        let mmap_storage = Arc::new(MemoryMappedStorage::with_config(mmap_config)?);
+
+        // Tier 3: Traditional segment-based storage
         let segments = Arc::new(RwLock::new(HashMap::new()));
 
         // Start background persistence task
@@ -342,6 +365,7 @@ impl HybridStorage {
 
         Ok(Self {
             memory,
+            mmap_storage,
             base_dir,
             segments,
             persistence_tx: tx,
@@ -527,10 +551,43 @@ impl HybridStorage {
         let start_offset = self.get_latest_offset(topic, partition).unwrap_or(0);
         let message_count = messages.len();
 
-        // Fast in-memory operation
+        // Calculate total message size for tier selection
+        let total_size: usize = messages
+            .iter()
+            .map(|m| m.value.len() + m.key.as_ref().map_or(0, |k| k.len()))
+            .sum();
+
+        // 3-tier storage strategy:
+        // Tier 1 (Memory): All messages for fast access
+        // Tier 2 (MMap): Messages > 4KB or batches > 64KB for zero-copy I/O
+        // Tier 3 (Disk): All messages for persistence
+
+        // Tier 1: Always store in memory for fast access
         let end_offset = self
             .memory
             .append_messages(topic, partition, messages.clone())?;
+
+        // Tier 2: Store in memory-mapped storage for large messages/batches
+        if total_size > 4096 || message_count > 100 {
+            // 4KB or 100+ messages
+            match self
+                .mmap_storage
+                .append_messages_zero_copy(topic, partition, messages.clone())
+            {
+                Ok(_) => {
+                    trace!(
+                        "Large batch ({} bytes, {} messages) stored in memory-mapped storage for {}:{}",
+                        total_size, message_count, topic, partition
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Memory-mapped storage append failed: {}, continuing with memory-only",
+                        e
+                    );
+                }
+            }
+        }
 
         // Send notification about new messages (fire-and-forget)
         let notification = MessageNotification {
@@ -543,7 +600,7 @@ impl HybridStorage {
         // Don't block if no one is listening
         let _ = self.message_notifier.send(notification);
 
-        // Async persistence to disk (fire-and-forget for performance)
+        // Tier 3: Async persistence to disk (fire-and-forget for performance)
         if let Err(_) = self.persistence_tx.send(PersistenceCommand::Append {
             topic: topic.to_string(),
             partition,
@@ -563,9 +620,48 @@ impl HybridStorage {
         offset: Offset,
         max_bytes: u32,
     ) -> Result<Vec<(Offset, Message)>> {
-        // Fast in-memory operation
-        self.memory
-            .fetch_messages(topic, partition, offset, max_bytes)
+        // 3-tier fetch strategy:
+        // 1. Try memory first (fastest)
+        // 2. Try memory-mapped storage (zero-copy)
+        // 3. Fallback to disk if needed
+
+        // Tier 1: Fast in-memory lookup
+        let memory_result = self
+            .memory
+            .fetch_messages(topic, partition, offset, max_bytes)?;
+
+        if !memory_result.is_empty() {
+            return Ok(memory_result);
+        }
+
+        // Tier 2: Memory-mapped storage (zero-copy I/O)
+        match self
+            .mmap_storage
+            .fetch_messages_zero_copy(topic, partition, offset, max_bytes)
+        {
+            Ok(mmap_result) => {
+                if !mmap_result.is_empty() {
+                    trace!(
+                        "Fetched {} messages from memory-mapped storage for {}:{}",
+                        mmap_result.len(),
+                        topic,
+                        partition
+                    );
+                    return Ok(mmap_result);
+                }
+            }
+            Err(e) => {
+                debug!("Memory-mapped storage fetch failed: {}, trying disk", e);
+            }
+        }
+
+        // Tier 3: If not in memory or mmap, could potentially read from disk
+        // For now, return empty result as disk loading happens during startup
+        debug!(
+            "No messages found for {}:{} at offset {} in any tier",
+            topic, partition, offset
+        );
+        Ok(vec![])
     }
 
     pub fn get_topics(&self) -> Vec<TopicName> {
