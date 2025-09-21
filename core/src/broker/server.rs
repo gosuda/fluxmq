@@ -8,6 +8,7 @@ use bytes::Bytes;
 use futures::SinkExt;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tokio_util::codec::Framed;
 use tracing::{error, info, warn};
@@ -24,6 +25,8 @@ pub struct BrokerServer {
     io_manager: Arc<IOOptimizationManager>,
     // Connection pool for efficient connection management
     connection_pool: Arc<ConnectionPool>,
+    // Graceful shutdown coordination
+    shutdown_tx: broadcast::Sender<()>,
 }
 
 impl BrokerServer {
@@ -47,6 +50,7 @@ impl BrokerServer {
         // 🚀 ULTRA-PERFORMANCE: High-throughput I/O optimizations
         let io_manager = Arc::new(IOOptimizationManager::new());
         let connection_pool = Arc::new(ConnectionPool::new(10000)); // Support 10k connections
+        let (shutdown_tx, _) = broadcast::channel(16); // Graceful shutdown coordination
         Ok(Self {
             config,
             handler,
@@ -54,6 +58,7 @@ impl BrokerServer {
             batch_processor,
             io_manager,
             connection_pool,
+            shutdown_tx,
         })
     }
 
@@ -89,6 +94,10 @@ impl BrokerServer {
             // 🚀 ULTRA-PERFORMANCE: High-throughput I/O optimizations
             let io_manager = Arc::new(IOOptimizationManager::new());
             let connection_pool = Arc::new(ConnectionPool::new(10000)); // Support 10k connections
+
+            // Graceful shutdown coordination
+            let (shutdown_tx, _) = broadcast::channel(16);
+
             Ok(Self {
                 config,
                 handler,
@@ -96,6 +105,7 @@ impl BrokerServer {
                 batch_processor,
                 io_manager,
                 connection_pool,
+                shutdown_tx,
             })
         } else {
             let mut handler = MessageHandler::new_with_features(
@@ -120,6 +130,10 @@ impl BrokerServer {
             // 🚀 ULTRA-PERFORMANCE: High-throughput I/O optimizations
             let io_manager = Arc::new(IOOptimizationManager::new());
             let connection_pool = Arc::new(ConnectionPool::new(10000)); // Support 10k connections
+
+            // Graceful shutdown coordination
+            let (shutdown_tx, _) = broadcast::channel(16);
+
             Ok(Self {
                 config,
                 handler,
@@ -127,6 +141,7 @@ impl BrokerServer {
                 batch_processor,
                 io_manager,
                 connection_pool,
+                shutdown_tx,
             })
         }
     }
@@ -185,6 +200,7 @@ impl BrokerServer {
         // 🚀 ULTRA-PERFORMANCE: High-throughput I/O optimizations
         let io_manager = Arc::new(IOOptimizationManager::new());
         let connection_pool = Arc::new(ConnectionPool::new(10000)); // Support 10k connections
+        let (shutdown_tx, _) = broadcast::channel(16); // Graceful shutdown coordination
         Ok(Self {
             config,
             handler,
@@ -192,9 +208,17 @@ impl BrokerServer {
             batch_processor,
             io_manager,
             connection_pool,
+            shutdown_tx,
         })
     }
 
+    /// Initiate graceful shutdown of the server
+    pub fn shutdown(&self) {
+        info!("Initiating graceful shutdown...");
+        let _ = self.shutdown_tx.send(()); // Notify all background tasks to shutdown
+    }
+
+    /// Run the server with graceful shutdown support
     pub async fn run(&self) -> Result<()> {
         let addr = format!("{}:{}", self.config.host, self.config.port);
         let listener = TcpListener::bind(&addr).await?;
@@ -215,11 +239,12 @@ impl BrokerServer {
 
                         info!("FluxMQ TLS broker listening on {}", tls_addr);
 
-                        // Start TLS listener in background
+                        // Start TLS listener in background with shutdown support
                         let tls_handler = Arc::clone(&self.handler);
                         let acceptor_arc = Arc::new(acceptor);
+                        let tls_shutdown_rx = self.shutdown_tx.subscribe();
                         tokio::spawn(async move {
-                            Self::run_tls_listener(tls_listener, tls_handler, acceptor_arc).await;
+                            Self::run_tls_listener_with_shutdown(tls_listener, tls_handler, acceptor_arc, tls_shutdown_rx).await;
                         });
                     }
                     Err(e) => {
@@ -235,18 +260,33 @@ impl BrokerServer {
         if let Some(metrics_port) = self.config.metrics_port {
             let metrics = self.handler.get_metrics();
             let http_server = HttpMetricsServer::new(metrics, metrics_port);
+            let mut metrics_shutdown_rx = self.shutdown_tx.subscribe();
 
             tokio::spawn(async move {
-                if let Err(e) = http_server.start().await {
-                    error!("HTTP metrics server error: {}", e);
+                // Run HTTP server with shutdown support
+                tokio::select! {
+                    result = http_server.start() => {
+                        if let Err(e) = result {
+                            error!("HTTP metrics server error: {}", e);
+                        }
+                    }
+                    _ = metrics_shutdown_rx.recv() => {
+                        info!("Shutting down HTTP metrics server...");
+                    }
                 }
             });
             info!("HTTP metrics server started on port {}", metrics_port);
         }
 
-        // Main non-TLS listener loop
+        // Create shutdown receiver for the main loop
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+
+        // Main non-TLS listener loop with graceful shutdown support
         loop {
-            match listener.accept().await {
+            tokio::select! {
+                // Handle new connections
+                accept_result = listener.accept() => {
+                    match accept_result {
                 Ok((stream, peer_addr)) => {
                     // 🚀 ULTRA-PERFORMANCE: Check connection pool capacity
                     if !self.connection_pool.can_accept_connection() {
@@ -285,11 +325,21 @@ impl BrokerServer {
                         connection_pool.connection_closed();
                     });
                 }
-                Err(e) => {
-                    error!("Failed to accept connection: {}", e);
+                        Err(e) => {
+                            error!("Failed to accept connection: {}", e);
+                        }
+                    }
+                }
+                // Handle shutdown signal
+                _ = shutdown_rx.recv() => {
+                    info!("Received shutdown signal, stopping server gracefully...");
+                    break;
                 }
             }
         }
+
+        info!("Server shutdown complete");
+        Ok(())
     }
 
     /// Apply ultra-performance TCP socket optimizations to client connections
@@ -537,41 +587,46 @@ impl BrokerServer {
             kafka_request.correlation_id()
         );
 
-        // Check if this is a consumer group request
-        if let Ok(Some(cg_message)) =
-            ProtocolAdapter::handle_consumer_group_request(kafka_request.clone())
-        {
-            // Handle consumer group request
-            if let Some(cg_coordinator) = handler.get_consumer_group_coordinator() {
-                match cg_coordinator.handle_message(cg_message).await {
-                    Ok(cg_response) => {
-                        let kafka_response = ProtocolAdapter::consumer_group_response_to_kafka(
-                            cg_response,
-                            kafka_request.correlation_id(),
-                            kafka_request.api_version(),
-                        )?;
-                        // DISABLED: Use standard codec to debug buffer bounds issue
-                        let response_bytes = KafkaCodec::encode_response(&kafka_response)?;
-                        kafka_framed.send(response_bytes).await?;
-                    }
+        // Check if this is a consumer group request (zero-copy check)
+        if ProtocolAdapter::is_consumer_group_request(&kafka_request) {
+            // Extract metadata before consuming the request
+            let correlation_id = kafka_request.correlation_id();
+            let api_version = kafka_request.api_version();
+
+            // Now handle consumer group request (taking ownership)
+            if let Ok(Some(cg_message)) = ProtocolAdapter::handle_consumer_group_request(kafka_request) {
+                if let Some(cg_coordinator) = handler.get_consumer_group_coordinator() {
+                    match cg_coordinator.handle_message(cg_message).await {
+                        Ok(cg_response) => {
+                            let kafka_response = ProtocolAdapter::consumer_group_response_to_kafka(
+                                cg_response,
+                                correlation_id,
+                                api_version,
+                            )?;
+                            // DISABLED: Use standard codec to debug buffer bounds issue
+                            let response_bytes = KafkaCodec::encode_response(&kafka_response)?;
+                            kafka_framed.send(response_bytes).await?;
+                        }
                     Err(e) => {
                         warn!("Consumer group request failed: {}", e);
                         metrics.broker.error_occurred();
                         // Send error response
                         Self::send_kafka_error_response(
                             kafka_framed,
-                            kafka_request.correlation_id(),
+                            correlation_id,
                             crate::protocol::kafka::KafkaErrorCode::Unknown,
                         )
                         .await?;
                     }
                 }
+                }
             } else {
-                // Consumer groups not enabled
+                // Failed to parse as consumer group request or None returned
+                warn!("Failed to parse consumer group request");
                 Self::send_kafka_error_response(
                     kafka_framed,
-                    kafka_request.correlation_id(),
-                    crate::protocol::kafka::KafkaErrorCode::UnsupportedVersion,
+                    correlation_id,
+                    crate::protocol::kafka::KafkaErrorCode::Unknown,
                 )
                 .await?;
             }
@@ -1268,6 +1323,45 @@ impl BrokerServer {
             topics,
             cluster_authorized_operations: -2147483648,
         })
+    }
+
+    /// Run TLS listener for secure connections with shutdown support
+    async fn run_tls_listener_with_shutdown(
+        listener: TcpListener,
+        handler: Arc<MessageHandler>,
+        acceptor: Arc<FluxTlsAcceptor>,
+        mut shutdown_rx: broadcast::Receiver<()>,
+    ) {
+        info!("Starting TLS listener with shutdown support...");
+
+        loop {
+            tokio::select! {
+                accept_result = listener.accept() => {
+                    match accept_result {
+                        Ok((stream, peer_addr)) => {
+                            info!("New TLS client connected: {}", peer_addr);
+                            let handler_clone = Arc::clone(&handler);
+                            let _acceptor_clone = Arc::clone(&acceptor);
+
+                            tokio::spawn(async move {
+                                if let Err(e) = Self::handle_tls_client(stream, handler_clone).await {
+                                    error!("Error handling TLS client {}: {}", peer_addr, e);
+                                } else {
+                                    info!("TLS client {} disconnected", peer_addr);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            error!("Failed to accept TLS connection: {}", e);
+                        }
+                    }
+                }
+                _ = shutdown_rx.recv() => {
+                    info!("TLS listener shutting down gracefully...");
+                    break;
+                }
+            }
+        }
     }
 
     /// Run TLS listener for secure connections

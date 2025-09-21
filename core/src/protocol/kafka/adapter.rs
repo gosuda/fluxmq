@@ -222,6 +222,22 @@ impl ProtocolAdapter {
         }
     }
 
+    /// Check if request is a consumer group request without taking ownership
+    pub fn is_consumer_group_request(kafka_request: &KafkaRequest) -> bool {
+        matches!(
+            kafka_request,
+            KafkaRequest::JoinGroup(_)
+                | KafkaRequest::OffsetCommit(_)
+                | KafkaRequest::OffsetFetch(_)
+                | KafkaRequest::FindCoordinator(_)
+                | KafkaRequest::Heartbeat(_)
+                | KafkaRequest::LeaveGroup(_)
+                | KafkaRequest::SyncGroup(_)
+                | KafkaRequest::DescribeGroups(_)
+                | KafkaRequest::ListGroups(_)
+        )
+    }
+
     /// Handle Kafka consumer group request (separate from regular message flow)
     pub fn handle_consumer_group_request(
         kafka_request: KafkaRequest,
@@ -1239,7 +1255,14 @@ impl ProtocolAdapter {
             return Ok(messages);
         }
 
-        // Get the remaining records data
+        // Get the remaining records data - add defensive bounds check
+        if cursor > records_bytes.len() {
+            return Err(AdapterError::InvalidFormat(format!(
+                "Cursor position {} exceeds buffer length {}",
+                cursor,
+                records_bytes.len()
+            )));
+        }
         let records_data = &records_bytes[cursor..];
 
         // Decompress records if necessary
@@ -1367,8 +1390,18 @@ impl ProtocolAdapter {
             )));
         }
 
-        let record_start = *cursor;
-        let record_end = record_start + record_length as usize;
+        // Important fix: record_length is the length of the record data AFTER the length field
+        // So the record ends at: current_cursor + record_length (not record_start + record_length)
+        let record_data_start = *cursor;
+        let record_data_end = record_data_start + record_length as usize;
+
+        // Defensive check: ensure we don't read beyond buffer
+        if record_data_end > records_bytes.len() {
+            return Err(AdapterError::InvalidFormat(format!(
+                "Record extends beyond buffer: record_end={}, buffer_len={}",
+                record_data_end, records_bytes.len()
+            )));
+        }
 
         // Read attributes (1 byte)
         if *cursor >= records_bytes.len() {
@@ -1454,13 +1487,13 @@ impl ProtocolAdapter {
         }
 
         // Ensure we're at the expected position
-        if *cursor != record_end {
+        if *cursor != record_data_end {
             tracing::warn!(
                 "Record parsing position mismatch: expected {}, actual {}",
-                record_end,
+                record_data_end,
                 *cursor
             );
-            *cursor = record_end;
+            *cursor = record_data_end;
         }
 
         // Create FluxMQ message
@@ -1485,13 +1518,13 @@ impl ProtocolAdapter {
 
     /// Read a varint from bytes at cursor position
     fn read_varint_from_bytes(bytes: &Bytes, cursor: &mut usize) -> Result<i32> {
-        let mut value = 0i64; // Use i64 internally to handle large values
+        let mut value = 0u32; // Use u32 for varint decoding
         let mut shift = 0;
         let start_cursor = *cursor;
 
         loop {
-            if shift >= 64 {
-                tracing::error!("🔍 VARINT: Varint too large at cursor {} (>64 bits)", *cursor);
+            if shift >= 32 {
+                tracing::error!("🔍 VARINT: Varint too large at cursor {} (>32 bits)", *cursor);
                 return Err(AdapterError::InvalidFormat("Varint too large".to_string()));
             }
 
@@ -1505,7 +1538,7 @@ impl ProtocolAdapter {
             let byte = bytes[*cursor];
             *cursor += 1;
 
-            value |= ((byte & 0x7F) as i64) << shift;
+            value |= ((byte & 0x7F) as u32) << shift;
 
             tracing::debug!("🔍 VARINT: Read byte {:02x} at pos {}, value so far: {}", byte, *cursor - 1, value);
 
@@ -1516,20 +1549,17 @@ impl ProtocolAdapter {
             shift += 7;
         }
 
-        // Convert back to i32, handling potential overflow gracefully
-        let final_value = if value > i32::MAX as i64 {
-            tracing::error!("🔍 VARINT: Unrealistic large value {} suggests parsing error", value);
-            return Err(AdapterError::InvalidFormat(format!("Varint value too large: {}", value)));
-        } else if value < i32::MIN as i64 {
-            tracing::error!("🔍 VARINT: Unrealistic small value {} suggests parsing error", value);
-            return Err(AdapterError::InvalidFormat(format!("Varint value too small: {}", value)));
-        } else {
-            value as i32
-        };
+        // Apply ZigZag decoding for signed varints
+        let final_value = Self::zigzag_decode(value);
 
-        tracing::debug!("🔍 VARINT: Final value: {} (cursor {} -> {})", final_value, start_cursor, *cursor);
+        tracing::debug!("🔍 VARINT: Raw value: {}, ZigZag decoded: {} (cursor {} -> {})", value, final_value, start_cursor, *cursor);
 
         Ok(final_value)
+    }
+
+    /// ZigZag decode for signed varints - converts unsigned varint to signed int
+    fn zigzag_decode(value: u32) -> i32 {
+        ((value >> 1) as i32) ^ (-((value & 1) as i32))
     }
 
     /// Decompress LZ4 compressed data

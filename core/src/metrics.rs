@@ -316,8 +316,11 @@ impl ThroughputMetrics {
     pub fn record_produced(&self, count: u64, bytes: u64) {
         // Use Release ordering to ensure visibility to readers
         // This ensures calculate_rates can see the updated values
-        self.messages_produced.0.fetch_add(count, Ordering::Release);
+        let new_total = self.messages_produced.0.fetch_add(count, Ordering::Release) + count;
         self.bytes_produced.0.fetch_add(bytes, Ordering::Release);
+
+        // Debug logging to track message recording
+        tracing::debug!("🔧 METRICS RECORD: count={}, new_total={}", count, new_total);
     }
 
     #[inline(always)]

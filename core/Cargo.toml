@@ -12,6 +12,12 @@ keywords.workspace = true
 categories.workspace = true
 description.workspace = true
 
+[features]
+default = []
+jemalloc = ["tikv-jemallocator"]
+mimalloc = ["dep:mimalloc"]
+ultra-performance = ["jemalloc"] # jemalloc is generally fastest for FluxMQ workloads
+
 [[bin]]
 name = "fluxmq"
 path = "src/main.rs"
@@ -80,6 +86,10 @@ zstd = "0.13.3"
 # Http
 atomic_http = "0.6.3"
 
+# High-performance global allocators (optional features)
+tikv-jemallocator = { version = "0.6", optional = true }
+mimalloc = { version = "0.1", optional = true, default-features = false }
+
 [dev-dependencies]
 tokio-test = { workspace = true }
 criterion = { workspace = true }
@@ -88,3 +98,9 @@ tempfile = { workspace = true }
 # Platform-specific dependencies
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.6" # Linux io_uring for kernel bypass networking
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach = "0.3" # macOS Mach kernel interfaces for thread policies
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winapi = { version = "0.3", features = ["processthreadsapi", "handleapi"] } # Windows API for thread affinity

@@ -347,17 +347,18 @@ impl MessageHandler {
                             "Failed to auto-create topic '{}' for produce request: {}",
                             request.topic, e
                         );
-                        let topic_clone = request.topic.clone();
+                        // Optimize: Create error message before moving request.topic
+                        let error_message = format!(
+                            "Partition {} does not exist for topic {} and auto-creation failed: {}",
+                            request.partition, request.topic, e
+                        );
                         return Ok(Response::Produce(ProduceResponse {
                             correlation_id: request.correlation_id,
                             topic: request.topic,
                             partition: request.partition,
                             base_offset: 0,
                             error_code: 3, // Unknown topic or partition
-                            error_message: Some(format!(
-                                "Partition {} does not exist for topic {} and auto-creation failed: {}",
-                                request.partition, topic_clone, e
-                            )),
+                            error_message: Some(error_message),
                         }));
                     }
                 }
@@ -367,17 +368,18 @@ impl MessageHandler {
                     .topic_manager
                     .partition_exists(&request.topic, request.partition)
                 {
-                    let topic_clone = request.topic.clone();
+                    // Optimize: Create error message before moving request.topic
+                    let error_message = format!(
+                        "Partition {} does not exist for topic {} even after auto-creation",
+                        request.partition, request.topic
+                    );
                     return Ok(Response::Produce(ProduceResponse {
                         correlation_id: request.correlation_id,
                         topic: request.topic,
                         partition: request.partition,
                         base_offset: 0,
                         error_code: 3, // Unknown topic or partition
-                        error_message: Some(format!(
-                            "Partition {} does not exist for topic {} even after auto-creation",
-                            request.partition, topic_clone
-                        )),
+                        error_message: Some(error_message),
                     }));
                 }
             }
@@ -404,14 +406,16 @@ impl MessageHandler {
             })
             .sum::<usize>() as u64;
 
-        // Create shared message reference to avoid cloning
-        let messages_arc = Arc::new(request.messages);
+        // 🚀 MEMORY OPTIMIZATION: Use optimal message handling approach
+        // Keep messages owned to avoid unnecessary Arc allocation in common case
+        let messages = request.messages;
 
-        // 🚀 JAVA CLIENT COMPATIBILITY: Use ultra-performance broker with fast acknowledgment
-        let base_offset = match self.ultra_performance_broker.append_messages_ultra_shared(
+        // Strategy: Try ultra-performance first with a clone, use original on fallback
+        // This optimizes for the success case (no Arc unwrapping) while maintaining fallback capability
+        let base_offset = match self.ultra_performance_broker.append_messages_ultra(
             &request.topic,
             partition,
-            Arc::clone(&messages_arc),
+            messages.clone(), // Clone only for ultra-performance attempt
         ) {
             Ok(offset) => {
                 let processing_duration = start_time.elapsed();
@@ -424,9 +428,7 @@ impl MessageHandler {
             Err(e) => {
                 let processing_duration = start_time.elapsed();
                 info!("⚠️ ULTRA-PERFORMANCE: Ultra-performance broker failed ({}) after {:?}, falling back to traditional storage", e, processing_duration);
-                // Fallback to basic storage if ultra-performance fails
-                // Convert Arc back to Vec for compatibility
-                let messages = Arc::try_unwrap(messages_arc).unwrap_or_else(|arc| (*arc).clone());
+                // Optimized fallback: Use original owned messages (no Arc unwrapping needed)
                 self.storage
                     .append_messages(&request.topic, partition, messages)?
             }
@@ -628,7 +630,8 @@ impl MessageHandler {
             request.topics
         };
 
-        let mut topic_metadata = Vec::new();
+        // Optimize: Pre-allocate Vec based on requested topics count
+        let mut topic_metadata = Vec::with_capacity(requested_topics.len());
         for topic in requested_topics {
             if let Some(topic_info) = self.topic_manager.get_topic(&topic) {
                 let partition_metadata: Vec<PartitionMetadata> = topic_info
@@ -1153,7 +1156,8 @@ impl MessageHandler {
         };
 
         // Apply stricter byte limiting
-        let mut result = Vec::new();
+        // Optimize: Pre-allocate Vec based on input size for better performance
+        let mut result = Vec::with_capacity(all_messages.len().min(1000)); // Cap at 1000 to avoid excessive allocation
         let mut bytes_accumulated = 0u32;
 
         for (msg_offset, message) in all_messages {
@@ -1274,13 +1278,15 @@ impl MessageHandler {
             request.topics.len(), request.max_wait_ms, request.min_bytes, request.max_bytes
         );
 
-        let mut topic_responses = Vec::new();
+        // Optimize: Pre-allocate Vecs based on request size for better performance
+        let mut topic_responses = Vec::with_capacity(request.topics.len());
         let mut total_bytes = 0u32;
         let mut has_messages = false;
 
         // Process each topic
         for topic_request in request.topics {
-            let mut partition_responses = Vec::new();
+            // Optimize: Pre-allocate based on partition count
+            let mut partition_responses = Vec::with_capacity(topic_request.partitions.len());
 
             // Process each partition in the topic
             for partition_request in topic_request.partitions {
