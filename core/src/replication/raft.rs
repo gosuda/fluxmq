@@ -206,7 +206,8 @@ impl LeaderState {
         let majority = (total_nodes / 2) + 1;
         if indices.len() >= majority - 1 {
             // -1 because we don't include ourselves in match_index
-            indices[majority - 2].max(current_commit)
+            // For majority replication, we need the majority-th highest index
+            indices[majority - 1].max(current_commit)
         } else {
             current_commit
         }

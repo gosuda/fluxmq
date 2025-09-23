@@ -70,6 +70,7 @@ impl From<CompressionType> for u8 {
 }
 
 /// High-performance compression engine optimized for FluxMQ
+#[derive(Debug)]
 pub struct CompressionEngine {
     // Engine state for compression operations
 }

@@ -29,6 +29,7 @@
 
 pub mod high_performance;
 pub mod immediate_optimizations;
+pub mod message_cache;
 // pub mod ultra_high_performance;
 pub mod index;
 pub mod log;
@@ -36,6 +37,7 @@ pub mod log;
 pub mod segment;
 pub mod tests;
 
+use crate::compression::{CompressionEngine, CompressionPriority, CompressionType};
 use crate::performance::mmap_storage::{MMapStorageConfig, MemoryMappedStorage};
 
 use segment::{SegmentConfig, SegmentManager};
@@ -323,6 +325,10 @@ pub struct HybridStorage {
     persistence_tx: channel::Sender<PersistenceCommand>,
     // Broadcast channel for message notifications
     message_notifier: broadcast::Sender<MessageNotification>,
+    // Compression engine for message compression
+    compression_engine: Arc<parking_lot::Mutex<CompressionEngine>>,
+    // Compression configuration
+    compression_config: CompressionConfig,
 }
 
 impl HybridStorage {
@@ -370,6 +376,8 @@ impl HybridStorage {
             segments,
             persistence_tx: tx,
             message_notifier,
+            compression_engine: Arc::new(parking_lot::Mutex::new(CompressionEngine::new())),
+            compression_config: CompressionConfig::default(),
         })
     }
 
@@ -557,23 +565,34 @@ impl HybridStorage {
             .map(|m| m.value.len() + m.key.as_ref().map_or(0, |k| k.len()))
             .sum();
 
-        // 3-tier storage strategy:
+        // Apply compression to large messages if enabled
+        let processed_messages = if self.compression_config.enabled
+            && total_size >= self.compression_config.min_message_size
+        {
+            self.compress_messages(messages, total_size)?
+        } else {
+            messages
+        };
+
+        // 4-tier storage strategy:
+        // Tier 0 (Compression): Automatic compression for large messages
         // Tier 1 (Memory): All messages for fast access
         // Tier 2 (MMap): Messages > 4KB or batches > 64KB for zero-copy I/O
         // Tier 3 (Disk): All messages for persistence
 
         // Tier 1: Always store in memory for fast access
-        let end_offset = self
-            .memory
-            .append_messages(topic, partition, messages.clone())?;
+        let end_offset =
+            self.memory
+                .append_messages(topic, partition, processed_messages.clone())?;
 
         // Tier 2: Store in memory-mapped storage for large messages/batches
         if total_size > 4096 || message_count > 100 {
             // 4KB or 100+ messages
-            match self
-                .mmap_storage
-                .append_messages_zero_copy(topic, partition, messages.clone())
-            {
+            match self.mmap_storage.append_messages_zero_copy(
+                topic,
+                partition,
+                processed_messages.clone(),
+            ) {
                 Ok(_) => {
                     trace!(
                         "Large batch ({} bytes, {} messages) stored in memory-mapped storage for {}:{}",
@@ -604,7 +623,7 @@ impl HybridStorage {
         if let Err(_) = self.persistence_tx.send(PersistenceCommand::Append {
             topic: topic.to_string(),
             partition,
-            messages,
+            messages: processed_messages,
             offset: end_offset,
         }) {
             warn!("Persistence channel full, skipping disk write");
@@ -631,7 +650,7 @@ impl HybridStorage {
             .fetch_messages(topic, partition, offset, max_bytes)?;
 
         if !memory_result.is_empty() {
-            return Ok(memory_result);
+            return self.decompress_messages(memory_result);
         }
 
         // Tier 2: Memory-mapped storage (zero-copy I/O)
@@ -647,7 +666,7 @@ impl HybridStorage {
                         topic,
                         partition
                     );
-                    return Ok(mmap_result);
+                    return self.decompress_messages(mmap_result);
                 }
             }
             Err(e) => {
@@ -875,5 +894,187 @@ impl HybridStorage {
     /// Get the number of active subscribers (for monitoring)
     pub fn get_subscriber_count(&self) -> usize {
         self.message_notifier.receiver_count()
+    }
+
+    /// Configure compression settings for the storage layer
+    pub fn set_compression_config(&mut self, config: CompressionConfig) {
+        self.compression_config = config;
+    }
+
+    /// Get current compression configuration
+    pub fn get_compression_config(&self) -> &CompressionConfig {
+        &self.compression_config
+    }
+
+    /// Compress messages based on size and configuration
+    fn compress_messages(
+        &self,
+        messages: Vec<Message>,
+        _total_size: usize,
+    ) -> Result<Vec<Message>> {
+        let mut engine = self.compression_engine.lock();
+        let mut compressed_messages = Vec::with_capacity(messages.len());
+        let mut total_original_size = 0;
+        let mut total_compressed_size = 0;
+
+        for message in messages {
+            let original_size = message.value.len();
+            total_original_size += original_size;
+
+            // Only compress if message is large enough
+            if original_size >= self.compression_config.min_message_size {
+                // Choose compression type based on priority and message size
+                let compression_type = engine
+                    .choose_optimal_compression(original_size, self.compression_config.priority);
+
+                match engine.compress(&message.value, compression_type) {
+                    Ok(compressed_value) => {
+                        let compressed_size = compressed_value.len();
+                        total_compressed_size += compressed_size;
+
+                        // Create compressed message with compression metadata in headers
+                        let mut compressed_message = message.clone();
+                        compressed_message.value = compressed_value;
+
+                        // Add compression metadata to message headers
+                        compressed_message.headers.insert(
+                            "compression".to_string(),
+                            bytes::Bytes::from(format!("{}", compression_type as u8)),
+                        );
+                        compressed_message.headers.insert(
+                            "original_size".to_string(),
+                            bytes::Bytes::from(original_size.to_string()),
+                        );
+
+                        compressed_messages.push(compressed_message);
+
+                        trace!(
+                            "Compressed message: {} -> {} bytes ({:.1}% reduction, type: {:?})",
+                            original_size,
+                            compressed_size,
+                            (1.0 - compressed_size as f64 / original_size as f64) * 100.0,
+                            compression_type
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Compression failed for message: {}, storing uncompressed",
+                            e
+                        );
+                        compressed_messages.push(message);
+                        total_compressed_size += original_size;
+                    }
+                }
+            } else {
+                // Keep small messages uncompressed
+                compressed_messages.push(message);
+                total_compressed_size += original_size;
+            }
+        }
+
+        if total_original_size > 0 && total_compressed_size < total_original_size {
+            let compression_ratio =
+                (1.0 - total_compressed_size as f64 / total_original_size as f64) * 100.0;
+            debug!(
+                "Batch compression: {} -> {} bytes ({:.1}% reduction)",
+                total_original_size, total_compressed_size, compression_ratio
+            );
+        }
+
+        Ok(compressed_messages)
+    }
+
+    /// Decompress messages when reading from storage
+    fn decompress_messages(
+        &self,
+        messages: Vec<(Offset, Message)>,
+    ) -> Result<Vec<(Offset, Message)>> {
+        let mut engine = self.compression_engine.lock();
+        let mut decompressed_messages = Vec::with_capacity(messages.len());
+
+        for (offset, message) in messages {
+            // Check if message is compressed by looking at headers
+            if let Some(compression_bytes) = message.headers.get("compression") {
+                if let Ok(compression_str) = std::str::from_utf8(compression_bytes) {
+                    if let Ok(compression_type_u8) = compression_str.parse::<u8>() {
+                        if let Ok(compression_type) = CompressionType::try_from(compression_type_u8)
+                        {
+                            // Get original size hint if available
+                            let original_size = message
+                                .headers
+                                .get("original_size")
+                                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                                .and_then(|s| s.parse::<usize>().ok());
+
+                            match engine.decompress(&message.value, compression_type, original_size)
+                            {
+                                Ok(decompressed_value) => {
+                                    let original_compressed_size = message.value.len();
+                                    let decompressed_size = decompressed_value.len();
+
+                                    let mut decompressed_message = message.clone();
+                                    decompressed_message.value = decompressed_value;
+
+                                    // Remove compression metadata from headers
+                                    decompressed_message.headers.remove("compression");
+                                    decompressed_message.headers.remove("original_size");
+
+                                    decompressed_messages.push((offset, decompressed_message));
+
+                                    trace!(
+                                        "Decompressed message at offset {}: {} -> {} bytes",
+                                        offset,
+                                        original_compressed_size,
+                                        decompressed_size
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!("Decompression failed for message at offset {}: {}, returning compressed data", offset, e);
+                                    decompressed_messages.push((offset, message));
+                                }
+                            }
+                        } else {
+                            // Unknown compression type, return as-is
+                            decompressed_messages.push((offset, message));
+                        }
+                    } else {
+                        // Invalid compression header, return as-is
+                        decompressed_messages.push((offset, message));
+                    }
+                } else {
+                    // Invalid UTF-8 in compression header, return as-is
+                    decompressed_messages.push((offset, message));
+                }
+            } else {
+                // No compression header, return as-is
+                decompressed_messages.push((offset, message));
+            }
+        }
+
+        Ok(decompressed_messages)
+    }
+}
+
+/// Configuration for storage compression
+#[derive(Debug, Clone)]
+pub struct CompressionConfig {
+    /// Enable compression for stored messages
+    pub enabled: bool,
+    /// Minimum message size to trigger compression (bytes)
+    pub min_message_size: usize,
+    /// Compression priority strategy
+    pub priority: CompressionPriority,
+    /// Default compression type when auto-selection is not used
+    pub default_type: CompressionType,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_message_size: 1024,               // 1KB minimum
+            priority: CompressionPriority::Speed, // LZ4 for fast compression
+            default_type: CompressionType::Lz4,
+        }
     }
 }
