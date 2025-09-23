@@ -7,7 +7,7 @@
 //! - Notification routing and delivery
 //! - Alert history and analytics
 
-use crate::monitoring::{AlertSeverity, PerformanceAlert};
+use crate::monitoring::AlertSeverity;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -101,7 +101,7 @@ pub struct AlertManagerConfig {
 impl Default for AlertManagerConfig {
     fn default() -> Self {
         Self {
-            evaluation_interval_seconds: 10,
+            evaluation_interval_seconds: 30,
             alert_history_retention_hours: 24,
             max_alerts_per_rule: 1000,
             enable_alert_aggregation: true,
@@ -110,46 +110,26 @@ impl Default for AlertManagerConfig {
     }
 }
 
-/// Alert analytics and statistics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AlertAnalytics {
-    pub total_alerts_24h: u64,
-    pub alerts_by_severity: HashMap<String, u64>,
-    pub alerts_by_component: HashMap<String, u64>,
-    pub avg_resolution_time_minutes: f64,
-    pub top_firing_rules: Vec<TopFiringRule>,
-    pub alert_trends: AlertTrends,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TopFiringRule {
-    pub rule_name: String,
-    pub fire_count: u64,
-    pub avg_duration_minutes: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AlertTrends {
-    pub hourly_counts: Vec<u64>,
-    pub daily_pattern: Vec<f64>,
-    pub resolution_time_trend: TrendDirection,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum TrendDirection {
-    Improving,
-    Worsening,
-    Stable,
-}
-
-/// Comprehensive alert manager
+/// Alert manager with real-time alerting capabilities
 pub struct AlertManager {
     config: AlertManagerConfig,
     alert_rules: Arc<RwLock<HashMap<String, AlertRule>>>,
     alert_states: Arc<RwLock<HashMap<String, AlertState>>>,
     notification_channels: Arc<RwLock<HashMap<String, NotificationChannel>>>,
-    alert_history: Arc<RwLock<VecDeque<PerformanceAlert>>>,
+    alert_history: Arc<RwLock<VecDeque<HistoricalAlert>>>,
     metrics_cache: Arc<RwLock<HashMap<String, f64>>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoricalAlert {
+    pub rule_id: String,
+    pub rule_name: String,
+    pub severity: AlertSeverity,
+    pub triggered_at: u64,
+    pub resolved_at: Option<u64>,
+    pub trigger_value: f64,
+    pub threshold: f64,
+    pub message: String,
 }
 
 impl AlertManager {
@@ -164,13 +144,10 @@ impl AlertManager {
         }
     }
 
-    /// Start the alert manager background task
-    pub async fn start_alert_manager(self: Arc<Self>) {
-        // Initialize default alert rules
-        self.initialize_default_rules().await;
-
-        // Initialize default notification channels
-        self.initialize_default_channels().await;
+    /// Start the alert evaluation loop
+    pub async fn start_evaluation_loop(self: Arc<Self>) {
+        // Initialize default rules and channels
+        self.initialize_defaults().await;
 
         let manager = Arc::clone(&self);
         tokio::spawn(async move {
@@ -180,8 +157,8 @@ impl AlertManager {
 
             loop {
                 interval.tick().await;
-                if let Err(e) = manager.evaluate_alert_rules().await {
-                    error!("Failed to evaluate alert rules: {}", e);
+                if let Err(e) = manager.evaluate_alerts().await {
+                    error!("Alert evaluation failed: {}", e);
                 }
             }
         });
@@ -192,8 +169,25 @@ impl AlertManager {
         );
     }
 
-    /// Initialize default alert rules
-    async fn initialize_default_rules(&self) {
+    /// Initialize default alert rules and notification channels
+    async fn initialize_defaults(&self) {
+        // Add default log channel
+        let log_channel = NotificationChannel {
+            id: "default_log".to_string(),
+            name: "Default Log Channel".to_string(),
+            channel_type: ChannelType::Log,
+            configuration: ChannelConfig {
+                email_addresses: None,
+                slack_webhook_url: None,
+                webhook_url: None,
+                pagerduty_key: None,
+                log_level: Some("info".to_string()),
+            },
+            enabled: true,
+        };
+        self.add_notification_channel(log_channel).await;
+
+        // Add default alert rules
         let default_rules = vec![
             AlertRule {
                 id: "high_memory_usage".to_string(),
@@ -203,188 +197,128 @@ impl AlertManager {
                 condition: AlertCondition::GreaterThan,
                 threshold: 80.0,
                 severity: AlertSeverity::Warning,
-                duration_seconds: 300,
+                duration_seconds: 300, // 5 minutes
                 enabled: true,
                 notification_channels: vec!["default_log".to_string()],
             },
             AlertRule {
                 id: "high_cpu_usage".to_string(),
                 name: "High CPU Usage".to_string(),
-                description: "CPU usage exceeds 75%".to_string(),
+                description: "CPU usage exceeds 90%".to_string(),
                 metric_name: "cpu_usage_percent".to_string(),
                 condition: AlertCondition::GreaterThan,
-                threshold: 75.0,
+                threshold: 90.0,
+                severity: AlertSeverity::Critical,
+                duration_seconds: 60, // 1 minute
+                enabled: true,
+                notification_channels: vec!["default_log".to_string()],
+            },
+            AlertRule {
+                id: "low_cache_hit_rate".to_string(),
+                name: "Low Cache Hit Rate".to_string(),
+                description: "Cache hit rate below 70%".to_string(),
+                metric_name: "cache_hit_rate".to_string(),
+                condition: AlertCondition::LessThan,
+                threshold: 0.7,
                 severity: AlertSeverity::Warning,
-                duration_seconds: 180,
-                enabled: true,
-                notification_channels: vec!["default_log".to_string()],
-            },
-            AlertRule {
-                id: "throughput_drop".to_string(),
-                name: "Throughput Drop".to_string(),
-                description: "Throughput decreased by more than 50%".to_string(),
-                metric_name: "total_throughput".to_string(),
-                condition: AlertCondition::RateDecrease(50.0),
-                threshold: 0.0,
-                severity: AlertSeverity::Critical,
-                duration_seconds: 120,
-                enabled: true,
-                notification_channels: vec!["default_log".to_string()],
-            },
-            AlertRule {
-                id: "connection_limit".to_string(),
-                name: "Connection Limit Approaching".to_string(),
-                description: "Active connections exceed 8000".to_string(),
-                metric_name: "active_connections".to_string(),
-                condition: AlertCondition::GreaterThan,
-                threshold: 8000.0,
-                severity: AlertSeverity::Critical,
-                duration_seconds: 60,
+                duration_seconds: 600, // 10 minutes
                 enabled: true,
                 notification_channels: vec!["default_log".to_string()],
             },
         ];
 
-        let mut rules = self.alert_rules.write().await;
         for rule in default_rules {
-            rules.insert(rule.id.clone(), rule);
+            self.add_alert_rule(rule).await;
         }
     }
 
-    /// Initialize default notification channels
-    async fn initialize_default_channels(&self) {
-        let default_channels = vec![NotificationChannel {
-            id: "default_log".to_string(),
-            name: "Default Log Channel".to_string(),
-            channel_type: ChannelType::Log,
-            configuration: ChannelConfig {
-                email_addresses: None,
-                slack_webhook_url: None,
-                webhook_url: None,
-                pagerduty_key: None,
-                log_level: Some("warn".to_string()),
-            },
-            enabled: true,
-        }];
+    /// Add a new alert rule
+    pub async fn add_alert_rule(&self, rule: AlertRule) {
+        let mut rules = self.alert_rules.write().await;
+        rules.insert(rule.id.clone(), rule);
+    }
 
+    /// Add a notification channel
+    pub async fn add_notification_channel(&self, channel: NotificationChannel) {
         let mut channels = self.notification_channels.write().await;
-        for channel in default_channels {
-            channels.insert(channel.id.clone(), channel);
-        }
+        channels.insert(channel.id.clone(), channel);
     }
 
-    /// Evaluate all alert rules against current metrics
-    async fn evaluate_alert_rules(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// Update metrics cache for alert evaluation
+    pub async fn update_metrics(&self, metrics: HashMap<String, f64>) {
+        let mut cache = self.metrics_cache.write().await;
+        *cache = metrics;
+    }
+
+    /// Evaluate all alert rules
+    async fn evaluate_alerts(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let rules = self.alert_rules.read().await;
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let metrics = self.metrics_cache.read().await;
+        let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 
         for rule in rules.values() {
             if !rule.enabled {
                 continue;
             }
 
-            if let Err(e) = self.evaluate_single_rule(rule, timestamp).await {
-                warn!("Failed to evaluate rule {}: {}", rule.id, e);
+            if let Some(&metric_value) = metrics.get(&rule.metric_name) {
+                self.evaluate_rule(rule, metric_value, current_time).await?;
             }
         }
 
         // Clean up old alert history
-        self.cleanup_alert_history().await;
+        self.cleanup_old_alerts(current_time).await;
 
         Ok(())
     }
 
     /// Evaluate a single alert rule
-    async fn evaluate_single_rule(
+    async fn evaluate_rule(
         &self,
         rule: &AlertRule,
-        timestamp: u64,
+        metric_value: f64,
+        current_time: u64,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Get current metric value (simplified - would integrate with actual metrics)
-        let current_value = self.get_metric_value(&rule.metric_name).await;
+        let condition_met = self.evaluate_condition(&rule.condition, metric_value, rule.threshold);
 
-        // Check if alert condition is met
-        let condition_met = match &rule.condition {
-            AlertCondition::GreaterThan => current_value > rule.threshold,
-            AlertCondition::LessThan => current_value < rule.threshold,
-            AlertCondition::EqualTo => (current_value - rule.threshold).abs() < f64::EPSILON,
-            AlertCondition::NotEqualTo => (current_value - rule.threshold).abs() > f64::EPSILON,
-            AlertCondition::RateIncrease(percent) => {
-                if let Some(previous_value) =
-                    self.get_previous_metric_value(&rule.metric_name).await
-                {
-                    let increase = ((current_value - previous_value) / previous_value) * 100.0;
-                    increase > *percent
-                } else {
-                    false
-                }
-            }
-            AlertCondition::RateDecrease(percent) => {
-                if let Some(previous_value) =
-                    self.get_previous_metric_value(&rule.metric_name).await
-                {
-                    let decrease = ((previous_value - current_value) / previous_value) * 100.0;
-                    decrease > *percent
-                } else {
-                    false
-                }
-            }
-        };
-
-        // Update alert state
-        self.update_alert_state(rule, condition_met, current_value, timestamp)
-            .await?;
-
-        Ok(())
-    }
-
-    /// Update alert state and trigger notifications if needed
-    async fn update_alert_state(
-        &self,
-        rule: &AlertRule,
-        condition_met: bool,
-        current_value: f64,
-        timestamp: u64,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut states = self.alert_states.write().await;
-        let state = states.entry(rule.id.clone()).or_insert(AlertState {
+        let alert_state = states.entry(rule.id.clone()).or_insert_with(|| AlertState {
             rule_id: rule.id.clone(),
-            status: AlertStatus::Resolved,
-            first_triggered: 0,
-            last_triggered: 0,
+            status: AlertStatus::Pending,
+            first_triggered: current_time,
+            last_triggered: current_time,
             trigger_count: 0,
-            current_value: current_value,
-            resolved_at: Some(timestamp),
+            current_value: metric_value,
+            resolved_at: None,
         });
 
-        state.current_value = current_value;
+        alert_state.current_value = metric_value;
+        alert_state.last_triggered = current_time;
 
-        match (&state.status, condition_met) {
-            (AlertStatus::Resolved, true) => {
-                // New alert condition detected
-                state.status = AlertStatus::Pending;
-                state.first_triggered = timestamp;
-                state.last_triggered = timestamp;
-                state.trigger_count += 1;
-                state.resolved_at = None;
-            }
-            (AlertStatus::Pending, true) => {
-                // Check if duration threshold is met
-                if timestamp - state.first_triggered >= rule.duration_seconds {
-                    state.status = AlertStatus::Firing;
-                    self.trigger_alert(rule, state, timestamp).await?;
+        match (&alert_state.status, condition_met) {
+            (AlertStatus::Resolved | AlertStatus::Pending, true) => {
+                // Condition met, check duration
+                if current_time - alert_state.first_triggered >= rule.duration_seconds {
+                    // Fire the alert
+                    alert_state.status = AlertStatus::Firing;
+                    alert_state.trigger_count += 1;
+                    alert_state.resolved_at = None;
+
+                    self.fire_alert(rule, metric_value, current_time).await?;
+                } else {
+                    alert_state.status = AlertStatus::Pending;
                 }
             }
             (AlertStatus::Firing, false) => {
-                // Alert condition resolved
-                state.status = AlertStatus::Resolved;
-                state.resolved_at = Some(timestamp);
-                self.resolve_alert(rule, state, timestamp).await?;
+                // Alert resolved
+                alert_state.status = AlertStatus::Resolved;
+                alert_state.resolved_at = Some(current_time);
+
+                self.resolve_alert(rule, current_time).await?;
             }
             (AlertStatus::Pending, false) => {
-                // Condition no longer met before firing
-                state.status = AlertStatus::Resolved;
-                state.resolved_at = Some(timestamp);
+                // Reset pending state
+                alert_state.first_triggered = current_time;
             }
             _ => {
                 // No state change needed
@@ -394,43 +328,63 @@ impl AlertManager {
         Ok(())
     }
 
-    /// Trigger an alert and send notifications
-    async fn trigger_alert(
+    /// Evaluate alert condition
+    fn evaluate_condition(&self, condition: &AlertCondition, value: f64, threshold: f64) -> bool {
+        match condition {
+            AlertCondition::GreaterThan => value > threshold,
+            AlertCondition::LessThan => value < threshold,
+            AlertCondition::EqualTo => (value - threshold).abs() < f64::EPSILON,
+            AlertCondition::NotEqualTo => (value - threshold).abs() > f64::EPSILON,
+            AlertCondition::RateIncrease(percentage) => {
+                // Would need historical data to calculate rate
+                value > threshold * (1.0 + percentage / 100.0)
+            }
+            AlertCondition::RateDecrease(percentage) => {
+                // Would need historical data to calculate rate
+                value < threshold * (1.0 - percentage / 100.0)
+            }
+        }
+    }
+
+    /// Fire an alert
+    async fn fire_alert(
         &self,
         rule: &AlertRule,
-        state: &AlertState,
+        trigger_value: f64,
         timestamp: u64,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let alert = PerformanceAlert {
-            id: format!("{}_{}", rule.id, timestamp),
+        let message = format!(
+            "Alert: {} - {} exceeded threshold {} with value {}",
+            rule.name, rule.metric_name, rule.threshold, trigger_value
+        );
+
+        info!("🚨 ALERT FIRED: {}", message);
+
+        // Add to history
+        let historical_alert = HistoricalAlert {
+            rule_id: rule.id.clone(),
+            rule_name: rule.name.clone(),
             severity: rule.severity.clone(),
-            message: format!(
-                "{}: {} = {:.2} (threshold: {:.2})",
-                rule.name, rule.metric_name, state.current_value, rule.threshold
-            ),
-            timestamp,
-            metric_name: rule.metric_name.clone(),
-            current_value: state.current_value,
+            triggered_at: timestamp,
+            resolved_at: None,
+            trigger_value,
             threshold: rule.threshold,
+            message: message.clone(),
         };
 
-        // Add to alert history
         {
             let mut history = self.alert_history.write().await;
-            history.push_back(alert.clone());
-        }
+            history.push_back(historical_alert);
 
-        // Send notifications
-        for channel_id in &rule.notification_channels {
-            if let Err(e) = self.send_notification(channel_id, &alert).await {
-                warn!(
-                    "Failed to send notification to channel {}: {}",
-                    channel_id, e
-                );
+            // Limit history size
+            while history.len() > self.config.max_alerts_per_rule {
+                history.pop_front();
             }
         }
 
-        info!("Alert triggered: {} - {}", rule.name, alert.message);
+        // Send notifications
+        self.send_notifications(rule, &message, AlertNotificationType::Fire)
+            .await?;
 
         Ok(())
     }
@@ -439,49 +393,45 @@ impl AlertManager {
     async fn resolve_alert(
         &self,
         rule: &AlertRule,
-        state: &AlertState,
-        _timestamp: u64,
+        timestamp: u64,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        info!(
-            "Alert resolved: {} - {} returned to normal ({})",
-            rule.name, rule.metric_name, state.current_value
-        );
+        let message = format!("Alert resolved: {}", rule.name);
+
+        info!("✅ ALERT RESOLVED: {}", message);
+
+        // Update history
+        {
+            let mut history = self.alert_history.write().await;
+            if let Some(alert) = history
+                .iter_mut()
+                .rev()
+                .find(|a| a.rule_id == rule.id && a.resolved_at.is_none())
+            {
+                alert.resolved_at = Some(timestamp);
+            }
+        }
+
+        // Send resolution notification
+        self.send_notifications(rule, &message, AlertNotificationType::Resolve)
+            .await?;
+
         Ok(())
     }
 
-    /// Send notification through specified channel
-    async fn send_notification(
+    /// Send notifications for alert
+    async fn send_notifications(
         &self,
-        channel_id: &str,
-        alert: &PerformanceAlert,
+        rule: &AlertRule,
+        message: &str,
+        notification_type: AlertNotificationType,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let channels = self.notification_channels.read().await;
-        if let Some(channel) = channels.get(channel_id) {
-            if !channel.enabled {
-                return Ok(());
-            }
 
-            match channel.channel_type {
-                ChannelType::Log => match alert.severity {
-                    AlertSeverity::Critical => error!("CRITICAL ALERT: {}", alert.message),
-                    AlertSeverity::Warning => warn!("WARNING ALERT: {}", alert.message),
-                    AlertSeverity::Info => info!("INFO ALERT: {}", alert.message),
-                },
-                ChannelType::Email => {
-                    // Email notification implementation would go here
-                    info!("Email notification sent for alert: {}", alert.message);
-                }
-                ChannelType::Slack => {
-                    // Slack notification implementation would go here
-                    info!("Slack notification sent for alert: {}", alert.message);
-                }
-                ChannelType::Webhook => {
-                    // Webhook notification implementation would go here
-                    info!("Webhook notification sent for alert: {}", alert.message);
-                }
-                ChannelType::PagerDuty => {
-                    // PagerDuty notification implementation would go here
-                    info!("PagerDuty notification sent for alert: {}", alert.message);
+        for channel_id in &rule.notification_channels {
+            if let Some(channel) = channels.get(channel_id) {
+                if channel.enabled {
+                    self.send_notification(channel, message, notification_type)
+                        .await?;
                 }
             }
         }
@@ -489,103 +439,109 @@ impl AlertManager {
         Ok(())
     }
 
-    /// Get current metric value (simplified implementation)
-    async fn get_metric_value(&self, metric_name: &str) -> f64 {
-        // In a real implementation, this would fetch from the metrics registry
-        match metric_name {
-            "memory_usage_percent" => 25.0,
-            "cpu_usage_percent" => 30.0,
-            "total_throughput" => 45000.0,
-            "active_connections" => 1500.0,
-            _ => 0.0,
-        }
-    }
-
-    /// Get previous metric value for rate calculations
-    async fn get_previous_metric_value(&self, metric_name: &str) -> Option<f64> {
-        let cache = self.metrics_cache.read().await;
-        cache.get(metric_name).copied()
-    }
-
-    /// Clean up old alert history
-    async fn cleanup_alert_history(&self) {
-        let cutoff_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            - (self.config.alert_history_retention_hours as u64 * 3600);
-
-        let mut history = self.alert_history.write().await;
-        while let Some(front) = history.front() {
-            if front.timestamp < cutoff_time {
-                history.pop_front();
-            } else {
-                break;
+    /// Send notification to specific channel
+    async fn send_notification(
+        &self,
+        channel: &NotificationChannel,
+        message: &str,
+        notification_type: AlertNotificationType,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match channel.channel_type {
+            ChannelType::Log => match notification_type {
+                AlertNotificationType::Fire => warn!("ALERT: {}", message),
+                AlertNotificationType::Resolve => info!("ALERT RESOLVED: {}", message),
+            },
+            ChannelType::Email => {
+                // Would implement email sending here
+                info!("EMAIL ALERT: {}", message);
+            }
+            ChannelType::Slack => {
+                // Would implement Slack webhook here
+                info!("SLACK ALERT: {}", message);
+            }
+            ChannelType::Webhook => {
+                // Would implement generic webhook here
+                info!("WEBHOOK ALERT: {}", message);
+            }
+            ChannelType::PagerDuty => {
+                // Would implement PagerDuty integration here
+                info!("PAGERDUTY ALERT: {}", message);
             }
         }
+
+        Ok(())
+    }
+
+    /// Clean up old alerts from history
+    async fn cleanup_old_alerts(&self, current_time: u64) {
+        let cutoff_time = current_time - (self.config.alert_history_retention_hours as u64 * 3600);
+
+        let mut history = self.alert_history.write().await;
+        history.retain(|alert| alert.triggered_at > cutoff_time);
     }
 
     /// Get current alert statistics
-    pub async fn get_alert_analytics(&self) -> AlertAnalytics {
-        let history = self.alert_history.read().await;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let twenty_four_hours_ago = now - 86400;
-
-        let recent_alerts: Vec<_> = history
-            .iter()
-            .filter(|alert| alert.timestamp > twenty_four_hours_ago)
-            .collect();
-
-        let total_alerts_24h = recent_alerts.len() as u64;
-
-        let mut alerts_by_severity = HashMap::new();
-        let mut alerts_by_component = HashMap::new();
-
-        for alert in &recent_alerts {
-            let severity_key = format!("{:?}", alert.severity);
-            *alerts_by_severity.entry(severity_key).or_insert(0) += 1;
-            *alerts_by_component
-                .entry(alert.metric_name.clone())
-                .or_insert(0) += 1;
-        }
-
-        AlertAnalytics {
-            total_alerts_24h,
-            alerts_by_severity,
-            alerts_by_component,
-            avg_resolution_time_minutes: 15.0, // Simplified
-            top_firing_rules: vec![],          // Simplified
-            alert_trends: AlertTrends {
-                hourly_counts: vec![0; 24],  // Simplified
-                daily_pattern: vec![0.0; 7], // Simplified
-                resolution_time_trend: TrendDirection::Stable,
-            },
-        }
-    }
-
-    /// Get active alerts
-    pub async fn get_active_alerts(&self) -> Vec<PerformanceAlert> {
+    pub async fn get_alert_stats(&self) -> AlertStats {
         let states = self.alert_states.read().await;
         let history = self.alert_history.read().await;
 
-        history
+        let total_alerts = states.len();
+        let firing_alerts = states
+            .values()
+            .filter(|s| matches!(s.status, AlertStatus::Firing))
+            .count();
+        let pending_alerts = states
+            .values()
+            .filter(|s| matches!(s.status, AlertStatus::Pending))
+            .count();
+
+        let critical_alerts = history
             .iter()
-            .filter(|alert| {
-                if let Some(state) = states.get(&extract_rule_id(&alert.id)) {
-                    matches!(state.status, AlertStatus::Firing)
-                } else {
-                    false
-                }
-            })
-            .cloned()
-            .collect()
+            .filter(|a| matches!(a.severity, AlertSeverity::Critical))
+            .count();
+        let warning_alerts = history
+            .iter()
+            .filter(|a| matches!(a.severity, AlertSeverity::Warning))
+            .count();
+        let info_alerts = history
+            .iter()
+            .filter(|a| matches!(a.severity, AlertSeverity::Info))
+            .count();
+
+        AlertStats {
+            total_alerts,
+            firing_alerts,
+            pending_alerts,
+            resolved_alerts: total_alerts - firing_alerts - pending_alerts,
+            critical_alerts,
+            warning_alerts,
+            info_alerts,
+            alert_history_count: history.len(),
+        }
+    }
+
+    /// Get recent alert history
+    pub async fn get_recent_alerts(&self, limit: usize) -> Vec<HistoricalAlert> {
+        let history = self.alert_history.read().await;
+        history.iter().rev().take(limit).cloned().collect()
     }
 }
 
-/// Extract rule ID from alert ID
-fn extract_rule_id(alert_id: &str) -> String {
-    alert_id.split('_').take(1).collect::<Vec<_>>().join("_")
+#[derive(Debug, Clone, Copy)]
+enum AlertNotificationType {
+    Fire,
+    Resolve,
+}
+
+/// Alert statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertStats {
+    pub total_alerts: usize,
+    pub firing_alerts: usize,
+    pub pending_alerts: usize,
+    pub resolved_alerts: usize,
+    pub critical_alerts: usize,
+    pub warning_alerts: usize,
+    pub info_alerts: usize,
+    pub alert_history_count: usize,
 }

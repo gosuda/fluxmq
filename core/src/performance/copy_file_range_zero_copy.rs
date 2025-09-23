@@ -13,7 +13,6 @@
 /// - Backup and archival operations
 use crate::Result;
 use std::fs::File;
-use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 

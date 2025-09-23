@@ -141,6 +141,12 @@ pub struct MetricsRegistry {
     pub broker: Arc<BrokerMetrics>,
     /// System metrics (lock-free)
     pub system: Arc<SystemMetrics>,
+    /// Message cache performance metrics
+    pub cache: Arc<CacheMetrics>,
+    /// Transaction system metrics
+    pub transactions: Arc<TransactionMetrics>,
+    /// Performance bottleneck tracking
+    pub performance: Arc<PerformanceMetrics>,
 }
 
 impl MetricsRegistry {
@@ -151,6 +157,9 @@ impl MetricsRegistry {
             storage: Arc::new(StorageMetrics::new()),
             broker: Arc::new(BrokerMetrics::new()),
             system: Arc::new(SystemMetrics::new()),
+            cache: Arc::new(CacheMetrics::new()),
+            transactions: Arc::new(TransactionMetrics::new()),
+            performance: Arc::new(PerformanceMetrics::new()),
         }
     }
 
@@ -270,6 +279,36 @@ impl MetricsRegistry {
                 cpu_usage_percent: self.system.cpu_usage_percent(),
                 uptime_seconds: self.system.uptime_seconds(),
             },
+            cache: CacheSnapshot {
+                total_hits: self.cache.total_hits(),
+                total_misses: self.cache.total_misses(),
+                hit_rate: self.cache.calculate_hit_rate(),
+                memory_usage_mb: self.cache.memory_usage_mb(),
+                peak_memory_mb: self.cache.peak_memory_mb(),
+                active_partitions: self.cache.active_partitions(),
+                total_evictions: self.cache.total_evictions(),
+            },
+            transactions: TransactionSnapshot {
+                active_transactions: self.transactions.active_transactions(),
+                total_started: self.transactions.total_started(),
+                total_committed: self.transactions.total_committed(),
+                total_aborted: self.transactions.total_aborted(),
+                active_producers: self.transactions.active_producers(),
+                commit_rate: self.transactions.commit_rate(),
+                avg_duration_ms: self.transactions.avg_duration_ms(),
+                max_duration_ms: self.transactions.max_duration_ms(),
+            },
+            performance: PerformanceSnapshot {
+                p50_latency_ms: self.performance.p50_latency_ms(),
+                p95_latency_ms: self.performance.p95_latency_ms(),
+                p99_latency_ms: self.performance.p99_latency_ms(),
+                max_latency_ms: self.performance.max_latency_ms(),
+                throughput_degradation_percentage: self
+                    .performance
+                    .throughput_degradation_percentage(),
+                current_queue_depth: self.performance.current_queue_depth(),
+                max_queue_depth: self.performance.max_queue_depth(),
+            },
         }
     }
 }
@@ -320,7 +359,11 @@ impl ThroughputMetrics {
         self.bytes_produced.0.fetch_add(bytes, Ordering::Release);
 
         // Debug logging to track message recording
-        tracing::debug!("🔧 METRICS RECORD: count={}, new_total={}", count, new_total);
+        tracing::debug!(
+            "🔧 METRICS RECORD: count={}, new_total={}",
+            count,
+            new_total
+        );
     }
 
     #[inline(always)]
@@ -362,15 +405,16 @@ impl ThroughputMetrics {
                 let last_produced = self.last_produced_snapshot.load(Ordering::Acquire);
                 let last_consumed = self.last_consumed_snapshot.load(Ordering::Acquire);
 
-                // Calculate rates
-                let producer_rate =
-                    ((current_produced - last_produced) as f64 / elapsed_secs) as u64;
-                let consumer_rate =
-                    ((current_consumed - last_consumed) as f64 / elapsed_secs) as u64;
+                // Calculate rates with proper rounding
+                let producer_rate_f64 = (current_produced - last_produced) as f64 / elapsed_secs;
+                let consumer_rate_f64 = (current_consumed - last_consumed) as f64 / elapsed_secs;
+
+                let producer_rate = producer_rate_f64.round() as u64;
+                let consumer_rate = consumer_rate_f64.round() as u64;
 
                 // Debug logging for rate calculation
-                tracing::info!("🔧 RATE CALC DEBUG: elapsed_secs={:.2}, current_produced={}, last_produced={}, producer_rate={}", 
-                    elapsed_secs, current_produced, last_produced, producer_rate);
+                tracing::info!("🔧 RATE CALC DEBUG: elapsed_secs={:.2}, current_produced={}, last_produced={}, producer_rate_f64={:.2}, producer_rate={}",
+                    elapsed_secs, current_produced, last_produced, producer_rate_f64, producer_rate);
 
                 // Store rates with Release ordering
                 self.producer_rate.0.store(producer_rate, Ordering::Release);
@@ -619,6 +663,9 @@ pub struct MetricsSnapshot {
     pub broker: BrokerSnapshot,
     pub consumer_groups: HashMap<String, ConsumerGroupMetrics>,
     pub system: SystemSnapshot,
+    pub cache: CacheSnapshot,
+    pub transactions: TransactionSnapshot,
+    pub performance: PerformanceSnapshot,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -649,6 +696,40 @@ pub struct SystemSnapshot {
     pub memory_usage_mb: u64,
     pub cpu_usage_percent: f64,
     pub uptime_seconds: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CacheSnapshot {
+    pub total_hits: u64,
+    pub total_misses: u64,
+    pub hit_rate: f64,
+    pub memory_usage_mb: f64,
+    pub peak_memory_mb: f64,
+    pub active_partitions: usize,
+    pub total_evictions: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TransactionSnapshot {
+    pub active_transactions: u64,
+    pub total_started: u64,
+    pub total_committed: u64,
+    pub total_aborted: u64,
+    pub active_producers: usize,
+    pub commit_rate: f64,
+    pub avg_duration_ms: u64,
+    pub max_duration_ms: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PerformanceSnapshot {
+    pub p50_latency_ms: f64,
+    pub p95_latency_ms: f64,
+    pub p99_latency_ms: f64,
+    pub max_latency_ms: f64,
+    pub throughput_degradation_percentage: f64,
+    pub current_queue_depth: usize,
+    pub max_queue_depth: usize,
 }
 
 impl MetricsSnapshot {
@@ -738,6 +819,97 @@ impl MetricsSnapshot {
             ));
         }
 
+        // Cache metrics
+        output.push_str(&format!(
+            "fluxmq_cache_hits_total {}\n",
+            self.cache.total_hits
+        ));
+        output.push_str(&format!(
+            "fluxmq_cache_misses_total {}\n",
+            self.cache.total_misses
+        ));
+        output.push_str(&format!("fluxmq_cache_hit_rate {}\n", self.cache.hit_rate));
+        output.push_str(&format!(
+            "fluxmq_cache_memory_usage_mb {}\n",
+            self.cache.memory_usage_mb
+        ));
+        output.push_str(&format!(
+            "fluxmq_cache_peak_memory_mb {}\n",
+            self.cache.peak_memory_mb
+        ));
+        output.push_str(&format!(
+            "fluxmq_cache_active_partitions {}\n",
+            self.cache.active_partitions
+        ));
+        output.push_str(&format!(
+            "fluxmq_cache_evictions_total {}\n",
+            self.cache.total_evictions
+        ));
+
+        // Transaction metrics
+        output.push_str(&format!(
+            "fluxmq_transactions_active {}\n",
+            self.transactions.active_transactions
+        ));
+        output.push_str(&format!(
+            "fluxmq_transactions_started_total {}\n",
+            self.transactions.total_started
+        ));
+        output.push_str(&format!(
+            "fluxmq_transactions_committed_total {}\n",
+            self.transactions.total_committed
+        ));
+        output.push_str(&format!(
+            "fluxmq_transactions_aborted_total {}\n",
+            self.transactions.total_aborted
+        ));
+        output.push_str(&format!(
+            "fluxmq_transactions_active_producers {}\n",
+            self.transactions.active_producers
+        ));
+        output.push_str(&format!(
+            "fluxmq_transactions_commit_rate {}\n",
+            self.transactions.commit_rate
+        ));
+        output.push_str(&format!(
+            "fluxmq_transactions_avg_duration_ms {}\n",
+            self.transactions.avg_duration_ms
+        ));
+        output.push_str(&format!(
+            "fluxmq_transactions_max_duration_ms {}\n",
+            self.transactions.max_duration_ms
+        ));
+
+        // Performance metrics
+        output.push_str(&format!(
+            "fluxmq_latency_p50_ms {}\n",
+            self.performance.p50_latency_ms
+        ));
+        output.push_str(&format!(
+            "fluxmq_latency_p95_ms {}\n",
+            self.performance.p95_latency_ms
+        ));
+        output.push_str(&format!(
+            "fluxmq_latency_p99_ms {}\n",
+            self.performance.p99_latency_ms
+        ));
+        output.push_str(&format!(
+            "fluxmq_latency_max_ms {}\n",
+            self.performance.max_latency_ms
+        ));
+        output.push_str(&format!(
+            "fluxmq_throughput_degradation_percentage {}\n",
+            self.performance.throughput_degradation_percentage
+        ));
+        output.push_str(&format!(
+            "fluxmq_queue_depth_current {}\n",
+            self.performance.current_queue_depth
+        ));
+        output.push_str(&format!(
+            "fluxmq_queue_depth_max {}\n",
+            self.performance.max_queue_depth
+        ));
+
         output
     }
 }
@@ -751,7 +923,7 @@ impl Serialize for MetricsSnapshot {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("MetricsSnapshot", 6)?;
+        let mut state = serializer.serialize_struct("MetricsSnapshot", 9)?;
         state.serialize_field(
             "timestamp",
             &self
@@ -765,6 +937,9 @@ impl Serialize for MetricsSnapshot {
         state.serialize_field("broker", &self.broker)?;
         state.serialize_field("consumer_groups", &self.consumer_groups)?;
         state.serialize_field("system", &self.system)?;
+        state.serialize_field("cache", &self.cache)?;
+        state.serialize_field("transactions", &self.transactions)?;
+        state.serialize_field("performance", &self.performance)?;
         state.end()
     }
 }
@@ -775,5 +950,624 @@ impl<'de> Deserialize<'de> for MetricsSnapshot {
         D: serde::Deserializer<'de>,
     {
         Err(serde::de::Error::custom("Deserialization not implemented"))
+    }
+}
+
+/// Message cache performance metrics
+#[derive(Debug)]
+pub struct CacheMetrics {
+    // Global cache statistics
+    total_cache_hits: CacheLineAligned<AtomicU64>,
+    total_cache_misses: CacheLineAligned<AtomicU64>,
+    total_evictions: AtomicU64,
+    total_memory_usage: AtomicU64,
+    active_partitions: AtomicUsize,
+
+    // Per-partition performance tracking
+    avg_hit_rate: AtomicU64, // Stored as percentage * 100 for precision
+    peak_memory_usage: AtomicU64,
+    eviction_rate: AtomicU64,
+}
+
+impl CacheMetrics {
+    pub fn new() -> Self {
+        Self {
+            total_cache_hits: CacheLineAligned(AtomicU64::new(0)),
+            total_cache_misses: CacheLineAligned(AtomicU64::new(0)),
+            total_evictions: AtomicU64::new(0),
+            total_memory_usage: AtomicU64::new(0),
+            active_partitions: AtomicUsize::new(0),
+            avg_hit_rate: AtomicU64::new(0),
+            peak_memory_usage: AtomicU64::new(0),
+            eviction_rate: AtomicU64::new(0),
+        }
+    }
+
+    #[inline(always)]
+    pub fn record_cache_hit(&self) {
+        self.total_cache_hits.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn record_cache_miss(&self) {
+        self.total_cache_misses.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_eviction(&self, count: u64) {
+        self.total_evictions.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn update_memory_usage(&self, bytes: u64) {
+        self.total_memory_usage.store(bytes, Ordering::Relaxed);
+        let current_peak = self.peak_memory_usage.load(Ordering::Relaxed);
+        if bytes > current_peak {
+            self.peak_memory_usage.store(bytes, Ordering::Relaxed);
+        }
+    }
+
+    pub fn update_active_partitions(&self, count: usize) {
+        self.active_partitions.store(count, Ordering::Relaxed);
+    }
+
+    pub fn calculate_hit_rate(&self) -> f64 {
+        let hits = self.total_cache_hits.0.load(Ordering::Relaxed);
+        let misses = self.total_cache_misses.0.load(Ordering::Relaxed);
+        let total = hits + misses;
+        if total > 0 {
+            hits as f64 / total as f64
+        } else {
+            0.0
+        }
+    }
+
+    // Getters for metrics
+    pub fn total_hits(&self) -> u64 {
+        self.total_cache_hits.0.load(Ordering::Relaxed)
+    }
+    pub fn total_misses(&self) -> u64 {
+        self.total_cache_misses.0.load(Ordering::Relaxed)
+    }
+    pub fn total_evictions(&self) -> u64 {
+        self.total_evictions.load(Ordering::Relaxed)
+    }
+    pub fn memory_usage_bytes(&self) -> u64 {
+        self.total_memory_usage.load(Ordering::Relaxed)
+    }
+    pub fn memory_usage_mb(&self) -> f64 {
+        self.memory_usage_bytes() as f64 / (1024.0 * 1024.0)
+    }
+    pub fn peak_memory_mb(&self) -> f64 {
+        self.peak_memory_usage.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0)
+    }
+    pub fn active_partitions(&self) -> usize {
+        self.active_partitions.load(Ordering::Relaxed)
+    }
+}
+
+/// Transaction system metrics
+#[derive(Debug)]
+pub struct TransactionMetrics {
+    // Transaction counts
+    active_transactions: CacheLineAligned<AtomicU64>,
+    total_transactions_started: CacheLineAligned<AtomicU64>,
+    total_transactions_committed: CacheLineAligned<AtomicU64>,
+    total_transactions_aborted: CacheLineAligned<AtomicU64>,
+
+    // Producer metrics
+    active_producers: AtomicUsize,
+    total_producer_ids_allocated: AtomicU64,
+    producer_epoch_bumps: AtomicU64,
+
+    // Transaction timing
+    avg_transaction_duration_ms: AtomicU64,
+    max_transaction_duration_ms: AtomicU64,
+    transaction_timeout_count: AtomicU64,
+
+    // Error tracking
+    invalid_producer_epoch_errors: AtomicU64,
+    concurrent_transaction_errors: AtomicU64,
+    coordinator_fenced_errors: AtomicU64,
+}
+
+impl TransactionMetrics {
+    pub fn new() -> Self {
+        Self {
+            active_transactions: CacheLineAligned(AtomicU64::new(0)),
+            total_transactions_started: CacheLineAligned(AtomicU64::new(0)),
+            total_transactions_committed: CacheLineAligned(AtomicU64::new(0)),
+            total_transactions_aborted: CacheLineAligned(AtomicU64::new(0)),
+            active_producers: AtomicUsize::new(0),
+            total_producer_ids_allocated: AtomicU64::new(0),
+            producer_epoch_bumps: AtomicU64::new(0),
+            avg_transaction_duration_ms: AtomicU64::new(0),
+            max_transaction_duration_ms: AtomicU64::new(0),
+            transaction_timeout_count: AtomicU64::new(0),
+            invalid_producer_epoch_errors: AtomicU64::new(0),
+            concurrent_transaction_errors: AtomicU64::new(0),
+            coordinator_fenced_errors: AtomicU64::new(0),
+        }
+    }
+
+    #[inline(always)]
+    pub fn transaction_started(&self) {
+        self.active_transactions.0.fetch_add(1, Ordering::Relaxed);
+        self.total_transactions_started
+            .0
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn transaction_committed(&self, duration_ms: u64) {
+        self.active_transactions.0.fetch_sub(1, Ordering::Relaxed);
+        self.total_transactions_committed
+            .0
+            .fetch_add(1, Ordering::Relaxed);
+        self.update_transaction_duration(duration_ms);
+    }
+
+    #[inline(always)]
+    pub fn transaction_aborted(&self, duration_ms: u64) {
+        self.active_transactions.0.fetch_sub(1, Ordering::Relaxed);
+        self.total_transactions_aborted
+            .0
+            .fetch_add(1, Ordering::Relaxed);
+        self.update_transaction_duration(duration_ms);
+    }
+
+    pub fn producer_allocated(&self) {
+        self.active_producers.fetch_add(1, Ordering::Relaxed);
+        self.total_producer_ids_allocated
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn producer_released(&self) {
+        self.active_producers.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn epoch_bumped(&self) {
+        self.producer_epoch_bumps.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn update_transaction_duration(&self, duration_ms: u64) {
+        // Update max duration
+        let current_max = self.max_transaction_duration_ms.load(Ordering::Relaxed);
+        if duration_ms > current_max {
+            self.max_transaction_duration_ms
+                .store(duration_ms, Ordering::Relaxed);
+        }
+
+        // Simple average calculation (in production would use exponential moving average)
+        let current_avg = self.avg_transaction_duration_ms.load(Ordering::Relaxed);
+        let new_avg = (current_avg + duration_ms) / 2;
+        self.avg_transaction_duration_ms
+            .store(new_avg, Ordering::Relaxed);
+    }
+
+    // Error tracking methods
+    pub fn invalid_epoch_error(&self) {
+        self.invalid_producer_epoch_errors
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn concurrent_transaction_error(&self) {
+        self.concurrent_transaction_errors
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn coordinator_fenced_error(&self) {
+        self.coordinator_fenced_errors
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn transaction_timeout(&self) {
+        self.transaction_timeout_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    // Getter methods
+    pub fn active_transactions(&self) -> u64 {
+        self.active_transactions.0.load(Ordering::Relaxed)
+    }
+    pub fn total_started(&self) -> u64 {
+        self.total_transactions_started.0.load(Ordering::Relaxed)
+    }
+    pub fn total_committed(&self) -> u64 {
+        self.total_transactions_committed.0.load(Ordering::Relaxed)
+    }
+    pub fn total_aborted(&self) -> u64 {
+        self.total_transactions_aborted.0.load(Ordering::Relaxed)
+    }
+    pub fn active_producers(&self) -> usize {
+        self.active_producers.load(Ordering::Relaxed)
+    }
+    pub fn commit_rate(&self) -> f64 {
+        let committed = self.total_committed();
+        let total = committed + self.total_aborted();
+        if total > 0 {
+            committed as f64 / total as f64
+        } else {
+            0.0
+        }
+    }
+    pub fn avg_duration_ms(&self) -> u64 {
+        self.avg_transaction_duration_ms.load(Ordering::Relaxed)
+    }
+    pub fn max_duration_ms(&self) -> u64 {
+        self.max_transaction_duration_ms.load(Ordering::Relaxed)
+    }
+}
+
+/// Performance bottleneck tracking metrics
+#[derive(Debug)]
+pub struct PerformanceMetrics {
+    // Latency tracking (stored in microseconds for precision)
+    p50_latency_us: AtomicU64,
+    p95_latency_us: AtomicU64,
+    p99_latency_us: AtomicU64,
+    max_latency_us: AtomicU64,
+
+    // Throughput degradation detection
+    baseline_throughput: AtomicU64,
+    current_throughput: AtomicU64,
+    throughput_degradation_count: AtomicU64,
+
+    // Resource bottleneck indicators
+    memory_pressure_events: AtomicU64,
+    cpu_saturation_events: AtomicU64,
+    io_wait_events: AtomicU64,
+    network_saturation_events: AtomicU64,
+
+    // Queue depth and backpressure
+    max_queue_depth: AtomicUsize,
+    current_queue_depth: AtomicUsize,
+    backpressure_events: AtomicU64,
+
+    // Performance alerts
+    performance_alerts_triggered: AtomicU64,
+    critical_alerts_triggered: AtomicU64,
+}
+
+impl PerformanceMetrics {
+    pub fn new() -> Self {
+        Self {
+            p50_latency_us: AtomicU64::new(0),
+            p95_latency_us: AtomicU64::new(0),
+            p99_latency_us: AtomicU64::new(0),
+            max_latency_us: AtomicU64::new(0),
+            baseline_throughput: AtomicU64::new(0),
+            current_throughput: AtomicU64::new(0),
+            throughput_degradation_count: AtomicU64::new(0),
+            memory_pressure_events: AtomicU64::new(0),
+            cpu_saturation_events: AtomicU64::new(0),
+            io_wait_events: AtomicU64::new(0),
+            network_saturation_events: AtomicU64::new(0),
+            max_queue_depth: AtomicUsize::new(0),
+            current_queue_depth: AtomicUsize::new(0),
+            backpressure_events: AtomicU64::new(0),
+            performance_alerts_triggered: AtomicU64::new(0),
+            critical_alerts_triggered: AtomicU64::new(0),
+        }
+    }
+
+    pub fn update_latency_percentiles(&self, p50_us: u64, p95_us: u64, p99_us: u64, max_us: u64) {
+        self.p50_latency_us.store(p50_us, Ordering::Relaxed);
+        self.p95_latency_us.store(p95_us, Ordering::Relaxed);
+        self.p99_latency_us.store(p99_us, Ordering::Relaxed);
+        self.max_latency_us.store(max_us, Ordering::Relaxed);
+    }
+
+    pub fn update_throughput(&self, current: u64, baseline: Option<u64>) {
+        self.current_throughput.store(current, Ordering::Relaxed);
+        if let Some(baseline) = baseline {
+            self.baseline_throughput.store(baseline, Ordering::Relaxed);
+
+            // Detect throughput degradation (>20% drop)
+            if current < baseline * 80 / 100 {
+                self.throughput_degradation_count
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn update_queue_depth(&self, current: usize) {
+        self.current_queue_depth.store(current, Ordering::Relaxed);
+        let current_max = self.max_queue_depth.load(Ordering::Relaxed);
+        if current > current_max {
+            self.max_queue_depth.store(current, Ordering::Relaxed);
+        }
+    }
+
+    // Resource bottleneck event tracking
+    pub fn memory_pressure_detected(&self) {
+        self.memory_pressure_events.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn cpu_saturation_detected(&self) {
+        self.cpu_saturation_events.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn io_wait_detected(&self) {
+        self.io_wait_events.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn network_saturation_detected(&self) {
+        self.network_saturation_events
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn backpressure_detected(&self) {
+        self.backpressure_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // Alert tracking
+    pub fn performance_alert_triggered(&self) {
+        self.performance_alerts_triggered
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn critical_alert_triggered(&self) {
+        self.critical_alerts_triggered
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    // Getter methods with unit conversion
+    pub fn p50_latency_ms(&self) -> f64 {
+        self.p50_latency_us.load(Ordering::Relaxed) as f64 / 1000.0
+    }
+    pub fn p95_latency_ms(&self) -> f64 {
+        self.p95_latency_us.load(Ordering::Relaxed) as f64 / 1000.0
+    }
+    pub fn p99_latency_ms(&self) -> f64 {
+        self.p99_latency_us.load(Ordering::Relaxed) as f64 / 1000.0
+    }
+    pub fn max_latency_ms(&self) -> f64 {
+        self.max_latency_us.load(Ordering::Relaxed) as f64 / 1000.0
+    }
+    pub fn throughput_degradation_percentage(&self) -> f64 {
+        let baseline = self.baseline_throughput.load(Ordering::Relaxed);
+        let current = self.current_throughput.load(Ordering::Relaxed);
+        if baseline > 0 {
+            ((baseline as f64 - current as f64) / baseline as f64) * 100.0
+        } else {
+            0.0
+        }
+    }
+    pub fn current_queue_depth(&self) -> usize {
+        self.current_queue_depth.load(Ordering::Relaxed)
+    }
+    pub fn max_queue_depth(&self) -> usize {
+        self.max_queue_depth.load(Ordering::Relaxed)
+    }
+}
+
+/// Compression metrics for monitoring message compression performance
+///
+/// Tracks compression efficiency, throughput, and type usage across the storage layer.
+/// All metrics use atomic operations for lock-free updates in hot paths.
+#[repr(C, align(64))] // Cache-line aligned to prevent false sharing
+#[derive(Debug)]
+pub struct CompressionMetrics {
+    // Compression operation counters
+    messages_compressed: AtomicU64,
+    messages_decompressed: AtomicU64,
+    compression_failures: AtomicU64,
+    decompression_failures: AtomicU64,
+
+    // Size tracking for efficiency calculations
+    total_original_bytes: AtomicU64,
+    total_compressed_bytes: AtomicU64,
+
+    // Compression type usage (index by CompressionType as u8)
+    lz4_compressions: AtomicU64,
+    snappy_compressions: AtomicU64,
+    gzip_compressions: AtomicU64,
+    zstd_compressions: AtomicU64,
+
+    // Performance metrics
+    total_compression_time_us: AtomicU64, // Total time spent compressing (microseconds)
+    total_decompression_time_us: AtomicU64, // Total time spent decompressing (microseconds)
+
+    // Efficiency tracking
+    best_compression_ratio: AtomicU64, // Best ratio achieved (stored as percentage * 100)
+    worst_compression_ratio: AtomicU64, // Worst ratio achieved (stored as percentage * 100)
+
+    // Message size distribution for compression decisions
+    small_messages_skipped: AtomicU64, // Messages < min_size that skipped compression
+    large_messages_compressed: AtomicU64, // Messages >= min_size that were compressed
+}
+
+impl CompressionMetrics {
+    pub fn new() -> Self {
+        Self {
+            messages_compressed: AtomicU64::new(0),
+            messages_decompressed: AtomicU64::new(0),
+            compression_failures: AtomicU64::new(0),
+            decompression_failures: AtomicU64::new(0),
+            total_original_bytes: AtomicU64::new(0),
+            total_compressed_bytes: AtomicU64::new(0),
+            lz4_compressions: AtomicU64::new(0),
+            snappy_compressions: AtomicU64::new(0),
+            gzip_compressions: AtomicU64::new(0),
+            zstd_compressions: AtomicU64::new(0),
+            total_compression_time_us: AtomicU64::new(0),
+            total_decompression_time_us: AtomicU64::new(0),
+            best_compression_ratio: AtomicU64::new(10000), // 100.00% (no compression achieved)
+            worst_compression_ratio: AtomicU64::new(0),    // 0.00% (perfect compression)
+            small_messages_skipped: AtomicU64::new(0),
+            large_messages_compressed: AtomicU64::new(0),
+        }
+    }
+
+    /// Record a successful compression operation
+    pub fn record_compression(
+        &self,
+        original_size: usize,
+        compressed_size: usize,
+        compression_type: u8,
+        duration_us: u64,
+    ) {
+        self.messages_compressed.fetch_add(1, Ordering::Relaxed);
+        self.total_original_bytes
+            .fetch_add(original_size as u64, Ordering::Relaxed);
+        self.total_compressed_bytes
+            .fetch_add(compressed_size as u64, Ordering::Relaxed);
+        self.total_compression_time_us
+            .fetch_add(duration_us, Ordering::Relaxed);
+        self.large_messages_compressed
+            .fetch_add(1, Ordering::Relaxed);
+
+        // Update compression type counters
+        match compression_type {
+            3 => self.lz4_compressions.fetch_add(1, Ordering::Relaxed),
+            2 => self.snappy_compressions.fetch_add(1, Ordering::Relaxed),
+            1 => self.gzip_compressions.fetch_add(1, Ordering::Relaxed),
+            4 => self.zstd_compressions.fetch_add(1, Ordering::Relaxed),
+            _ => 0, // Unknown compression type
+        };
+
+        // Calculate and update compression ratio tracking
+        if original_size > 0 {
+            let ratio_percent = ((compressed_size as f64 / original_size as f64) * 10000.0) as u64;
+
+            // Update best ratio (lowest value = best compression)
+            let current_best = self.best_compression_ratio.load(Ordering::Relaxed);
+            if ratio_percent < current_best {
+                self.best_compression_ratio
+                    .store(ratio_percent, Ordering::Relaxed);
+            }
+
+            // Update worst ratio (highest value = worst compression)
+            let current_worst = self.worst_compression_ratio.load(Ordering::Relaxed);
+            if ratio_percent > current_worst {
+                self.worst_compression_ratio
+                    .store(ratio_percent, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Record a compression failure
+    pub fn record_compression_failure(&self) {
+        self.compression_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a message that was skipped due to small size
+    pub fn record_small_message_skipped(&self) {
+        self.small_messages_skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a successful decompression operation
+    pub fn record_decompression(&self, duration_us: u64) {
+        self.messages_decompressed.fetch_add(1, Ordering::Relaxed);
+        self.total_decompression_time_us
+            .fetch_add(duration_us, Ordering::Relaxed);
+    }
+
+    /// Record a decompression failure
+    pub fn record_decompression_failure(&self) {
+        self.decompression_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // Getter methods for metrics reporting
+    pub fn messages_compressed(&self) -> u64 {
+        self.messages_compressed.load(Ordering::Relaxed)
+    }
+    pub fn messages_decompressed(&self) -> u64 {
+        self.messages_decompressed.load(Ordering::Relaxed)
+    }
+    pub fn compression_failures(&self) -> u64 {
+        self.compression_failures.load(Ordering::Relaxed)
+    }
+    pub fn decompression_failures(&self) -> u64 {
+        self.decompression_failures.load(Ordering::Relaxed)
+    }
+
+    pub fn total_original_bytes(&self) -> u64 {
+        self.total_original_bytes.load(Ordering::Relaxed)
+    }
+    pub fn total_compressed_bytes(&self) -> u64 {
+        self.total_compressed_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn lz4_compressions(&self) -> u64 {
+        self.lz4_compressions.load(Ordering::Relaxed)
+    }
+    pub fn snappy_compressions(&self) -> u64 {
+        self.snappy_compressions.load(Ordering::Relaxed)
+    }
+    pub fn gzip_compressions(&self) -> u64 {
+        self.gzip_compressions.load(Ordering::Relaxed)
+    }
+    pub fn zstd_compressions(&self) -> u64 {
+        self.zstd_compressions.load(Ordering::Relaxed)
+    }
+
+    pub fn small_messages_skipped(&self) -> u64 {
+        self.small_messages_skipped.load(Ordering::Relaxed)
+    }
+    pub fn large_messages_compressed(&self) -> u64 {
+        self.large_messages_compressed.load(Ordering::Relaxed)
+    }
+
+    /// Calculate overall compression ratio as a percentage
+    pub fn overall_compression_ratio(&self) -> f64 {
+        let original = self.total_original_bytes.load(Ordering::Relaxed);
+        let compressed = self.total_compressed_bytes.load(Ordering::Relaxed);
+
+        if original > 0 {
+            (compressed as f64 / original as f64) * 100.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Calculate average compression time per message in microseconds
+    pub fn avg_compression_time_us(&self) -> f64 {
+        let total_time = self.total_compression_time_us.load(Ordering::Relaxed);
+        let total_ops = self.messages_compressed.load(Ordering::Relaxed);
+
+        if total_ops > 0 {
+            total_time as f64 / total_ops as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Calculate average decompression time per message in microseconds
+    pub fn avg_decompression_time_us(&self) -> f64 {
+        let total_time = self.total_decompression_time_us.load(Ordering::Relaxed);
+        let total_ops = self.messages_decompressed.load(Ordering::Relaxed);
+
+        if total_ops > 0 {
+            total_time as f64 / total_ops as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Get best compression ratio achieved (as percentage)
+    pub fn best_compression_ratio(&self) -> f64 {
+        self.best_compression_ratio.load(Ordering::Relaxed) as f64 / 100.0
+    }
+
+    /// Get worst compression ratio achieved (as percentage)
+    pub fn worst_compression_ratio(&self) -> f64 {
+        self.worst_compression_ratio.load(Ordering::Relaxed) as f64 / 100.0
+    }
+
+    /// Calculate compression success rate as percentage
+    pub fn compression_success_rate(&self) -> f64 {
+        let successes = self.messages_compressed.load(Ordering::Relaxed);
+        let failures = self.compression_failures.load(Ordering::Relaxed);
+        let total = successes + failures;
+
+        if total > 0 {
+            (successes as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Calculate bytes saved through compression
+    pub fn bytes_saved(&self) -> u64 {
+        let original = self.total_original_bytes.load(Ordering::Relaxed);
+        let compressed = self.total_compressed_bytes.load(Ordering::Relaxed);
+
+        if compressed < original {
+            original - compressed
+        } else {
+            0
+        }
     }
 }
