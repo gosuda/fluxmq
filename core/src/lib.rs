@@ -82,6 +82,7 @@ pub mod replication;
 pub mod storage;
 pub mod tls;
 pub mod topic_manager;
+pub mod transaction;
 
 pub use broker::{BrokerServer, MessageHandler};
 pub use config::BrokerConfig;
@@ -102,6 +103,10 @@ pub use replication::{
     BrokerId, PartitionReplicaInfo, ReplicationConfig, ReplicationCoordinator, ReplicationRole,
 };
 pub use storage::{HybridStorage, InMemoryStorage};
+pub use transaction::{
+    ProducerId, ProducerIdManager, TransactionCoordinator, TransactionCoordinatorConfig,
+    TransactionError, TransactionLog, TransactionResult, TransactionStateMachine, TxnState,
+};
 
 use thiserror::Error;
 
