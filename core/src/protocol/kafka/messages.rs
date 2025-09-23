@@ -606,6 +606,13 @@ pub enum KafkaRequest {
     SaslHandshake(KafkaSaslHandshakeRequest),
     SaslAuthenticate(KafkaSaslAuthenticateRequest),
     GetTelemetrySubscriptions(KafkaGetTelemetrySubscriptionsRequest),
+    // Transaction APIs
+    InitProducerId(KafkaInitProducerIdRequest),
+    AddPartitionsToTxn(KafkaAddPartitionsToTxnRequest),
+    AddOffsetsToTxn(KafkaAddOffsetsToTxnRequest),
+    EndTxn(KafkaEndTxnRequest),
+    WriteTxnMarkers(KafkaWriteTxnMarkersRequest),
+    TxnOffsetCommit(KafkaTxnOffsetCommitRequest),
 }
 
 /// Unified Kafka response enum
@@ -636,6 +643,13 @@ pub enum KafkaResponse {
     SaslHandshake(KafkaSaslHandshakeResponse),
     SaslAuthenticate(KafkaSaslAuthenticateResponse),
     GetTelemetrySubscriptions(KafkaGetTelemetrySubscriptionsResponse),
+    // Transaction APIs
+    InitProducerId(KafkaInitProducerIdResponse),
+    AddPartitionsToTxn(KafkaAddPartitionsToTxnResponse),
+    AddOffsetsToTxn(KafkaAddOffsetsToTxnResponse),
+    EndTxn(KafkaEndTxnResponse),
+    WriteTxnMarkers(KafkaWriteTxnMarkersResponse),
+    TxnOffsetCommit(KafkaTxnOffsetCommitResponse),
 }
 
 impl KafkaRequest {
@@ -667,6 +681,12 @@ impl KafkaRequest {
             KafkaRequest::SaslHandshake(_) => 17,
             KafkaRequest::SaslAuthenticate(_) => 36,
             KafkaRequest::GetTelemetrySubscriptions(_) => 71,
+            KafkaRequest::InitProducerId(_) => 22,
+            KafkaRequest::AddPartitionsToTxn(_) => 24,
+            KafkaRequest::AddOffsetsToTxn(_) => 25,
+            KafkaRequest::EndTxn(_) => 26,
+            KafkaRequest::WriteTxnMarkers(_) => 27,
+            KafkaRequest::TxnOffsetCommit(_) => 28,
         }
     }
 
@@ -698,6 +718,12 @@ impl KafkaRequest {
             KafkaRequest::SaslHandshake(req) => req.correlation_id,
             KafkaRequest::SaslAuthenticate(req) => req.correlation_id,
             KafkaRequest::GetTelemetrySubscriptions(req) => req.header.correlation_id,
+            KafkaRequest::InitProducerId(req) => req.header.correlation_id,
+            KafkaRequest::AddPartitionsToTxn(req) => req.header.correlation_id,
+            KafkaRequest::AddOffsetsToTxn(req) => req.header.correlation_id,
+            KafkaRequest::EndTxn(req) => req.header.correlation_id,
+            KafkaRequest::WriteTxnMarkers(req) => req.header.correlation_id,
+            KafkaRequest::TxnOffsetCommit(req) => req.header.correlation_id,
         }
     }
 
@@ -729,6 +755,12 @@ impl KafkaRequest {
             KafkaRequest::SaslHandshake(_) => 0, // No header in SASL, use default
             KafkaRequest::SaslAuthenticate(_) => 0, // No header in SASL, use default
             KafkaRequest::GetTelemetrySubscriptions(req) => req.header.api_version,
+            KafkaRequest::InitProducerId(req) => req.header.api_version,
+            KafkaRequest::AddPartitionsToTxn(req) => req.header.api_version,
+            KafkaRequest::AddOffsetsToTxn(req) => req.header.api_version,
+            KafkaRequest::EndTxn(req) => req.header.api_version,
+            KafkaRequest::WriteTxnMarkers(req) => req.header.api_version,
+            KafkaRequest::TxnOffsetCommit(req) => req.header.api_version,
         }
     }
 }
@@ -762,6 +794,12 @@ impl KafkaResponse {
             KafkaResponse::UpdateMetadata(resp) => resp.header.correlation_id,
             KafkaResponse::ControlledShutdown(resp) => resp.header.correlation_id,
             KafkaResponse::GetTelemetrySubscriptions(resp) => resp.header.correlation_id,
+            KafkaResponse::InitProducerId(resp) => resp.correlation_id,
+            KafkaResponse::AddPartitionsToTxn(resp) => resp.correlation_id,
+            KafkaResponse::AddOffsetsToTxn(resp) => resp.correlation_id,
+            KafkaResponse::EndTxn(resp) => resp.correlation_id,
+            KafkaResponse::WriteTxnMarkers(resp) => resp.correlation_id,
+            KafkaResponse::TxnOffsetCommit(resp) => resp.correlation_id,
         }
     }
 }
@@ -1202,3 +1240,31 @@ mod tests {
         assert_eq!(produce_req.correlation_id(), 123);
     }
 }
+
+// ============================================================================
+// TRANSACTION APIs - Exactly-Once Semantics Support
+// ============================================================================
+
+// InitProducerId API (22)
+pub use crate::transaction::messages::InitProducerIdRequest as KafkaInitProducerIdRequest;
+pub use crate::transaction::messages::InitProducerIdResponse as KafkaInitProducerIdResponse;
+
+// AddPartitionsToTxn API (24)
+pub use crate::transaction::messages::AddPartitionsToTxnRequest as KafkaAddPartitionsToTxnRequest;
+pub use crate::transaction::messages::AddPartitionsToTxnResponse as KafkaAddPartitionsToTxnResponse;
+
+// AddOffsetsToTxn API (25)
+pub use crate::transaction::messages::AddOffsetsToTxnRequest as KafkaAddOffsetsToTxnRequest;
+pub use crate::transaction::messages::AddOffsetsToTxnResponse as KafkaAddOffsetsToTxnResponse;
+
+// EndTxn API (26)
+pub use crate::transaction::messages::EndTxnRequest as KafkaEndTxnRequest;
+pub use crate::transaction::messages::EndTxnResponse as KafkaEndTxnResponse;
+
+// WriteTxnMarkers API (27)
+pub use crate::transaction::messages::WriteTxnMarkersRequest as KafkaWriteTxnMarkersRequest;
+pub use crate::transaction::messages::WriteTxnMarkersResponse as KafkaWriteTxnMarkersResponse;
+
+// TxnOffsetCommit API (28)
+pub use crate::transaction::messages::TxnOffsetCommitRequest as KafkaTxnOffsetCommitRequest;
+pub use crate::transaction::messages::TxnOffsetCommitResponse as KafkaTxnOffsetCommitResponse;

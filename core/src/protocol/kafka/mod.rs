@@ -62,13 +62,23 @@ pub const API_KEY_HEARTBEAT: i16 = 12;
 pub const API_KEY_LEAVE_GROUP: i16 = 13;
 pub const API_KEY_SYNC_GROUP: i16 = 14;
 
-/// Kafka API Keys - Admin APIs  
+/// Kafka API Keys - Admin APIs
 pub const API_KEY_DESCRIBE_GROUPS: i16 = 15;
 pub const API_KEY_LIST_GROUPS: i16 = 16;
 pub const API_KEY_SASL_HANDSHAKE: i16 = 17;
 pub const API_KEY_API_VERSIONS: i16 = 18;
 pub const API_KEY_CREATE_TOPICS: i16 = 19;
 pub const API_KEY_DELETE_TOPICS: i16 = 20;
+
+/// Kafka API Keys - Transaction APIs (exactly-once semantics)
+pub const API_KEY_INIT_PRODUCER_ID: i16 = 22;
+pub const API_KEY_ADD_PARTITIONS_TO_TXN: i16 = 24;
+pub const API_KEY_ADD_OFFSETS_TO_TXN: i16 = 25;
+pub const API_KEY_END_TXN: i16 = 26;
+pub const API_KEY_WRITE_TXN_MARKERS: i16 = 27;
+pub const API_KEY_TXN_OFFSET_COMMIT: i16 = 28;
+
+/// Kafka API Keys - Configuration APIs
 pub const API_KEY_DESCRIBE_CONFIGS: i16 = 32;
 pub const API_KEY_ALTER_CONFIGS: i16 = 33;
 pub const API_KEY_SASL_AUTHENTICATE: i16 = 36;
@@ -104,7 +114,7 @@ pub fn is_kafka_request(data: &[u8]) -> bool {
     let api_key = i16::from_be_bytes([data[4], data[5]]);
     info!("Protocol detection: api_key={}", api_key);
 
-    // Check if API key is in known Kafka range - now includes all new APIs
+    // Check if API key is in known Kafka range - now includes transaction APIs
     let is_kafka = matches!(
         api_key,
         API_KEY_PRODUCE
@@ -123,7 +133,17 @@ pub fn is_kafka_request(data: &[u8]) -> bool {
             | API_KEY_API_VERSIONS
             | API_KEY_CREATE_TOPICS
             | API_KEY_DELETE_TOPICS
-            | 15..=50 // Allow room for additional Kafka APIs
+            | API_KEY_INIT_PRODUCER_ID
+            | API_KEY_ADD_PARTITIONS_TO_TXN
+            | API_KEY_ADD_OFFSETS_TO_TXN
+            | API_KEY_END_TXN
+            | API_KEY_WRITE_TXN_MARKERS
+            | API_KEY_TXN_OFFSET_COMMIT
+            | API_KEY_DESCRIBE_CONFIGS
+            | API_KEY_ALTER_CONFIGS
+            | API_KEY_SASL_AUTHENTICATE
+            | API_KEY_GET_TELEMETRY_SUBSCRIPTIONS
+            | 15..=75 // Allow room for additional Kafka APIs
     );
 
     info!("Protocol detection result: is_kafka={}", is_kafka);

@@ -160,6 +160,31 @@ impl ProtocolAdapter {
                 // This API is used for graceful broker shutdown coordination
                 Err(AdapterError::UnsupportedApi(7, 0))
             }
+            // Transaction APIs - handled by transaction coordinator
+            KafkaRequest::InitProducerId(_req) => {
+                // InitProducerId: Transaction coordinator API
+                Err(AdapterError::UnsupportedApi(22, 0))
+            }
+            KafkaRequest::AddPartitionsToTxn(_req) => {
+                // AddPartitionsToTxn: Transaction coordinator API
+                Err(AdapterError::UnsupportedApi(24, 0))
+            }
+            KafkaRequest::AddOffsetsToTxn(_req) => {
+                // AddOffsetsToTxn: Transaction coordinator API
+                Err(AdapterError::UnsupportedApi(25, 0))
+            }
+            KafkaRequest::EndTxn(_req) => {
+                // EndTxn: Transaction coordinator API
+                Err(AdapterError::UnsupportedApi(26, 0))
+            }
+            KafkaRequest::WriteTxnMarkers(_req) => {
+                // WriteTxnMarkers: Transaction coordinator API
+                Err(AdapterError::UnsupportedApi(27, 0))
+            }
+            KafkaRequest::TxnOffsetCommit(_req) => {
+                // TxnOffsetCommit: Transaction coordinator API
+                Err(AdapterError::UnsupportedApi(28, 0))
+            }
         }
     }
 
@@ -1047,7 +1072,10 @@ impl ProtocolAdapter {
 
             // Handle null key (-1 in Kafka protocol)
             if key_length_i32 < 0 {
-                tracing::debug!("Null key encountered (length={}), skipping key data", key_length_i32);
+                tracing::debug!(
+                    "Null key encountered (length={}), skipping key data",
+                    key_length_i32
+                );
                 // Null key, continue to value processing
             } else {
                 // Skip key data (we're not processing keys in this simplified parser)
@@ -1083,7 +1111,10 @@ impl ProtocolAdapter {
 
             // Handle null value (-1 in Kafka protocol)
             if value_length_i32 < 0 {
-                tracing::debug!("Null value encountered (length={}), skipping", value_length_i32);
+                tracing::debug!(
+                    "Null value encountered (length={}), skipping",
+                    value_length_i32
+                );
                 // For null values, create an empty message and continue
                 let message = Message {
                     timestamp: 0,
@@ -1248,10 +1279,16 @@ impl ProtocolAdapter {
         ]);
         cursor += 4;
 
-        tracing::info!("🔍 JAVA DEBUG: RecordBatch contains {} records", records_count);
+        tracing::info!(
+            "🔍 JAVA DEBUG: RecordBatch contains {} records",
+            records_count
+        );
 
         if records_count <= 0 {
-            tracing::warn!("🔍 JAVA DEBUG: RecordBatch has no records: {}", records_count);
+            tracing::warn!(
+                "🔍 JAVA DEBUG: RecordBatch has no records: {}",
+                records_count
+            );
             return Ok(messages);
         }
 
@@ -1330,8 +1367,10 @@ impl ProtocolAdapter {
             );
             match Self::parse_single_record_v2(&decompressed_bytes, &mut decompressed_cursor) {
                 Ok(Some(message)) => {
-                    tracing::debug!("✅ Successfully parsed record {}/{}: key_len={}, value_len={}",
-                        i + 1, records_count,
+                    tracing::debug!(
+                        "✅ Successfully parsed record {}/{}: key_len={}, value_len={}",
+                        i + 1,
+                        records_count,
                         message.key.as_ref().map(|k| k.len()).unwrap_or(0),
                         message.value.len()
                     );
@@ -1345,7 +1384,12 @@ impl ProtocolAdapter {
                     );
                 }
                 Err(e) => {
-                    tracing::warn!("❌ Failed to parse record {}/{}: {}", i + 1, records_count, e);
+                    tracing::warn!(
+                        "❌ Failed to parse record {}/{}: {}",
+                        i + 1,
+                        records_count,
+                        e
+                    );
                     // Continue parsing remaining records
                     break;
                 }
@@ -1367,7 +1411,11 @@ impl ProtocolAdapter {
         cursor: &mut usize,
     ) -> Result<Option<Message>> {
         if *cursor >= records_bytes.len() {
-            tracing::debug!("🔍 SINGLE RECORD: Cursor {} >= buffer_len {}", *cursor, records_bytes.len());
+            tracing::debug!(
+                "🔍 SINGLE RECORD: Cursor {} >= buffer_len {}",
+                *cursor,
+                records_bytes.len()
+            );
             return Err(AdapterError::InvalidFormat(
                 "Cursor beyond buffer end".to_string(),
             ));
@@ -1378,10 +1426,19 @@ impl ProtocolAdapter {
         // keyLength(varint) + key + valueLength(varint) + value + headersCount(varint) + headers
 
         // Read record length (varint)
-        tracing::info!("🔍 SINGLE RECORD: Starting parse at cursor {}, buffer len {}", *cursor, records_bytes.len());
+        tracing::info!(
+            "🔍 SINGLE RECORD: Starting parse at cursor {}, buffer len {}",
+            *cursor,
+            records_bytes.len()
+        );
         let initial_cursor = *cursor;
         let record_length = Self::read_varint_from_bytes(records_bytes, cursor)?;
-        tracing::info!("🔍 SINGLE RECORD: Record length = {} bytes, cursor advanced from {} to {}", record_length, initial_cursor, *cursor);
+        tracing::info!(
+            "🔍 SINGLE RECORD: Record length = {} bytes, cursor advanced from {} to {}",
+            record_length,
+            initial_cursor,
+            *cursor
+        );
 
         if record_length <= 0 {
             return Err(AdapterError::InvalidFormat(format!(
@@ -1399,7 +1456,8 @@ impl ProtocolAdapter {
         if record_data_end > records_bytes.len() {
             return Err(AdapterError::InvalidFormat(format!(
                 "Record extends beyond buffer: record_end={}, buffer_len={}",
-                record_data_end, records_bytes.len()
+                record_data_end,
+                records_bytes.len()
             )));
         }
 
@@ -1419,12 +1477,21 @@ impl ProtocolAdapter {
         // Read key
         let key_cursor_before = *cursor;
         let key_length = Self::read_varint_from_bytes(records_bytes, cursor)?;
-        tracing::info!("🔍 SINGLE RECORD: Key length = {}, cursor {} -> {}", key_length, key_cursor_before, *cursor);
+        tracing::info!(
+            "🔍 SINGLE RECORD: Key length = {}, cursor {} -> {}",
+            key_length,
+            key_cursor_before,
+            *cursor
+        );
         let key = if key_length > 0 {
             // Defensive check: ensure key_length is not negative when cast to usize
             let key_len_usize = key_length.max(0) as usize;
             if *cursor + key_len_usize > records_bytes.len() {
-                tracing::error!("🔍 SINGLE RECORD: Buffer too small for key - need {} bytes, have {}", key_len_usize, records_bytes.len() - *cursor);
+                tracing::error!(
+                    "🔍 SINGLE RECORD: Buffer too small for key - need {} bytes, have {}",
+                    key_len_usize,
+                    records_bytes.len() - *cursor
+                );
                 return Err(AdapterError::InvalidFormat(
                     "Buffer too small for record key".to_string(),
                 ));
@@ -1432,14 +1499,21 @@ impl ProtocolAdapter {
             // Additional safety check to prevent invalid slice ranges
             let end_pos = *cursor + key_len_usize;
             if end_pos < *cursor {
-                tracing::error!("🔍 SINGLE RECORD: Invalid key length causing overflow - key_len: {}", key_length);
+                tracing::error!(
+                    "🔍 SINGLE RECORD: Invalid key length causing overflow - key_len: {}",
+                    key_length
+                );
                 return Err(AdapterError::InvalidFormat(
                     "Invalid key length causing slice overflow".to_string(),
                 ));
             }
             let key_bytes = records_bytes[*cursor..end_pos].to_vec();
             *cursor += key_len_usize;
-            tracing::info!("🔍 SINGLE RECORD: Read {} byte key, cursor now {}", key_len_usize, *cursor);
+            tracing::info!(
+                "🔍 SINGLE RECORD: Read {} byte key, cursor now {}",
+                key_len_usize,
+                *cursor
+            );
             Some(Bytes::from(key_bytes))
         } else {
             tracing::info!("🔍 SINGLE RECORD: No key (length {})", key_length);
@@ -1449,12 +1523,21 @@ impl ProtocolAdapter {
         // Read value
         let value_cursor_before = *cursor;
         let value_length = Self::read_varint_from_bytes(records_bytes, cursor)?;
-        tracing::info!("🔍 SINGLE RECORD: Value length = {}, cursor {} -> {}", value_length, value_cursor_before, *cursor);
+        tracing::info!(
+            "🔍 SINGLE RECORD: Value length = {}, cursor {} -> {}",
+            value_length,
+            value_cursor_before,
+            *cursor
+        );
         let value = if value_length > 0 {
             // Defensive check: ensure value_length is not negative when cast to usize
             let value_len_usize = value_length.max(0) as usize;
             if *cursor + value_len_usize > records_bytes.len() {
-                tracing::error!("🔍 SINGLE RECORD: Buffer too small for value - need {} bytes, have {}", value_len_usize, records_bytes.len() - *cursor);
+                tracing::error!(
+                    "🔍 SINGLE RECORD: Buffer too small for value - need {} bytes, have {}",
+                    value_len_usize,
+                    records_bytes.len() - *cursor
+                );
                 return Err(AdapterError::InvalidFormat(
                     "Buffer too small for record value".to_string(),
                 ));
@@ -1462,14 +1545,21 @@ impl ProtocolAdapter {
             // Additional safety check to prevent invalid slice ranges
             let end_pos = *cursor + value_len_usize;
             if end_pos < *cursor {
-                tracing::error!("🔍 SINGLE RECORD: Invalid value length causing overflow - value_len: {}", value_length);
+                tracing::error!(
+                    "🔍 SINGLE RECORD: Invalid value length causing overflow - value_len: {}",
+                    value_length
+                );
                 return Err(AdapterError::InvalidFormat(
                     "Invalid value length causing slice overflow".to_string(),
                 ));
             }
             let value_bytes = records_bytes[*cursor..end_pos].to_vec();
             *cursor += value_len_usize;
-            tracing::info!("🔍 SINGLE RECORD: Read {} byte value, cursor now {}", value_len_usize, *cursor);
+            tracing::info!(
+                "🔍 SINGLE RECORD: Read {} byte value, cursor now {}",
+                value_len_usize,
+                *cursor
+            );
             Bytes::from(value_bytes)
         } else {
             tracing::info!("🔍 SINGLE RECORD: Empty value (length {})", value_length);
@@ -1524,12 +1614,19 @@ impl ProtocolAdapter {
 
         loop {
             if shift >= 32 {
-                tracing::error!("🔍 VARINT: Varint too large at cursor {} (>32 bits)", *cursor);
+                tracing::error!(
+                    "🔍 VARINT: Varint too large at cursor {} (>32 bits)",
+                    *cursor
+                );
                 return Err(AdapterError::InvalidFormat("Varint too large".to_string()));
             }
 
             if *cursor >= bytes.len() {
-                tracing::error!("🔍 VARINT: Cursor {} beyond buffer len {}", *cursor, bytes.len());
+                tracing::error!(
+                    "🔍 VARINT: Cursor {} beyond buffer len {}",
+                    *cursor,
+                    bytes.len()
+                );
                 return Err(AdapterError::InvalidFormat(
                     "Failed to read varint byte".to_string(),
                 ));
@@ -1540,7 +1637,12 @@ impl ProtocolAdapter {
 
             value |= ((byte & 0x7F) as u32) << shift;
 
-            tracing::debug!("🔍 VARINT: Read byte {:02x} at pos {}, value so far: {}", byte, *cursor - 1, value);
+            tracing::debug!(
+                "🔍 VARINT: Read byte {:02x} at pos {}, value so far: {}",
+                byte,
+                *cursor - 1,
+                value
+            );
 
             if (byte & 0x80) == 0 {
                 break;
@@ -1552,7 +1654,13 @@ impl ProtocolAdapter {
         // Apply ZigZag decoding for signed varints
         let final_value = Self::zigzag_decode(value);
 
-        tracing::debug!("🔍 VARINT: Raw value: {}, ZigZag decoded: {} (cursor {} -> {})", value, final_value, start_cursor, *cursor);
+        tracing::debug!(
+            "🔍 VARINT: Raw value: {}, ZigZag decoded: {} (cursor {} -> {})",
+            value,
+            final_value,
+            start_cursor,
+            *cursor
+        );
 
         Ok(final_value)
     }
@@ -1589,7 +1697,9 @@ impl ProtocolAdapter {
         }
 
         // Method 3: Try with different potential uncompressed sizes
-        for uncompressed_size in [1024, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288] {
+        for uncompressed_size in [
+            1024, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288,
+        ] {
             if let Ok(decompressed) = lz4_flex::decompress(compressed_data, uncompressed_size) {
                 tracing::debug!(
                     "LZ4 decompression successful (estimated size {}): {} -> {} bytes",
@@ -1608,12 +1718,14 @@ impl ProtocolAdapter {
                 compressed_data[0],
                 compressed_data[1],
                 compressed_data[2],
-                compressed_data[3]
+                compressed_data[3],
             ]) as usize;
 
             // Reasonable size check (max 10MB uncompressed)
             if potential_size > 0 && potential_size < 10_485_760 {
-                if let Ok(decompressed) = lz4_flex::decompress(&compressed_data[4..], potential_size) {
+                if let Ok(decompressed) =
+                    lz4_flex::decompress(&compressed_data[4..], potential_size)
+                {
                     tracing::debug!(
                         "LZ4 decompression successful (BE size prefix {}): {} -> {} bytes",
                         potential_size,
@@ -1629,11 +1741,13 @@ impl ProtocolAdapter {
                 compressed_data[0],
                 compressed_data[1],
                 compressed_data[2],
-                compressed_data[3]
+                compressed_data[3],
             ]) as usize;
 
             if potential_size_le > 0 && potential_size_le < 10_485_760 {
-                if let Ok(decompressed) = lz4_flex::decompress(&compressed_data[4..], potential_size_le) {
+                if let Ok(decompressed) =
+                    lz4_flex::decompress(&compressed_data[4..], potential_size_le)
+                {
                     tracing::debug!(
                         "LZ4 decompression successful (LE size prefix {}): {} -> {} bytes",
                         potential_size_le,

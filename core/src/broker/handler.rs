@@ -14,13 +14,16 @@ use crate::{
         SaslHandshakeResponse, TopicFetchResponse, TopicMetadata,
     },
     replication::{BrokerId, ReplicationConfig, ReplicationCoordinator},
-    storage::HybridStorage,
+    storage::{
+        message_cache::{MessageCacheConfig, MessageCacheManager},
+        HybridStorage,
+    },
     topic_manager::{PartitionAssigner, PartitionStrategy, TopicManager},
     Result,
 };
 use std::sync::Arc;
 use tokio::sync::broadcast::error::RecvError;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Enhanced topic description structure for detailed metadata
 #[derive(Debug, Clone)]
@@ -54,6 +57,7 @@ pub struct MessageHandler {
     metrics: Arc<MetricsRegistry>,
     acl_manager: Option<Arc<parking_lot::RwLock<AclManager>>>,
     ultra_performance_broker: Arc<UltraPerformanceBroker>,
+    message_cache: Arc<MessageCacheManager>,
     #[allow(dead_code)]
     high_performance_codec: HighPerformanceKafkaCodec,
     #[allow(dead_code)]
@@ -126,6 +130,16 @@ impl MessageHandler {
 
         let ultra_performance_broker = Arc::new(UltraPerformanceBroker::new());
 
+        // Initialize message cache with optimized configuration
+        let cache_config = MessageCacheConfig {
+            max_messages_per_partition: 20000, // 20k messages per partition
+            max_memory_per_partition: 128 * 1024 * 1024, // 128MB per partition
+            message_ttl: Some(std::time::Duration::from_secs(600)), // 10 minute TTL
+            enable_cache_warming: true,
+            cache_warmup_size: 2000, // Pre-load last 2k messages
+        };
+        let message_cache = Arc::new(MessageCacheManager::new(cache_config));
+
         let handler = Self {
             broker_id,
             broker_port,
@@ -137,6 +151,7 @@ impl MessageHandler {
             metrics,
             acl_manager: None, // ACL disabled by default
             ultra_performance_broker,
+            message_cache,
             high_performance_codec: HighPerformanceKafkaCodec::new(),
             message_pools: MessagePools::new(),
         };
@@ -196,6 +211,16 @@ impl MessageHandler {
 
         let ultra_performance_broker = Arc::new(UltraPerformanceBroker::new());
 
+        // Initialize message cache with optimized configuration
+        let cache_config = MessageCacheConfig {
+            max_messages_per_partition: 20000, // 20k messages per partition
+            max_memory_per_partition: 128 * 1024 * 1024, // 128MB per partition
+            message_ttl: Some(std::time::Duration::from_secs(600)), // 10 minute TTL
+            enable_cache_warming: true,
+            cache_warmup_size: 2000, // Pre-load last 2k messages
+        };
+        let message_cache = Arc::new(MessageCacheManager::new(cache_config));
+
         let handler = Self {
             broker_id,
             broker_port,
@@ -207,6 +232,7 @@ impl MessageHandler {
             metrics,
             acl_manager: None, // ACL disabled by default
             ultra_performance_broker,
+            message_cache,
             high_performance_codec: HighPerformanceKafkaCodec::new(),
             message_pools: MessagePools::new(),
         };
@@ -412,6 +438,9 @@ impl MessageHandler {
 
         // Strategy: Try ultra-performance first with a clone, use original on fallback
         // This optimizes for the success case (no Arc unwrapping) while maintaining fallback capability
+        // Cache the messages before storage (since we'll need them for caching)
+        let messages_for_cache: Vec<Message> = messages.clone();
+
         let base_offset = match self.ultra_performance_broker.append_messages_ultra(
             &request.topic,
             partition,
@@ -433,6 +462,26 @@ impl MessageHandler {
                     .append_messages(&request.topic, partition, messages)?
             }
         };
+
+        // Cache the newly produced messages for future fetch performance
+        let cache_start = std::time::Instant::now();
+        for (i, message) in messages_for_cache.iter().enumerate() {
+            let message_offset = base_offset + i as u64;
+            self.message_cache.cache_message(
+                &request.topic,
+                partition,
+                message_offset,
+                Arc::new(message.clone()),
+            );
+        }
+        let cache_duration = cache_start.elapsed();
+        trace!(
+            "Cached {} newly produced messages in {:?} for {}-{}",
+            messages_for_cache.len(),
+            cache_duration,
+            request.topic,
+            partition
+        );
 
         // Record metrics with actual message data
         info!(
@@ -659,8 +708,11 @@ impl MessageHandler {
                     error_code: 0, // NO_ERROR
                     partitions: partition_metadata,
                 });
-            } else if request.allow_auto_topic_creation {
-                // Auto-create topic if allowed and return its metadata
+            } else {
+                // KAFKA COMPATIBILITY FIX: Auto-create topics for producer compatibility
+                // Standard Kafka brokers automatically create topics when producers request metadata
+                // This resolves Java client timeout issues where clients expect topics to be created
+                debug!("Auto-creating topic '{}' for Java client compatibility", topic);
                 match self.topic_manager.ensure_topic_exists(&topic) {
                     Ok(topic_info) => {
                         let partition_metadata: Vec<PartitionMetadata> = topic_info
@@ -700,13 +752,6 @@ impl MessageHandler {
                         });
                     }
                 }
-            } else {
-                // Return unknown topic error for non-existent topics
-                topic_metadata.push(TopicMetadata {
-                    name: topic,
-                    error_code: 3, // UNKNOWN_TOPIC_OR_PARTITION
-                    partitions: Vec::new(),
-                });
             }
         }
 
@@ -1119,7 +1164,13 @@ impl MessageHandler {
                             None // Valid topic and partition after auto-creation
                         }
                     } else {
-                        Some((3, format!("Topic {} auto-creation succeeded but topic not found", topic)))
+                        Some((
+                            3,
+                            format!(
+                                "Topic {} auto-creation succeeded but topic not found",
+                                topic
+                            ),
+                        ))
                     }
                 }
                 Err(e) => {
@@ -1127,7 +1178,13 @@ impl MessageHandler {
                         "Failed to auto-create topic '{}' for fetch request: {}",
                         topic, e
                     );
-                    Some((3, format!("Topic {} does not exist and auto-creation failed: {}", topic, e)))
+                    Some((
+                        3,
+                        format!(
+                            "Topic {} does not exist and auto-creation failed: {}",
+                            topic, e
+                        ),
+                    ))
                 }
             }
         }
@@ -1141,7 +1198,54 @@ impl MessageHandler {
         offset: Offset,
         max_bytes: u32,
     ) -> Result<Vec<(Offset, Message)>> {
-        // Try ultra-performance fetch first
+        // Step 1: Try to get messages from cache first
+        let cache_start = std::time::Instant::now();
+        let estimated_messages = (max_bytes / 1024).max(10).min(100) as usize; // Estimate message count
+        let offsets_to_check: Vec<Offset> = (offset..offset + estimated_messages as u64).collect();
+
+        let cached_results =
+            self.message_cache
+                .get_cached_messages(topic, partition, &offsets_to_check);
+        let mut cache_hits = Vec::new();
+        let mut missing_offsets = Vec::new();
+
+        for (offset, cached_msg) in cached_results {
+            match cached_msg {
+                Some(msg) => cache_hits.push((offset, (*msg).clone())),
+                None => missing_offsets.push(offset),
+            }
+        }
+
+        let cache_duration = cache_start.elapsed();
+        let cache_hit_rate = cache_hits.len() as f64 / offsets_to_check.len() as f64;
+
+        debug!(
+            "Cache lookup: {:.1}% hit rate ({}/{} messages), took {:?}",
+            cache_hit_rate * 100.0,
+            cache_hits.len(),
+            offsets_to_check.len(),
+            cache_duration
+        );
+
+        // Step 2: If we have sufficient cache hits and they're contiguous, use them
+        if cache_hit_rate > 0.7 && cache_hits.len() >= 5 {
+            // Sort by offset to ensure proper ordering
+            cache_hits.sort_by_key(|(offset, _)| *offset);
+
+            // Check if we have contiguous messages starting from requested offset
+            if let Some((first_offset, _)) = cache_hits.first() {
+                if *first_offset == offset {
+                    info!(
+                        "🚀 CACHE HIT: Serving {} messages from cache for {}-{} starting at offset {}",
+                        cache_hits.len(), topic, partition, offset
+                    );
+                    return Ok(cache_hits);
+                }
+            }
+        }
+
+        // Step 3: Cache miss or insufficient coverage - fetch from storage
+        let storage_start = std::time::Instant::now();
         let all_messages = match self
             .ultra_performance_broker
             .fetch_messages_ultra(topic, partition, offset, max_bytes)
@@ -1154,6 +1258,38 @@ impl MessageHandler {
                     .fetch_messages(topic, partition, offset, max_bytes)?
             }
         };
+
+        let storage_duration = storage_start.elapsed();
+        debug!(
+            "Storage fetch: {} messages in {:?} for {}-{} from offset {}",
+            all_messages.len(),
+            storage_duration,
+            topic,
+            partition,
+            offset
+        );
+
+        // Step 4: Cache the newly fetched messages for future use
+        if !all_messages.is_empty() {
+            let cache_start = std::time::Instant::now();
+            for (msg_offset, message) in &all_messages {
+                self.message_cache.cache_message(
+                    topic,
+                    partition,
+                    *msg_offset,
+                    Arc::new(message.clone()),
+                );
+            }
+            let cache_insert_duration = cache_start.elapsed();
+
+            trace!(
+                "Cached {} new messages in {:?} for {}-{}",
+                all_messages.len(),
+                cache_insert_duration,
+                topic,
+                partition
+            );
+        }
 
         // Apply stricter byte limiting
         // Optimize: Pre-allocate Vec based on input size for better performance

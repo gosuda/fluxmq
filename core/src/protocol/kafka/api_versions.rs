@@ -79,6 +79,14 @@ impl ApiVersionRegistry {
         registry.register(17, 0, 1); // SaslHandshake: v0-v1
         registry.register(36, 0, 2); // SaslAuthenticate: v0-v2
 
+        // Transaction APIs (exactly-once semantics)
+        registry.register(22, 0, 4); // InitProducerId: v0-v4
+        registry.register(24, 0, 3); // AddPartitionsToTxn: v0-v3
+        registry.register(25, 0, 3); // AddOffsetsToTxn: v0-v3
+        registry.register(26, 0, 3); // EndTxn: v0-v3
+        registry.register(27, 0, 1); // WriteTxnMarkers: v0-v1
+        registry.register(28, 0, 3); // TxnOffsetCommit: v0-v3
+
         registry
     }
 

@@ -86,7 +86,7 @@ impl HighPerformanceKafkaCodec {
             (0u16, 0u16, 7u16), // Produce (conservative v7)
             (1, 0, 11),         // Fetch (conservative v11)
             (2, 0, 5),          // ListOffsets (conservative v5)
-            (3, 0, 8),          // Metadata (v8 - conservative for Java compatibility)
+            (3, 0, 8),          // Metadata (v8 - Java 4.1 compatibility)
             (8, 0, 6),          // OffsetCommit (conservative v6)
             (9, 0, 5),          // OffsetFetch (conservative v5)
             (10, 0, 3),         // FindCoordinator (conservative v3)

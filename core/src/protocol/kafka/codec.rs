@@ -342,6 +342,25 @@ impl KafkaCodec {
             KafkaResponse::ControlledShutdown(_) => {
                 return Err(KafkaCodecError::UnsupportedApiKey(7)); // API key 7
             }
+            // Transaction APIs - placeholder error responses
+            KafkaResponse::InitProducerId(_) => {
+                return Err(KafkaCodecError::UnsupportedApiKey(22)); // API key 22
+            }
+            KafkaResponse::AddPartitionsToTxn(_) => {
+                return Err(KafkaCodecError::UnsupportedApiKey(24)); // API key 24
+            }
+            KafkaResponse::AddOffsetsToTxn(_) => {
+                return Err(KafkaCodecError::UnsupportedApiKey(25)); // API key 25
+            }
+            KafkaResponse::EndTxn(_) => {
+                return Err(KafkaCodecError::UnsupportedApiKey(26)); // API key 26
+            }
+            KafkaResponse::WriteTxnMarkers(_) => {
+                return Err(KafkaCodecError::UnsupportedApiKey(27)); // API key 27
+            }
+            KafkaResponse::TxnOffsetCommit(_) => {
+                return Err(KafkaCodecError::UnsupportedApiKey(28)); // API key 28
+            }
         }
 
         // CRITICAL FIX: Remove double encoding! 
