@@ -3,3 +3,23 @@ data/
 node_modules/
 kafka-4.1.0-src/
 claude.md
+
+# macOS system files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Java compiled classes
+*.class
+*.jar
+
+# Log files
+*.log
+server_debug*.log
+
+# Temporary files
+*.tmp
+*.temp
+cp.txt
