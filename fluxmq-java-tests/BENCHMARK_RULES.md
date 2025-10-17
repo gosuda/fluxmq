@@ -7,14 +7,15 @@
 **유일하게 허용되는 벤치마크:**
 ```bash
 cd /Users/sonheesung/Documents/GitHub/fluxmq/fluxmq-java-tests
-java -cp "$(cat cp.txt):target/classes" com.fluxmq.tests.FluxMQBenchmark
+mvn -q exec:java -Dexec.mainClass="com.fluxmq.tests.FluxMQBenchmark" -Dexec.cleanupDaemonThreads=false
 ```
+
+**참고**: pom.xml의 기본 mainClass가 MegaBatchBenchmark로 설정되어 있으므로, 반드시 `-Dexec.mainClass` 옵션으로 명시해야 합니다.
 
 ### ❌ 금지된 벤치마크 방법들
 
 **절대 사용 금지:**
-- `mvn compile exec:java` - Maven 실행 방식 금지
-- `mvn exec:java -Dexec.mainClass` - Maven 매개변수 방식 금지  
+- `java -cp` 방식 - 클래스패스 문제로 실패
 - 다른 Java 클래스 실행 (MinimalProducerTest, PerformanceBenchmark 등)
 - Python 클라이언트 테스트
 - 직접 Kafka 클라이언트 코드 작성
@@ -29,14 +30,46 @@ java -cp "$(cat cp.txt):target/classes" com.fluxmq.tests.FluxMQBenchmark
 
 2. **벤치마크 실행** (3초 대기 후)
    ```bash
-   cd /Users/sonheesung/Documents/GitHub/fluxmq/fluxmq-java-tests  
-   java -cp "$(cat cp.txt):target/classes" com.fluxmq.tests.FluxMQBenchmark
+   cd /Users/sonheesung/Documents/GitHub/fluxmq/fluxmq-java-tests
+   mvn -q exec:java -Dexec.mainClass="com.fluxmq.tests.FluxMQBenchmark" -Dexec.cleanupDaemonThreads=false
    ```
 
 3. **결과 해석**
    - 웜업: 5,000 메시지
    - 벤치마크: 50,000 메시지
    - 목표: 20,000+ msg/sec
+
+### 📝 벤치마크 결과 확인 (로그 파일 기준)
+
+**필수: 서버 로그 파일로 실제 성능 확인**
+
+1. **로그 파일 위치**
+   ```bash
+   /Users/sonheesung/Documents/GitHub/fluxmq/fluxmq.log
+   ```
+
+2. **성능 수치 확인 명령**
+   ```bash
+   # 실시간 로그 모니터링
+   tail -f /Users/sonheesung/Documents/GitHub/fluxmq/fluxmq.log | grep -E "msg/sec|throughput|performance"
+
+   # 최종 처리량 확인
+   grep "Total throughput" /Users/sonheesung/Documents/GitHub/fluxmq/fluxmq.log | tail -1
+   ```
+
+3. **로그 기반 성능 지표**
+   - **실제 처리량**: 서버 로그의 `msg/sec` 수치가 진짜 성능
+   - **클라이언트 수치**: 참고용 (네트워크 지연 포함)
+   - **판단 기준**: 항상 서버 로그 기준으로 평가
+
+4. **로그 분석 포인트**
+   ```
+   INFO fluxmq::metrics: Throughput: XXXXX msg/sec  ← 이 수치가 실제 성능
+   INFO fluxmq::broker: Processed batch of XXX messages
+   INFO fluxmq::performance: Current rate: XXXXX msg/sec
+   ```
+
+**⚠️ 중요**: 클라이언트가 보고하는 수치가 아닌, 서버 로그 파일의 실제 처리량으로 성능을 판단합니다.
 
 ### 🎯 성능 기준
 

@@ -99,20 +99,20 @@ public class FluxMQBenchmark {
         props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
         props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
         
-        // 🚀 Arena Allocator 최적화 설정 (64KB 배치, 50-150 메시지)
-        props.put(ProducerConfig.BATCH_SIZE_CONFIG, 131072);         // 128KB 배치 (Arena 트리거)
-        props.put(ProducerConfig.LINGER_MS_CONFIG, 5);               // 5ms 대기 (배치 집계 시간)  
-        props.put(ProducerConfig.BUFFER_MEMORY_CONFIG, 67108864);    // 64MB 버퍼 (적정 크기)
-        props.put(ProducerConfig.MAX_REQUEST_SIZE_CONFIG, 1048576);  // 1MB 최대 요청 (더 작게)
-        props.put(ProducerConfig.ACKS_CONFIG, "0");                  // No ack (최대 성능)
-        props.put(ProducerConfig.RETRIES_CONFIG, 0);                 // 재시도 없음 (타임아웃 방지)
-        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, false);  // 아이덤포턴스 비활성화 (성능 우선)
-        props.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5); // 병렬 처리 증가
-        props.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, "none");   // 압축 비활성화 (CPU 절약)
-        
+        // 🎯 실제 처리 성능 측정 설정 (정확한 벤치마크)
+        props.put(ProducerConfig.BATCH_SIZE_CONFIG, 131072);         // 128KB 배치
+        props.put(ProducerConfig.LINGER_MS_CONFIG, 1);               // 1ms 대기 (빠른 전송)
+        props.put(ProducerConfig.BUFFER_MEMORY_CONFIG, 67108864);    // 64MB 버퍼
+        props.put(ProducerConfig.MAX_REQUEST_SIZE_CONFIG, 1048576);  // 1MB 최대 요청
+        props.put(ProducerConfig.ACKS_CONFIG, "1");                  // Leader ack (실제 처리 확인)
+        props.put(ProducerConfig.RETRIES_CONFIG, 3);                 // 3회 재시도
+        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, false);  // 아이덤포턴스 비활성화
+        props.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5); // 병렬 처리
+        props.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, "none");   // 압축 비활성화
+
         // 타임아웃 최적화 (고성능 벤치마크용 - 충분한 여유시간 확보)
-        props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 60000); // 60초 전체 타임아웃  
-        props.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 30000);  // 30초 요청 타임아웃
+        props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 300000); // 300초(5분) 전체 타임아웃
+        props.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 120000);  // 120초 요청 타임아웃
         props.put(ProducerConfig.METADATA_MAX_AGE_CONFIG, 30000);    // 30초 메타데이터 갱신
         
         return props;
