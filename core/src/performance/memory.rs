@@ -12,8 +12,6 @@ use std::sync::Arc;
 /// Stack-allocated buffer for small messages to avoid heap allocations
 const SMALL_BUFFER_SIZE: usize = 1024;
 const MEDIUM_BUFFER_SIZE: usize = 8192;
-#[allow(dead_code)]
-const LARGE_BUFFER_SIZE: usize = 65536;
 
 /// Smart buffer that uses stack allocation for small data and heap for large data
 pub enum SmartBuffer {

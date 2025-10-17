@@ -24,9 +24,6 @@ pub struct QuickTopic {
 pub struct QuickPartition {
     messages: Vec<(Offset, Message)>,
     next_offset: Offset,
-    // Pre-allocated capacity to avoid frequent reallocations
-    #[allow(dead_code)]
-    reserved_capacity: usize,
 }
 
 impl QuickOptimizedStorage {
@@ -208,7 +205,6 @@ impl QuickPartition {
         Self {
             messages: Vec::new(),
             next_offset: 0,
-            reserved_capacity: 100,
         }
     }
 
@@ -216,7 +212,6 @@ impl QuickPartition {
         Self {
             messages: Vec::with_capacity(capacity),
             next_offset: 0,
-            reserved_capacity: capacity,
         }
     }
 }
@@ -247,8 +242,6 @@ pub fn unlikely(b: bool) -> bool {
 }
 
 /// CPU cache line optimization helpers
-pub const CACHE_LINE_SIZE: usize = 64;
-
 #[repr(align(64))]
 pub struct CacheAligned<T>(pub T);
 

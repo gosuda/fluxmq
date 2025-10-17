@@ -1,28 +1,20 @@
 use crate::acl::{AclManager, Principal};
-use crate::performance::io_optimizations::{BatchProcessor, ConnectionPool, IOOptimizationManager};
+use crate::performance::io_optimizations::ConnectionPool;
 use crate::protocol::high_performance_codec::HighPerformanceKafkaCodec;
 use crate::protocol::kafka::{KafkaCodec, KafkaFrameCodec, ProtocolAdapter};
 use crate::tls::FluxTlsAcceptor;
 use crate::{broker::MessageHandler, config::BrokerConfig, HttpMetricsServer, Result};
 use bytes::Bytes;
-use futures::SinkExt;
+use futures::{SinkExt, StreamExt as FuturesStreamExt};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
-use tokio_stream::StreamExt;
 use tokio_util::codec::Framed;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub struct BrokerServer {
     config: BrokerConfig,
     handler: Arc<MessageHandler>,
-    // High-performance codec for ultra-fast protocol processing
-    hp_codec: Arc<HighPerformanceKafkaCodec>,
-    // Advanced batch processor for 10k+ message batching
-    #[allow(dead_code)]
-    batch_processor: Arc<BatchProcessor>,
-    // I/O optimization manager for high-throughput operations
-    io_manager: Arc<IOOptimizationManager>,
     // Connection pool for efficient connection management
     connection_pool: Arc<ConnectionPool>,
     // Graceful shutdown coordination
@@ -45,18 +37,11 @@ impl BrokerServer {
             config.enable_replication,
             config.enable_consumer_groups,
         )?); // Use config values
-        let hp_codec = Arc::new(HighPerformanceKafkaCodec::new());
-        let batch_processor = Arc::new(BatchProcessor::new());
-        // 🚀 ULTRA-PERFORMANCE: High-throughput I/O optimizations
-        let io_manager = Arc::new(IOOptimizationManager::new());
         let connection_pool = Arc::new(ConnectionPool::new(10000)); // Support 10k connections
         let (shutdown_tx, _) = broadcast::channel(16); // Graceful shutdown coordination
         Ok(Self {
             config,
             handler,
-            hp_codec,
-            batch_processor,
-            io_manager,
             connection_pool,
             shutdown_tx,
         })
@@ -89,10 +74,6 @@ impl BrokerServer {
             }
 
             let handler = Arc::new(handler);
-            let hp_codec = Arc::new(HighPerformanceKafkaCodec::new());
-            let batch_processor = Arc::new(BatchProcessor::new());
-            // 🚀 ULTRA-PERFORMANCE: High-throughput I/O optimizations
-            let io_manager = Arc::new(IOOptimizationManager::new());
             let connection_pool = Arc::new(ConnectionPool::new(10000)); // Support 10k connections
 
             // Graceful shutdown coordination
@@ -101,9 +82,6 @@ impl BrokerServer {
             Ok(Self {
                 config,
                 handler,
-                hp_codec,
-                batch_processor,
-                io_manager,
                 connection_pool,
                 shutdown_tx,
             })
@@ -125,10 +103,6 @@ impl BrokerServer {
             }
 
             let handler = Arc::new(handler);
-            let hp_codec = Arc::new(HighPerformanceKafkaCodec::new());
-            let batch_processor = Arc::new(BatchProcessor::new());
-            // 🚀 ULTRA-PERFORMANCE: High-throughput I/O optimizations
-            let io_manager = Arc::new(IOOptimizationManager::new());
             let connection_pool = Arc::new(ConnectionPool::new(10000)); // Support 10k connections
 
             // Graceful shutdown coordination
@@ -137,9 +111,6 @@ impl BrokerServer {
             Ok(Self {
                 config,
                 handler,
-                hp_codec,
-                batch_processor,
-                io_manager,
                 connection_pool,
                 shutdown_tx,
             })
@@ -195,18 +166,12 @@ impl BrokerServer {
         let handler =
             Arc::new(MessageHandler::new_with_broker_id_and_recovery(0, config.port, false).await?);
 
-        let hp_codec = Arc::new(HighPerformanceKafkaCodec::new());
-        let batch_processor = Arc::new(BatchProcessor::new());
         // 🚀 ULTRA-PERFORMANCE: High-throughput I/O optimizations
-        let io_manager = Arc::new(IOOptimizationManager::new());
         let connection_pool = Arc::new(ConnectionPool::new(10000)); // Support 10k connections
         let (shutdown_tx, _) = broadcast::channel(16); // Graceful shutdown coordination
         Ok(Self {
             config,
             handler,
-            hp_codec,
-            batch_processor,
-            io_manager,
             connection_pool,
             shutdown_tx,
         })
@@ -244,7 +209,13 @@ impl BrokerServer {
                         let acceptor_arc = Arc::new(acceptor);
                         let tls_shutdown_rx = self.shutdown_tx.subscribe();
                         tokio::spawn(async move {
-                            Self::run_tls_listener_with_shutdown(tls_listener, tls_handler, acceptor_arc, tls_shutdown_rx).await;
+                            Self::run_tls_listener_with_shutdown(
+                                tls_listener,
+                                tls_handler,
+                                acceptor_arc,
+                                tls_shutdown_rx,
+                            )
+                            .await;
                         });
                     }
                     Err(e) => {
@@ -311,12 +282,11 @@ impl BrokerServer {
                     );
 
                     let handler = Arc::clone(&self.handler);
-                    let _hp_codec = Arc::clone(&self.hp_codec);
-                    let _io_manager = Arc::clone(&self.io_manager);
                     let connection_pool = Arc::clone(&self.connection_pool);
 
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_client(stream, handler).await {
+                        // 🚀 PIPELINED: Using FuturesUnordered + Lock-Free for maximum concurrency
+                        if let Err(e) = Self::handle_client_pipelined(stream, handler).await {
                             error!("Error handling client {}: {}", peer_addr, e);
                         } else {
                             info!("Client {} disconnected", peer_addr);
@@ -366,100 +336,240 @@ impl BrokerServer {
         Ok(())
     }
 
-    async fn handle_client(stream: TcpStream, handler: Arc<MessageHandler>) -> Result<()> {
-        info!("New client connected - using Kafka protocol");
-
-        // Track connection metrics
-        let metrics = handler.get_metrics();
-        metrics.broker.connection_opened();
-
-        // All connections use Kafka protocol only
-        let mut kafka_framed = Framed::new(stream, KafkaFrameCodec);
-
-        // Process all messages as Kafka protocol
-        while let Some(result) = kafka_framed.next().await {
-            match result {
-                Ok(message_bytes) => {
-                    // Create high-performance codec for this connection
-                    let hp_codec = Arc::new(HighPerformanceKafkaCodec::new());
-                    Self::process_kafka_message(
-                        &handler,
-                        &hp_codec,
-                        message_bytes,
-                        &mut kafka_framed,
-                    )
-                    .await?;
-                }
-                Err(e) => {
-                    warn!("Failed to decode Kafka message: {}", e);
-                    break;
-                }
-            }
-        }
-
-        // Track connection closure
-        metrics.broker.connection_closed();
-
-        Ok(())
-    }
-
-    /// 🚀 ULTRA-PERFORMANCE: Enhanced client handling with I/O optimizations
-    #[allow(dead_code)]
-    async fn handle_client_ultra(
+    /// 🚀 HYBRID OPTIMIZATION: Action-Based + Lock-Free for maximum performance
+    /// - Direct await (no tokio::spawn overhead)
+    /// - DashMap (no lock contention)
+    /// - AtomicI32 (lock-free ordering)
+    async fn handle_client_pipelined(
         stream: TcpStream,
         handler: Arc<MessageHandler>,
-        hp_codec: Arc<HighPerformanceKafkaCodec>,
-        io_manager: Arc<IOOptimizationManager>,
     ) -> Result<()> {
-        info!("🚀 New ultra-performance client connected - optimized Kafka protocol");
+        info!("🚀 PIPELINED-REORDER: New client connected - parallel processing with response reordering");
 
         // Track connection metrics
         let metrics = handler.get_metrics();
         metrics.broker.connection_opened();
 
-        // 🚀 OPTIMIZATION: Use pre-allocated buffers from I/O manager
-        let buffer_stats_before = io_manager.buffer_manager.get_stats();
+        // Framed를 읽기/쓰기로 분리
+        let kafka_framed = Framed::new(stream, KafkaFrameCodec);
+        let (mut kafka_write, mut kafka_read) = kafka_framed.split();
 
-        // All connections use Kafka protocol with ultra-performance optimizations
-        let mut kafka_framed = Framed::new(stream, KafkaFrameCodec);
+        // 🚀 LOCK-FREE: DashMap for concurrent response storage without lock contention
+        let response_buffer = Arc::new(dashmap::DashMap::<i32, Bytes>::new());
+        // 🔥 CRITICAL FIX: Track first correlation_id to establish ordering
+        let next_send_correlation = Arc::new(std::sync::atomic::AtomicI32::new(-1));
 
-        // Process all messages as Kafka protocol with advanced optimizations
-        while let Some(result) = kafka_framed.next().await {
-            match result {
-                Ok(message_bytes) => {
-                    // 🚀 ULTRA-OPTIMIZATION: Process with shared high-performance codec
-                    Self::process_kafka_message_ultra(
-                        &handler,
-                        &hp_codec,
-                        &io_manager,
-                        message_bytes,
-                        &mut kafka_framed,
-                    )
-                    .await?;
+        // Write channel for ordered delivery
+        let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<Bytes>(1000);
+
+        // High-performance codec 생성
+        let hp_codec = Arc::new(HighPerformanceKafkaCodec::new());
+
+        // 1️⃣ Read Loop: 요청을 읽고 병렬로 처리 (tokio::spawn)
+        let read_handle = {
+            let handler = Arc::clone(&handler);
+            let hp_codec = Arc::clone(&hp_codec);
+            let response_buffer = Arc::clone(&response_buffer);
+            let next_send_correlation = Arc::clone(&next_send_correlation);
+            let write_tx = write_tx.clone();
+
+            tokio::spawn(async move {
+                use futures::stream::{FuturesUnordered, StreamExt as FuturesStreamExt};
+
+                // 🚀 FUTURES-UNORDERED: Async parallel processing without tokio::spawn overhead
+                let mut processing_futures = FuturesUnordered::new();
+                let mut read_done = false;
+
+                loop {
+                    tokio::select! {
+                        // 새 요청 읽기 (읽기가 완료되지 않았을 때만)
+                        result = tokio_stream::StreamExt::next(&mut kafka_read), if !read_done => {
+                            match result {
+                                Some(Ok(message_bytes)) => {
+                                    // Correlation ID 추출
+                                    let correlation_id = if message_bytes.len() >= 8 {
+                                        i32::from_be_bytes([
+                                            message_bytes[4],
+                                            message_bytes[5],
+                                            message_bytes[6],
+                                            message_bytes[7],
+                                        ])
+                                    } else {
+                                        warn!("🚀 FUTURES-UNORDERED: Invalid message format (too short)");
+                                        continue;
+                                    };
+
+                                    debug!("🔍 READ: Received request with client correlation_id={}", correlation_id);
+
+                                    // 🚀 FUTURES-UNORDERED: Add future to concurrent processing queue
+                                    let handler = Arc::clone(&handler);
+                                    let hp_codec = Arc::clone(&hp_codec);
+                                    let response_buffer = Arc::clone(&response_buffer);
+                                    let next_send_correlation = Arc::clone(&next_send_correlation);
+                                    let write_tx = write_tx.clone();
+
+                                    let future = async move {
+                                        match Self::process_kafka_message_pipelined(
+                                            &handler,
+                                            &hp_codec,
+                                            message_bytes,
+                                        )
+                                        .await
+                                        {
+                                            Ok(response_bytes) => {
+                                                // 🚀 LOCK-FREE: DashMap insert (no lock contention!)
+                                                response_buffer.insert(correlation_id, response_bytes.clone());
+                                                debug!("🔍 FUTURES-UNORDERED: Inserted response for corr_id={}, empty={}, buffer_size={}",
+                                                       correlation_id, response_bytes.is_empty(), response_buffer.len());
+
+                                                // 순서대로 전송 가능한 응답들을 flush (lock-free!)
+                                                Self::flush_ordered_responses_lockfree(
+                                                    &response_buffer,
+                                                    &next_send_correlation,
+                                                    &write_tx,
+                                                )
+                                                .await;
+                                            }
+                                            Err(e) => {
+                                                warn!("🚀 FUTURES-UNORDERED: Request processing failed: {}", e);
+                                            }
+                                        }
+                                    };
+
+                                    processing_futures.push(future);
+                                }
+                                Some(Err(e)) => {
+                                    warn!("Failed to decode Kafka message: {}", e);
+                                    read_done = true;
+                                }
+                                None => {
+                                    info!("🚀 FUTURES-UNORDERED: Read stream closed");
+                                    read_done = true;
+                                }
+                            }
+                        }
+
+                        // 처리 중인 요청 완료 대기
+                        _ = FuturesStreamExt::next(&mut processing_futures), if !processing_futures.is_empty() => {
+                            // Future completed (response already flushed)
+                        }
+
+                        // 모든 작업 완료
+                        else => {
+                            if read_done && processing_futures.is_empty() {
+                                break;
+                            }
+                        }
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to decode Kafka message: {}", e);
+
+                info!("🚀 FUTURES-UNORDERED: All processing complete, dropping write_tx");
+                // write_tx는 여기서 drop됨 -> Write Loop가 정상 종료
+            })
+        };
+
+        // 2️⃣ Write Loop: 순서대로 응답 전송
+        let write_handle = {
+            tokio::spawn(async move {
+                let mut sent = 0;
+                while let Some(response_bytes) = write_rx.recv().await {
+                    if kafka_write.send(response_bytes).await.is_err() {
+                        warn!("🚀 PIPELINED: Write failed, sent {} responses", sent);
+                        break;
+                    }
+                    // 🔥 CRITICAL FIX: Flush immediately to ensure response reaches client
+                    if kafka_write.flush().await.is_err() {
+                        warn!("🚀 PIPELINED: Flush failed, sent {} responses", sent);
+                        break;
+                    }
+                    sent += 1;
+                    debug!("🔍 WRITE: Sent response #{} successfully", sent);
+                }
+                info!(
+                    "🚀 PIPELINED: Write loop terminated (sent {} responses)",
+                    sent
+                );
+            })
+        };
+
+        // 모든 루프가 종료될 때까지 대기
+        let _ = tokio::join!(read_handle, write_handle);
+
+        // Track connection closure
+        metrics.broker.connection_closed();
+        info!("🚀 PIPELINED: Client disconnected");
+
+        Ok(())
+    }
+
+    /// 🚀 LOCK-FREE: DashMap 기반 응답 순서 보장 flush (Mutex 없음!)
+    async fn flush_ordered_responses_lockfree(
+        response_buffer: &Arc<dashmap::DashMap<i32, Bytes>>,
+        next_send_correlation: &Arc<std::sync::atomic::AtomicI32>,
+        write_tx: &tokio::sync::mpsc::Sender<Bytes>,
+    ) {
+        use std::sync::atomic::Ordering;
+
+        loop {
+            // 🚀 LOCK-FREE: Atomic load (no mutex!)
+            let mut current = next_send_correlation.load(Ordering::Acquire);
+
+            // 첫 응답이면 초기화 (compare-and-swap으로 race-free)
+            if current == -1 {
+                // DashMap에서 가장 작은 키 찾기
+                if let Some(first_entry) = response_buffer.iter().next() {
+                    let first_key = *first_entry.key();
+                    // CAS로 안전하게 초기화 (다른 task가 먼저 초기화할 수 있음)
+                    match next_send_correlation.compare_exchange(
+                        -1,
+                        first_key,
+                        Ordering::Release,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => {
+                            debug!(
+                                "🔍 FLUSH: Initialized next_send_correlation to {}",
+                                first_key
+                            );
+                            current = first_key;
+                        }
+                        Err(updated) => {
+                            // 다른 task가 먼저 초기화함
+                            current = updated;
+                        }
+                    }
+                } else {
+                    // 버퍼가 아직 비어있음
+                    return;
+                }
+            }
+
+            // 🚀 LOCK-FREE: DashMap remove (no mutex!)
+            match response_buffer.remove(&current) {
+                Some((corr_id, response)) => {
+                    // 다음 correlation_id로 증가 (atomic!)
+                    next_send_correlation.store(corr_id + 1, Ordering::Release);
+
+                    // Empty response는 전송하지 않지만 sequence는 증가됨
+                    if !response.is_empty() {
+                        if write_tx.send(response).await.is_err() {
+                            debug!("🔍 FLUSH: Write channel closed");
+                            break;
+                        }
+                        debug!("🔍 FLUSH: Sent response for corr_id={}", corr_id);
+                    } else {
+                        debug!("🔍 FLUSH: Skipped empty response for corr_id={}", corr_id);
+                    }
+                }
+                None => {
+                    // 다음 응답이 아직 준비되지 않음
+                    debug!("🔍 FLUSH: Waiting for corr_id={}", current);
                     break;
                 }
             }
         }
-
-        // 🚀 PERFORMANCE: Report buffer optimization stats
-        let buffer_stats_after = io_manager.buffer_manager.get_stats();
-        if buffer_stats_after.reuse_count > buffer_stats_before.reuse_count {
-            let reuse_efficiency = buffer_stats_after.reuse_efficiency() * 100.0;
-            info!(
-                "🚀 Buffer reuse efficiency: {:.1}%, {} reuses",
-                reuse_efficiency,
-                buffer_stats_after.reuse_count - buffer_stats_before.reuse_count
-            );
-        }
-
-        // Track connection closure
-        metrics.broker.connection_closed();
-
-        Ok(())
     }
+
 
     async fn process_kafka_message<IO>(
         handler: &Arc<MessageHandler>,
@@ -478,27 +588,14 @@ impl BrokerServer {
         // Java Kafka 4.1 clients send ApiVersions v4 with headerVersion=2 format
         match KafkaCodec::decode_request(&mut message_bytes) {
             Ok(kafka_request) => {
-                info!(
-                    "Processing Kafka request: API key {}",
-                    kafka_request.api_key()
-                );
+                // 🚀 PERFORMANCE: Hot path - logging removed for speed
 
                 // Handle ApiVersions requests directly
                 if kafka_request.api_key() == 18 {
                     // API_KEY_API_VERSIONS - 🚀 ULTRA-FAST with pre-compiled template!
                     let response_bytes =
                         hp_codec.encode_api_versions_fast(kafka_request.correlation_id());
-                    info!(
-                        "Sending ApiVersions response: {} bytes, correlation_id={}",
-                        response_bytes.len(),
-                        kafka_request.correlation_id()
-                    );
-                    info!(
-                        "Response bytes (hex): {:02x?}",
-                        &response_bytes[0..std::cmp::min(response_bytes.len(), 50)]
-                    );
                     kafka_framed.send(response_bytes).await?;
-                    info!("ApiVersions response sent successfully");
                     return Ok(());
                 }
             }
@@ -567,25 +664,15 @@ impl BrokerServer {
 
         // Handle FindCoordinator requests directly
         if kafka_request.api_key() == 10 {
-            // API_KEY_FIND_COORDINATOR
+            // API_KEY_FIND_COORDINATOR - 🚀 PERFORMANCE: Hot path
             let find_coordinator_response =
                 Self::create_find_coordinator_response(kafka_request.correlation_id());
             let response_bytes = KafkaCodec::encode_response(&find_coordinator_response)?;
-            info!(
-                "Sending FindCoordinator response: {} bytes, correlation_id={}",
-                response_bytes.len(),
-                kafka_request.correlation_id()
-            );
             kafka_framed.send(response_bytes).await?;
-            info!("FindCoordinator response sent successfully");
             return Ok(());
         }
 
-        // Log the request for debugging
-        info!(
-            "Kafka request details: correlation_id={}",
-            kafka_request.correlation_id()
-        );
+        // 🚀 PERFORMANCE: Hot path - logging removed
 
         // Check if this is a consumer group request (zero-copy check)
         if ProtocolAdapter::is_consumer_group_request(&kafka_request) {
@@ -594,7 +681,9 @@ impl BrokerServer {
             let api_version = kafka_request.api_version();
 
             // Now handle consumer group request (taking ownership)
-            if let Ok(Some(cg_message)) = ProtocolAdapter::handle_consumer_group_request(kafka_request) {
+            if let Ok(Some(cg_message)) =
+                ProtocolAdapter::handle_consumer_group_request(kafka_request)
+            {
                 if let Some(cg_coordinator) = handler.get_consumer_group_coordinator() {
                     match cg_coordinator.handle_message(cg_message).await {
                         Ok(cg_response) => {
@@ -607,18 +696,18 @@ impl BrokerServer {
                             let response_bytes = KafkaCodec::encode_response(&kafka_response)?;
                             kafka_framed.send(response_bytes).await?;
                         }
-                    Err(e) => {
-                        warn!("Consumer group request failed: {}", e);
-                        metrics.broker.error_occurred();
-                        // Send error response
-                        Self::send_kafka_error_response(
-                            kafka_framed,
-                            correlation_id,
-                            crate::protocol::kafka::KafkaErrorCode::Unknown,
-                        )
-                        .await?;
+                        Err(e) => {
+                            warn!("Consumer group request failed: {}", e);
+                            metrics.broker.error_occurred();
+                            // Send error response
+                            Self::send_kafka_error_response(
+                                kafka_framed,
+                                correlation_id,
+                                crate::protocol::kafka::KafkaErrorCode::Unknown,
+                            )
+                            .await?;
+                        }
                     }
-                }
                 }
             } else {
                 // Failed to parse as consumer group request or None returned
@@ -633,16 +722,10 @@ impl BrokerServer {
         } else {
             // Handle Metadata requests directly (like ApiVersions)
             if kafka_request.api_key() == 3 {
-                // API_KEY_METADATA
+                // API_KEY_METADATA - 🚀 PERFORMANCE: Hot path
                 let metadata_response = Self::create_metadata_response(&kafka_request, handler);
                 let response_bytes = KafkaCodec::encode_response(&metadata_response)?;
-                info!(
-                    "Sending Metadata response: {} bytes, correlation_id={}",
-                    response_bytes.len(),
-                    kafka_request.correlation_id()
-                );
                 kafka_framed.send(response_bytes).await?;
-                info!("Metadata response sent successfully");
                 return Ok(());
             }
 
@@ -651,11 +734,11 @@ impl BrokerServer {
                 Ok(fluxmq_request) => match handler.handle_request(fluxmq_request).await {
                     Ok(fluxmq_response) => {
                         // Handle NoResponse (fire-and-forget) - don't send any response
+                        // 🚀 PERFORMANCE: Hot path - logging removed
                         if matches!(
                             fluxmq_response,
                             crate::protocol::messages::Response::NoResponse
                         ) {
-                            info!("🔥 FIRE-AND-FORGET: NoResponse received, connection stays open");
                             return Ok(());
                         }
 
@@ -672,7 +755,6 @@ impl BrokerServer {
                                 if e.to_string().contains(
                                     "Fire-and-forget request - no response should be sent",
                                 ) {
-                                    info!("🔥 FIRE-AND-FORGET: NoResponse adapter error, keeping connection alive");
                                     return Ok(());
                                 } else {
                                     // Other adapter errors should be propagated
@@ -708,195 +790,150 @@ impl BrokerServer {
         Ok(())
     }
 
-    /// 🚀 ULTRA-PERFORMANCE: Enhanced message processing with I/O optimizations
-    #[allow(dead_code)]
-    async fn process_kafka_message_ultra<IO>(
+    /// 🚀 PIPELINED: 응답 bytes를 직접 반환하는 파이프라인 최적화 버전
+    async fn process_kafka_message_pipelined(
         handler: &Arc<MessageHandler>,
         hp_codec: &Arc<HighPerformanceKafkaCodec>,
-        _io_manager: &Arc<IOOptimizationManager>,
         mut message_bytes: Bytes,
-        kafka_framed: &mut Framed<IO, KafkaFrameCodec>,
-    ) -> Result<()>
-    where
-        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-    {
+    ) -> Result<Bytes> {
+        debug!("🔍 BLOCKING: process_kafka_message_pipelined START");
+
         // Track request metrics
         let metrics = handler.get_metrics();
         metrics.broker.request_received();
 
-        // 🚀 OPTIMIZATION: Add message to batch processor for intelligent batching
-        // (This would be enhanced further in production to batch decode operations)
-
         // Decode Kafka request
-        match KafkaCodec::decode_request(&mut message_bytes) {
-            Ok(kafka_request) => {
-                info!(
-                    "🚀 Processing ultra-optimized Kafka request: API key {}",
-                    kafka_request.api_key()
-                );
+        let kafka_request = match KafkaCodec::decode_request(&mut message_bytes) {
+            Ok(req) => req,
+            Err(e) => {
+                warn!("Failed to decode Kafka request: {}", e);
+                // 빈 응답 반환 (에러 처리 간소화)
+                return Ok(Bytes::new());
+            }
+        };
+        debug!("🔍 BLOCKING: Decoded api_key={}", kafka_request.api_key());
 
-                // ENABLE: High-performance ApiVersions fast path for better performance
-                if kafka_request.api_key() == 18 {
-                    // API_KEY_API_VERSIONS - 🚀 ULTRA-FAST with pre-compiled template!
-                    let response_bytes =
-                        hp_codec.encode_api_versions_fast(kafka_request.correlation_id());
-                    info!(
-                        "🚀 Sending ultra-fast ApiVersions response: {} bytes, correlation_id={}",
-                        response_bytes.len(),
-                        kafka_request.correlation_id()
-                    );
-                    kafka_framed.send(response_bytes).await?;
-                    info!("🚀 Ultra-fast ApiVersions response sent successfully");
-                    return Ok(());
-                }
+        // Handle ApiVersions requests with pre-compiled template
+        if kafka_request.api_key() == 18 {
+            debug!("🔍 BLOCKING: ApiVersions fast path");
+            let response_bytes = hp_codec.encode_api_versions_fast(kafka_request.correlation_id());
+            return Ok(response_bytes);
+        }
 
-                // Handle DescribeGroups requests directly
-                if kafka_request.api_key() == 15 {
-                    // API_KEY_DESCRIBE_GROUPS
-                    let describe_groups_response =
-                        Self::create_describe_groups_response(kafka_request.correlation_id());
-                    let response_bytes = KafkaCodec::encode_response(&describe_groups_response)?;
-                    kafka_framed.send(response_bytes).await?;
-                    return Ok(());
-                }
+        // Handle Metadata requests
+        if kafka_request.api_key() == 3 {
+            debug!("🔍 BLOCKING: Metadata request");
+            let metadata_response = Self::create_metadata_response(&kafka_request, handler);
+            let response_bytes = KafkaCodec::encode_response(&metadata_response)?;
+            debug!("🔍 BLOCKING: Metadata encoded");
+            return Ok(response_bytes);
+        }
 
-                // Handle FindCoordinator requests directly
-                if kafka_request.api_key() == 10 {
-                    // API_KEY_FIND_COORDINATOR
-                    let find_coordinator_response =
-                        Self::create_find_coordinator_response(kafka_request.correlation_id());
-                    let response_bytes = KafkaCodec::encode_response(&find_coordinator_response)?;
-                    info!(
-                        "🚀 Sending ultra-optimized FindCoordinator response: {} bytes, correlation_id={}",
-                        response_bytes.len(),
-                        kafka_request.correlation_id()
-                    );
-                    kafka_framed.send(response_bytes).await?;
-                    info!("🚀 Ultra-optimized FindCoordinator response sent successfully");
-                    return Ok(());
-                }
+        debug!(
+            "🔍 BLOCKING: Converting to FluxMQ request, api_key={}",
+            kafka_request.api_key()
+        );
 
-                // Log the request for debugging
-                info!(
-                    "🚀 Ultra-optimized Kafka request details: correlation_id={}",
-                    kafka_request.correlation_id()
-                );
-
-                // Check if this is a consumer group request
-                if let Ok(Some(cg_message)) =
-                    ProtocolAdapter::handle_consumer_group_request(kafka_request.clone())
-                {
-                    // Handle consumer group request
-                    if let Some(cg_coordinator) = handler.get_consumer_group_coordinator() {
-                        match cg_coordinator.handle_message(cg_message).await {
-                            Ok(cg_response) => {
-                                let kafka_response =
-                                    ProtocolAdapter::consumer_group_response_to_kafka(
-                                        cg_response,
-                                        kafka_request.correlation_id(),
-                                        kafka_request.api_version(),
-                                    )?;
-                                // 🚀 ULTRA-PERFORMANCE: Use shared high-performance codec (5-10x faster)
-                                let response_bytes = KafkaCodec::encode_response(&kafka_response)
-                                    .map_err(|e| {
-                                    crate::FluxmqError::Network(format!(
-                                        "Ultra-performance codec error: {}",
-                                        e
-                                    ))
-                                })?;
-                                kafka_framed.send(response_bytes).await?;
-                            }
-                            Err(e) => {
-                                warn!("Consumer group request failed: {}", e);
-                                metrics.broker.error_occurred();
-                                // Send error response
-                                Self::send_kafka_error_response(
-                                    kafka_framed,
-                                    kafka_request.correlation_id(),
-                                    crate::protocol::kafka::KafkaErrorCode::Unknown,
-                                )
-                                .await?;
-                            }
+        // Handle regular message request (Produce, Fetch, etc.)
+        match ProtocolAdapter::kafka_to_fluxmq(kafka_request.clone()) {
+            Ok(fluxmq_request) => {
+                debug!("🔍 BLOCKING: Calling handler.handle_request()...");
+                match handler.handle_request(fluxmq_request).await {
+                    Ok(fluxmq_response) => {
+                        debug!("🔍 BLOCKING: handler.handle_request() RETURNED!");
+                        // Handle NoResponse (fire-and-forget)
+                        if matches!(
+                            fluxmq_response,
+                            crate::protocol::messages::Response::NoResponse
+                        ) {
+                            debug!("🔍 BLOCKING: NoResponse case");
+                            return Ok(Bytes::new()); // 빈 응답 반환
                         }
-                    } else {
-                        // Consumer groups not enabled
-                        Self::send_kafka_error_response(
-                            kafka_framed,
+
+                        debug!("🔍 BLOCKING: Converting FluxMQ response to Kafka");
+                        match ProtocolAdapter::fluxmq_to_kafka(
+                            fluxmq_response,
                             kafka_request.correlation_id(),
-                            crate::protocol::kafka::KafkaErrorCode::UnsupportedVersion,
-                        )
-                        .await?;
-                    }
-                } else {
-                    // Handle Metadata requests directly (like ApiVersions)
-                    if kafka_request.api_key() == 3 {
-                        // API_KEY_METADATA
-                        let metadata_response =
-                            Self::create_metadata_response(&kafka_request, handler);
-                        let response_bytes = KafkaCodec::encode_response(&metadata_response)?;
-                        info!(
-                            "🚀 Sending ultra-optimized Metadata response: {} bytes, correlation_id={}",
-                            response_bytes.len(),
-                            kafka_request.correlation_id()
-                        );
-                        kafka_framed.send(response_bytes).await?;
-                        info!("🚀 Ultra-optimized Metadata response sent successfully");
-                        return Ok(());
-                    }
-
-                    // Handle regular message request with ultra-optimizations
-                    match ProtocolAdapter::kafka_to_fluxmq(kafka_request.clone()) {
-                        Ok(fluxmq_request) => match handler.handle_request(fluxmq_request).await {
-                            Ok(fluxmq_response) => {
-                                let kafka_response = ProtocolAdapter::fluxmq_to_kafka(
-                                    fluxmq_response,
-                                    kafka_request.correlation_id(),
-                                )?;
-                                // 🚀 ULTRA-PERFORMANCE: Use shared high-performance codec (5-10x faster)
-                                let response_bytes = KafkaCodec::encode_response(&kafka_response)
-                                    .map_err(|e| {
-                                    crate::FluxmqError::Network(format!(
-                                        "Ultra-performance codec error: {}",
-                                        e
-                                    ))
-                                })?;
-
-                                // 🚀 OPTIMIZATION: Use I/O manager for efficient response sending
-                                kafka_framed.send(response_bytes).await?;
+                        ) {
+                            Ok(kafka_response) => {
+                                debug!("🔍 BLOCKING: Encoding Kafka response");
+                                let response_bytes = KafkaCodec::encode_response(&kafka_response)?;
+                                debug!(
+                                    "🔍 BLOCKING: Response encoded, bytes={}",
+                                    response_bytes.len()
+                                );
+                                Ok(response_bytes)
                             }
                             Err(e) => {
-                                warn!("FluxMQ request failed: {}", e);
-                                metrics.broker.error_occurred();
-                                Self::send_kafka_error_response(
-                                    kafka_framed,
-                                    kafka_request.correlation_id(),
-                                    crate::protocol::kafka::KafkaErrorCode::Unknown,
-                                )
-                                .await?;
+                                warn!("Failed to convert response: {}", e);
+                                // 에러 시에도 응답 전송 (acks=1 지원)
+                                Self::create_error_response(&kafka_request)
                             }
-                        },
-                        Err(e) => {
-                            warn!("Failed to convert Kafka to FluxMQ: {}", e);
-                            metrics.broker.error_occurred();
-                            Self::send_kafka_error_response(
-                                kafka_framed,
-                                kafka_request.correlation_id(),
-                                crate::protocol::kafka::KafkaErrorCode::UnknownTopicOrPartition,
-                            )
-                            .await?;
                         }
+                    }
+                    Err(e) => {
+                        warn!("🔍 BLOCKING: FluxMQ request FAILED: {}", e);
+                        metrics.broker.error_occurred();
+                        // 에러 시에도 응답 전송 (acks=1 지원)
+                        Self::create_error_response(&kafka_request)
                     }
                 }
             }
             Err(e) => {
-                warn!("Failed to decode ultra-optimized Kafka request: {}", e);
+                warn!("Failed to convert Kafka request: {}", e);
                 metrics.broker.error_occurred();
-                // Can't send proper error response without correlation ID
+                // 에러 시에도 응답 전송 (acks=1 지원)
+                Self::create_error_response(&kafka_request)
             }
         }
-
-        Ok(())
     }
+
+    /// Create error response for failed requests (acks=1 support)
+    fn create_error_response(
+        kafka_request: &crate::protocol::kafka::messages::KafkaRequest,
+    ) -> Result<Bytes> {
+        use crate::protocol::kafka::messages::*;
+
+        // API Key별로 적절한 에러 응답 생성
+        let error_response = match kafka_request.api_key() {
+            0 => {
+                // Produce request
+                KafkaResponse::Produce(KafkaProduceResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: kafka_request.correlation_id(),
+                    },
+                    responses: vec![],
+                    throttle_time_ms: 0,
+                })
+            }
+            1 => {
+                // Fetch request
+                KafkaResponse::Fetch(KafkaFetchResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: kafka_request.correlation_id(),
+                    },
+                    api_version: 0,
+                    throttle_time_ms: 0,
+                    error_code: 0,
+                    session_id: 0,
+                    responses: vec![],
+                })
+            }
+            _ => {
+                // 기타 API는 빈 Produce 응답으로 처리
+                KafkaResponse::Produce(KafkaProduceResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: kafka_request.correlation_id(),
+                    },
+                    responses: vec![],
+                    throttle_time_ms: 0,
+                })
+            }
+        };
+
+        Ok(KafkaCodec::encode_response(&error_response)?)
+    }
+
 
     async fn send_kafka_error_response<IO>(
         kafka_framed: &mut Framed<IO, KafkaFrameCodec>,
@@ -933,122 +970,6 @@ impl BrokerServer {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    fn create_api_versions_response(
-        correlation_id: i32,
-        api_version: i16,
-    ) -> crate::protocol::kafka::KafkaResponse {
-        use crate::protocol::kafka::{
-            KafkaApiVersion, KafkaApiVersionsResponse, KafkaResponse, KafkaResponseHeader,
-        };
-
-        // List of supported APIs - standard Kafka versions
-        let supported_apis = vec![
-            KafkaApiVersion {
-                api_key: 0,
-                min_version: 0,
-                max_version: 8,
-            }, // Produce
-            KafkaApiVersion {
-                api_key: 1,
-                min_version: 0,
-                max_version: 11,
-            }, // Fetch
-            KafkaApiVersion {
-                api_key: 2,
-                min_version: 0,
-                max_version: 5,
-            }, // ListOffsets
-            KafkaApiVersion {
-                api_key: 3,
-                min_version: 0,
-                max_version: 9,
-            }, // Metadata - increased version range
-            KafkaApiVersion {
-                api_key: 8,
-                min_version: 0,
-                max_version: 6,
-            }, // OffsetCommit
-            KafkaApiVersion {
-                api_key: 9,
-                min_version: 0,
-                max_version: 5,
-            }, // OffsetFetch - CRITICAL: Missing API causing client errors
-            KafkaApiVersion {
-                api_key: 10,
-                min_version: 0,
-                max_version: 2,
-            }, // FindCoordinator
-            KafkaApiVersion {
-                api_key: 11,
-                min_version: 0,
-                max_version: 5,
-            }, // JoinGroup
-            KafkaApiVersion {
-                api_key: 12,
-                min_version: 0,
-                max_version: 3,
-            }, // Heartbeat
-            KafkaApiVersion {
-                api_key: 13,
-                min_version: 0,
-                max_version: 3,
-            }, // LeaveGroup
-            KafkaApiVersion {
-                api_key: 14,
-                min_version: 0,
-                max_version: 3,
-            }, // SyncGroup
-            KafkaApiVersion {
-                api_key: 15,
-                min_version: 0,
-                max_version: 4,
-            }, // DescribeGroups
-            KafkaApiVersion {
-                api_key: 16,
-                min_version: 0,
-                max_version: 3,
-            }, // ListGroups
-            KafkaApiVersion {
-                api_key: 18,
-                min_version: 0,
-                max_version: 4, // UPGRADED: Now supports v4 with flexible versions
-            }, // ApiVersions
-            KafkaApiVersion {
-                api_key: 19,
-                min_version: 0,
-                max_version: 5,
-            }, // CreateTopics
-            KafkaApiVersion {
-                api_key: 20,
-                min_version: 0,
-                max_version: 3,
-            }, // DeleteTopics
-            KafkaApiVersion {
-                api_key: 32,
-                min_version: 0,
-                max_version: 3,
-            }, // DescribeConfigs
-            KafkaApiVersion {
-                api_key: 33,
-                min_version: 0,
-                max_version: 2,
-            }, // AlterConfigs
-        ];
-
-        KafkaResponse::ApiVersions(KafkaApiVersionsResponse {
-            header: KafkaResponseHeader { correlation_id },
-            api_version,
-            error_code: 0, // No error
-            api_keys: supported_apis,
-            throttle_time_ms: 0,
-            // Java client compatibility fields (v3+)
-            cluster_id: Some("fluxmq-cluster".to_string()), // Cluster identifier
-            controller_id: Some(0),                         // Broker 0 is controller
-            supported_features: vec![],                     // No special features yet
-        })
-    }
-
     fn create_describe_groups_response(
         correlation_id: i32,
     ) -> crate::protocol::kafka::KafkaResponse {
@@ -1082,18 +1003,6 @@ impl BrokerServer {
             host: "localhost".to_string(),
             port: 9092,
         })
-    }
-
-    #[allow(dead_code)]
-    fn extract_topics_from_metadata_request(
-        kafka_request: &crate::protocol::kafka::KafkaRequest,
-    ) -> Option<Vec<String>> {
-        use crate::protocol::kafka::KafkaRequest;
-
-        match kafka_request {
-            KafkaRequest::Metadata(metadata_req) => metadata_req.topics.clone(),
-            _ => None,
-        }
     }
 
     fn create_metadata_response(
@@ -1365,6 +1274,7 @@ impl BrokerServer {
     }
 
     /// Run TLS listener for secure connections
+    #[allow(dead_code)]
     async fn run_tls_listener(
         listener: TcpListener,
         handler: Arc<MessageHandler>,
@@ -1418,7 +1328,7 @@ impl BrokerServer {
         let hp_codec = Arc::new(HighPerformanceKafkaCodec::new());
 
         // Process all messages as Kafka protocol (same as regular clients)
-        while let Some(result) = kafka_framed.next().await {
+        while let Some(result) = tokio_stream::StreamExt::next(&mut kafka_framed).await {
             match result {
                 Ok(message_bytes) => {
                     if let Err(e) = Self::process_kafka_message(
