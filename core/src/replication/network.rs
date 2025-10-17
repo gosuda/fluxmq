@@ -4,6 +4,7 @@ use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -23,6 +24,9 @@ pub struct ReplicationNetwork {
     message_handlers: Arc<RwLock<HashMap<BrokerId, mpsc::UnboundedSender<ReplicationMessage>>>>,
     /// Network configuration
     config: NetworkConfig,
+    /// Sequence counter for outgoing messages
+    #[allow(dead_code)]
+    sequence_counter: Arc<AtomicU64>,
 }
 
 /// Configuration for replication network
@@ -78,6 +82,7 @@ impl ReplicationNetwork {
             peer_connections: Arc::new(RwLock::new(HashMap::new())),
             message_handlers: Arc::new(RwLock::new(HashMap::new())),
             config,
+            sequence_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -430,10 +435,11 @@ impl ReplicationNetwork {
     where
         T: AsyncWriteExt + Unpin,
     {
+        static SEQUENCE_COUNTER: AtomicU64 = AtomicU64::new(0);
         let network_message = NetworkMessage {
             from_broker,
             to_broker,
-            sequence: 0, // TODO: Implement sequence numbers
+            sequence: SEQUENCE_COUNTER.fetch_add(1, Ordering::Relaxed),
             payload: message.clone(),
         };
 

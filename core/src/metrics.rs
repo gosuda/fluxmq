@@ -353,23 +353,17 @@ impl ThroughputMetrics {
 
     #[inline(always)]
     pub fn record_produced(&self, count: u64, bytes: u64) {
-        // Use Release ordering to ensure visibility to readers
-        // This ensures calculate_rates can see the updated values
-        let new_total = self.messages_produced.0.fetch_add(count, Ordering::Release) + count;
-        self.bytes_produced.0.fetch_add(bytes, Ordering::Release);
-
-        // Debug logging to track message recording
-        tracing::debug!(
-            "🔧 METRICS RECORD: count={}, new_total={}",
-            count,
-            new_total
-        );
+        // Use Relaxed ordering for maximum performance in hot path
+        // Rate calculation will use proper Acquire/Release barriers
+        self.messages_produced.0.fetch_add(count, Ordering::Relaxed);
+        self.bytes_produced.0.fetch_add(bytes, Ordering::Relaxed);
     }
 
     #[inline(always)]
     pub fn record_consumed(&self, count: u64, bytes: u64) {
-        self.messages_consumed.0.fetch_add(count, Ordering::Release);
-        self.bytes_consumed.0.fetch_add(bytes, Ordering::Release);
+        // Use Relaxed ordering for maximum performance in hot path
+        self.messages_consumed.0.fetch_add(count, Ordering::Relaxed);
+        self.bytes_consumed.0.fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub fn calculate_rates(&self) {
@@ -379,10 +373,10 @@ impl ThroughputMetrics {
             .as_nanos() as u64;
         let last_ns = self.last_calc_timestamp_ns.load(Ordering::Acquire);
 
-        // Only update if at least 500ms have passed
+        // Reduce minimum interval to 100ms for faster updates during bursts
         let elapsed_ns = now_ns.saturating_sub(last_ns);
-        if elapsed_ns < 500_000_000 {
-            // 500ms in nanoseconds
+        if elapsed_ns < 100_000_000 {
+            // 100ms in nanoseconds - faster response to bursts
             return;
         }
 
@@ -406,15 +400,28 @@ impl ThroughputMetrics {
                 let last_consumed = self.last_consumed_snapshot.load(Ordering::Acquire);
 
                 // Calculate rates with proper rounding
-                let producer_rate_f64 = (current_produced - last_produced) as f64 / elapsed_secs;
-                let consumer_rate_f64 = (current_consumed - last_consumed) as f64 / elapsed_secs;
+                let messages_in_period = current_produced.saturating_sub(last_produced);
+                let producer_rate_f64 = messages_in_period as f64 / elapsed_secs;
+
+                let consumed_in_period = current_consumed.saturating_sub(last_consumed);
+                let consumer_rate_f64 = consumed_in_period as f64 / elapsed_secs;
 
                 let producer_rate = producer_rate_f64.round() as u64;
                 let consumer_rate = consumer_rate_f64.round() as u64;
 
-                // Debug logging for rate calculation
-                tracing::info!("🔧 RATE CALC DEBUG: elapsed_secs={:.2}, current_produced={}, last_produced={}, producer_rate_f64={:.2}, producer_rate={}",
-                    elapsed_secs, current_produced, last_produced, producer_rate_f64, producer_rate);
+                // Only log if there's actual activity (reduce noise)
+                if messages_in_period > 0 || consumed_in_period > 0 {
+                    tracing::info!(
+                        "📊 METRICS: {:.2}s interval | produced: {} msgs ({} msg/s) | consumed: {} msgs ({} msg/s) | total: {}/{}",
+                        elapsed_secs,
+                        messages_in_period,
+                        producer_rate,
+                        consumed_in_period,
+                        consumer_rate,
+                        current_produced,
+                        current_consumed
+                    );
+                }
 
                 // Store rates with Release ordering
                 self.producer_rate.0.store(producer_rate, Ordering::Release);
@@ -995,6 +1002,12 @@ impl CacheMetrics {
 
     pub fn record_eviction(&self, count: u64) {
         self.total_evictions.fetch_add(count, Ordering::Relaxed);
+        // Update eviction rate (evictions per second approximation)
+        self.eviction_rate.store(count, Ordering::Relaxed);
+    }
+
+    pub fn get_eviction_rate(&self) -> u64 {
+        self.eviction_rate.load(Ordering::Relaxed)
     }
 
     pub fn update_memory_usage(&self, bytes: u64) {
@@ -1014,10 +1027,18 @@ impl CacheMetrics {
         let misses = self.total_cache_misses.0.load(Ordering::Relaxed);
         let total = hits + misses;
         if total > 0 {
-            hits as f64 / total as f64
+            let hit_rate = hits as f64 / total as f64;
+            // Update avg_hit_rate (stored as percentage * 100 for precision)
+            self.avg_hit_rate
+                .store((hit_rate * 10000.0) as u64, Ordering::Relaxed);
+            hit_rate
         } else {
             0.0
         }
+    }
+
+    pub fn get_avg_hit_rate(&self) -> f64 {
+        self.avg_hit_rate.load(Ordering::Relaxed) as f64 / 10000.0
     }
 
     // Getters for metrics

@@ -1,5 +1,6 @@
 use clap::Parser;
 use fluxmq::{tls::TlsConfig, BrokerConfig, BrokerId, BrokerServer, Result};
+use tokio::signal;
 use tracing::{error, info, warn};
 use tracing_subscriber;
 
@@ -163,8 +164,25 @@ async fn main() -> Result<()> {
 
     let server = BrokerServer::new_async(config).await?;
 
-    // Start the Kafka-compatible broker server
-    server.run().await
+    // Spawn the server task
+    let server_handle = tokio::spawn(async move {
+        if let Err(e) = server.run().await {
+            error!("Server error: {}", e);
+        }
+    });
+
+    // Set up signal handlers
+    tokio::select! {
+        _ = signal::ctrl_c() => {
+            info!("Received Ctrl+C, shutting down gracefully...");
+        }
+        _ = server_handle => {
+            info!("Server task completed");
+        }
+    }
+
+    info!("FluxMQ shut down successfully");
+    Ok(())
 }
 
 fn parse_log_level(level: &str) -> tracing::Level {

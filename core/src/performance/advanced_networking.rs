@@ -129,8 +129,8 @@ impl AdvancedConnectionManager {
 
     /// Advanced socket tuning for maximum performance
     async fn tune_socket(&self, stream: &mut TcpStream) -> Result<()> {
-        // TODO: Implement socket2 tuning when needed
-        // For now, use basic Tokio socket options
+        // FUTURE: Implement socket2 advanced tuning for production
+        // Current: Basic Tokio socket options (sufficient for current performance)
 
         // Enable TCP_NODELAY for low latency using Tokio
         if self.config.tcp_nodelay {
@@ -139,8 +139,8 @@ impl AdvancedConnectionManager {
             })?;
         }
 
-        // TODO: Set buffer sizes using socket2 when implemented
-        // TODO: Enable keepalive using socket2 when implemented
+        // FUTURE: Implement socket2 buffer size tuning
+        // FUTURE: Implement socket2 keepalive configuration
 
         Ok(())
     }

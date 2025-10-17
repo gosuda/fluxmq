@@ -268,9 +268,38 @@ cargo test protocol     # Protocol tests
 ```
 
 ### Performance benchmarks
+
+#### 🚀 Automated Benchmark Execution (Recommended)
+```bash
+# One-click benchmark execution with file logging
+./run_benchmark.sh
+
+# Monitor benchmark progress
+./monitor_logs.sh
+
+# Clean up processes and logs
+./cleanup.sh
+```
+
+#### 📊 Manual Java Benchmark (Advanced)
+```bash
+# 1. Start FluxMQ server
+env RUSTFLAGS="-C target-cpu=native" ./target/release/fluxmq --port 9092 --enable-consumer-groups --log-level info > fluxmq_server.log 2>&1 &
+
+# 2. Run Java benchmark with file logging
+cd fluxmq-java-tests
+java -cp "target/classes:target/dependency/*" com.fluxmq.tests.MegaBatchBenchmark localhost:9092 > java_benchmark_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+
+# 3. Monitor results
+tail -f java_benchmark_*.log
+```
+
+#### 🔧 Legacy Rust Benchmarks
 ```bash
 cargo test --release -- --ignored benchmark
 ```
+
+📖 **For detailed benchmark execution guide**: See [BENCHMARK_EXECUTION_GUIDE.md](BENCHMARK_EXECUTION_GUIDE.md)
 
 ## 📁 Project Structure
 

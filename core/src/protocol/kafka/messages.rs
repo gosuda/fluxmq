@@ -130,6 +130,7 @@ pub struct KafkaForgottenTopic {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaFetchResponse {
     pub header: KafkaResponseHeader,
+    pub api_version: i16, // Track the API version for proper encoding
     pub throttle_time_ms: i32,
     pub error_code: i16,
     pub session_id: i32,

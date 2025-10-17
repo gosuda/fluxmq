@@ -645,7 +645,8 @@ mod tests {
         let ptr2 = arena.allocate(200, 8).unwrap();
 
         assert_ne!(ptr1, ptr2);
-        assert_eq!(arena.position.load(Ordering::Relaxed), 300);
+        // After 100 bytes + alignment padding (100 -> 104) + 200 bytes = 304
+        assert_eq!(arena.position.load(Ordering::Relaxed), 304);
     }
 
     #[test]

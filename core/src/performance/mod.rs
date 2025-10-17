@@ -83,6 +83,7 @@ pub mod advanced_networking;
 pub mod arena_allocator;
 pub mod copy_file_range_zero_copy; // Kernel-level file-to-file copying
 pub mod cross_platform_zero_copy; // Unified cross-platform zero-copy interface
+pub mod custom_allocator;
 pub mod fetch_sendfile; // Integration of sendfile for Fetch responses
 pub mod io_optimizations;
 pub mod io_uring_zero_copy; // Ultra-high performance Linux io_uring networking
@@ -90,17 +91,16 @@ pub mod lockfree_storage;
 pub mod memory;
 pub mod mmap_storage;
 pub mod network_simple;
+pub mod numa_allocator;
 pub mod object_pool;
 pub mod quick_wins;
 pub mod sendfile_zero_copy; // Kernel-level zero-copy using sendfile/splice
+pub mod server_batch_aggregator; // Server-side batch aggregation for kafka-python performance
 pub mod simd_optimizations;
 pub mod smart_pointers;
+pub mod thread_affinity;
 pub mod ultra_performance;
 pub mod zero_copy_storage; // Java client optimization - arena memory allocation
-                           // pub mod server_batch_aggregator; // Server-side batch aggregation for kafka-python performance
-pub mod custom_allocator;
-pub mod numa_allocator;
-pub mod thread_affinity;
 // 🚀 Protocol & Consumer Arena Allocators - High-frequency allocation optimization
 pub mod consumer_arena;
 pub mod protocol_arena; // Protocol request/response processing arena // Consumer group rebalancing operations arena

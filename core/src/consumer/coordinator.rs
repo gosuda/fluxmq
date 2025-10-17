@@ -3,11 +3,11 @@ use crate::storage::HybridStorage;
 use crate::topic_manager::TopicManager;
 use crate::Result;
 use crossbeam::channel;
+use dashmap::DashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::fs;
-use tokio::sync::RwLock;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
@@ -16,15 +16,15 @@ use tracing::{debug, error, info, warn};
 pub struct ConsumerGroupCoordinator {
     /// Configuration for consumer groups
     config: ConsumerGroupConfig,
-    /// Active consumer groups
-    groups: Arc<RwLock<HashMap<ConsumerGroupId, ConsumerGroupMetadata>>>,
+    /// Active consumer groups (🚀 LOCK-FREE: DashMap for concurrent access)
+    groups: Arc<DashMap<ConsumerGroupId, ConsumerGroupMetadata>>,
     /// Topic manager for partition information
     topic_manager: Arc<TopicManager>,
     /// Storage for offset commits (future use)
     #[allow(dead_code)]
     storage: Option<Arc<HybridStorage>>,
-    /// In-memory offset storage for fast access
-    offset_storage: Arc<RwLock<HashMap<(ConsumerGroupId, TopicName, PartitionId), ConsumerOffset>>>,
+    /// In-memory offset storage for fast access (🚀 LOCK-FREE: DashMap for concurrent access)
+    offset_storage: Arc<DashMap<(ConsumerGroupId, TopicName, PartitionId), ConsumerOffset>>,
     /// Channel for group state change notifications
     state_change_tx: channel::Sender<GroupStateChange>,
     state_change_rx: Arc<tokio::sync::Mutex<Option<channel::Receiver<GroupStateChange>>>>,
@@ -142,10 +142,10 @@ impl ConsumerGroupCoordinator {
 
         Self {
             config,
-            groups: Arc::new(RwLock::new(HashMap::new())),
+            groups: Arc::new(DashMap::new()), // 🚀 LOCK-FREE: DashMap initialization
             topic_manager,
             storage,
-            offset_storage: Arc::new(RwLock::new(HashMap::new())),
+            offset_storage: Arc::new(DashMap::new()), // 🚀 LOCK-FREE: DashMap initialization
             state_change_tx,
             state_change_rx: Arc::new(tokio::sync::Mutex::new(Some(state_change_rx))),
             metadata_dir,
@@ -377,16 +377,16 @@ impl ConsumerGroupCoordinator {
 
     /// Handle list groups request
     pub async fn handle_list_groups(&self) -> ConsumerGroupMessage {
-        let groups = self.groups.read().await;
-        let group_overviews: Vec<GroupOverview> = groups
-            .values()
-            .filter(|metadata| {
+        let group_overviews: Vec<GroupOverview> = self
+            .groups
+            .iter()
+            .filter(|entry| {
                 // Only include non-dead groups
-                !matches!(metadata.state, ConsumerGroupState::Dead)
+                !matches!(entry.value().state, ConsumerGroupState::Dead)
             })
-            .map(|metadata| GroupOverview {
-                group_id: metadata.group_id.clone(),
-                protocol_type: metadata.protocol_type.clone(),
+            .map(|entry| GroupOverview {
+                group_id: entry.value().group_id.clone(),
+                protocol_type: entry.value().protocol_type.clone(),
             })
             .collect();
 
@@ -403,16 +403,16 @@ impl ConsumerGroupCoordinator {
         &self,
         states: Option<Vec<ConsumerGroupState>>,
     ) -> ConsumerGroupMessage {
-        let groups = self.groups.read().await;
-        let group_overviews: Vec<GroupOverview> = groups
-            .values()
-            .filter(|metadata| match &states {
-                Some(filter_states) => filter_states.contains(&metadata.state),
-                None => !matches!(metadata.state, ConsumerGroupState::Dead),
+        let group_overviews: Vec<GroupOverview> = self
+            .groups
+            .iter()
+            .filter(|entry| match &states {
+                Some(filter_states) => filter_states.contains(&entry.value().state),
+                None => !matches!(entry.value().state, ConsumerGroupState::Dead),
             })
-            .map(|metadata| GroupOverview {
-                group_id: metadata.group_id.clone(),
-                protocol_type: metadata.protocol_type.clone(),
+            .map(|entry| GroupOverview {
+                group_id: entry.value().group_id.clone(),
+                protocol_type: entry.value().protocol_type.clone(),
             })
             .collect();
 
@@ -434,12 +434,12 @@ impl ConsumerGroupCoordinator {
         request: ConsumerGroupMessage,
     ) -> ConsumerGroupMessage {
         if let ConsumerGroupMessage::DescribeGroups { group_ids } = request {
-            let groups = self.groups.read().await;
             let mut descriptions = Vec::new();
 
             for group_id in group_ids {
-                if let Some(metadata) = groups.get(&group_id) {
+                if let Some(metadata) = self.groups.get(&group_id) {
                     let member_descriptions: Vec<MemberDescription> = metadata
+                        .value()
                         .members
                         .values()
                         .map(|member| {
@@ -463,6 +463,7 @@ impl ConsumerGroupCoordinator {
 
                     // Calculate additional group statistics
                     let total_partitions: usize = metadata
+                        .value()
                         .members
                         .values()
                         .map(|m| m.assigned_partitions.len())
@@ -471,17 +472,17 @@ impl ConsumerGroupCoordinator {
                     debug!(
                         "Describing group {}: state={:?}, members={}, partitions={}",
                         group_id,
-                        metadata.state,
-                        metadata.members.len(),
+                        metadata.value().state,
+                        metadata.value().members.len(),
                         total_partitions
                     );
 
                     descriptions.push(ConsumerGroupDescription {
                         error_code: error_codes::NONE,
                         group_id: group_id.clone(),
-                        state: metadata.state.clone(),
-                        protocol_type: metadata.protocol_type.clone(),
-                        protocol_data: metadata.protocol_name.clone(),
+                        state: metadata.value().state.clone(),
+                        protocol_type: metadata.value().protocol_type.clone(),
+                        protocol_data: metadata.value().protocol_name.clone(),
                         members: member_descriptions,
                     });
                 } else {
@@ -588,26 +589,26 @@ impl ConsumerGroupCoordinator {
         protocol_type: String,
         group_protocols: Vec<GroupProtocol>,
     ) -> std::result::Result<(i32, String, ConsumerId, Vec<ConsumerGroupMember>), i16> {
-        let mut groups = self.groups.write().await;
         let now = SystemTime::now();
 
         // Get or create group
-        let group = groups
-            .entry(group_id.clone())
-            .or_insert_with(|| ConsumerGroupMetadata {
-                group_id: group_id.clone(),
-                state: ConsumerGroupState::Empty,
-                protocol_type: protocol_type.clone(),
-                protocol_name: self.select_compatible_protocol(&group_protocols),
-                leader_id: None,
-                members: HashMap::new(),
-                generation_id: 0,
-                created_at: now,
-                state_timestamp: now,
-            });
+        let mut group_ref =
+            self.groups
+                .entry(group_id.clone())
+                .or_insert_with(|| ConsumerGroupMetadata {
+                    group_id: group_id.clone(),
+                    state: ConsumerGroupState::Empty,
+                    protocol_type: protocol_type.clone(),
+                    protocol_name: self.select_compatible_protocol(&group_protocols),
+                    leader_id: None,
+                    members: HashMap::new(),
+                    generation_id: 0,
+                    created_at: now,
+                    state_timestamp: now,
+                });
 
         // Check protocol compatibility
-        if group.protocol_type != protocol_type && !group.members.is_empty() {
+        if group_ref.protocol_type != protocol_type && !group_ref.members.is_empty() {
             return Err(error_codes::INCONSISTENT_GROUP_PROTOCOL);
         }
 
@@ -622,7 +623,7 @@ impl ConsumerGroupCoordinator {
         );
 
         // Add or update member
-        let is_new_member = !group.members.contains_key(&consumer_id);
+        let is_new_member = !group_ref.members.contains_key(&consumer_id);
         let member = ConsumerGroupMember {
             consumer_id: consumer_id.clone(),
             group_id: group_id.clone(),
@@ -636,22 +637,22 @@ impl ConsumerGroupCoordinator {
             is_leader: false,
         };
 
-        group.members.insert(consumer_id.clone(), member);
+        group_ref.members.insert(consumer_id.clone(), member);
 
         // If this is a new member or group was empty, trigger rebalance
-        if is_new_member || group.state == ConsumerGroupState::Empty {
-            group.state = ConsumerGroupState::PreparingRebalance;
-            group.generation_id += 1;
-            group.state_timestamp = now;
+        if is_new_member || group_ref.state == ConsumerGroupState::Empty {
+            group_ref.state = ConsumerGroupState::PreparingRebalance;
+            group_ref.generation_id += 1;
+            group_ref.state_timestamp = now;
 
             // Select leader (first member or existing leader if still present)
-            if group.leader_id.is_none()
-                || !group
+            if group_ref.leader_id.is_none()
+                || !group_ref
                     .members
-                    .contains_key(group.leader_id.as_ref().unwrap())
+                    .contains_key(group_ref.leader_id.as_ref().unwrap())
             {
-                group.leader_id = Some(consumer_id.clone());
-                if let Some(leader_member) = group.members.get_mut(&consumer_id) {
+                group_ref.leader_id = Some(consumer_id.clone());
+                if let Some(leader_member) = group_ref.members.get_mut(&consumer_id) {
                     leader_member.is_leader = true;
                 }
             }
@@ -663,10 +664,10 @@ impl ConsumerGroupCoordinator {
             });
         }
 
-        let leader_id = group.leader_id.clone().unwrap_or_default();
-        let generation_id = group.generation_id;
-        let protocol_name = group.protocol_name.clone();
-        let members: Vec<ConsumerGroupMember> = group.members.values().cloned().collect();
+        let leader_id = group_ref.leader_id.clone().unwrap_or_default();
+        let generation_id = group_ref.generation_id;
+        let protocol_name = group_ref.protocol_name.clone();
+        let members: Vec<ConsumerGroupMember> = group_ref.members.values().cloned().collect();
 
         debug!(
             "JoinGroup returning: group={}, protocol_name={}, generation={}",
@@ -683,19 +684,18 @@ impl ConsumerGroupCoordinator {
         generation_id: i32,
         group_assignments: HashMap<ConsumerId, Vec<TopicPartition>>,
     ) -> std::result::Result<Vec<TopicPartition>, i16> {
-        let mut groups = self.groups.write().await;
-
-        let group = groups
+        let mut group_ref = self
+            .groups
             .get_mut(&group_id)
             .ok_or(error_codes::UNKNOWN_GROUP_ID)?;
 
         // Verify generation
-        if group.generation_id != generation_id {
+        if group_ref.generation_id != generation_id {
             return Err(error_codes::ILLEGAL_GENERATION);
         }
 
         // Verify member exists
-        let member = group
+        let member = group_ref
             .members
             .get_mut(&consumer_id)
             .ok_or(error_codes::UNKNOWN_CONSUMER_ID)?;
@@ -707,7 +707,7 @@ impl ConsumerGroupCoordinator {
         if member.is_leader {
             // If no assignments provided, generate them automatically
             let final_assignments = if group_assignments.is_empty() {
-                self.generate_partition_assignments(&group_id, group)
+                self.generate_partition_assignments(&group_id, &*group_ref)
                     .await?
             } else {
                 group_assignments
@@ -715,7 +715,7 @@ impl ConsumerGroupCoordinator {
 
             // Apply assignments to all members
             for (member_id, assignment) in final_assignments.iter() {
-                if let Some(target_member) = group.members.get_mut(member_id) {
+                if let Some(target_member) = group_ref.members.get_mut(member_id) {
                     target_member.assigned_partitions = assignment.clone();
                     debug!(
                         "Assigned {} partitions to consumer {} in group {}: {:?}",
@@ -728,13 +728,13 @@ impl ConsumerGroupCoordinator {
             }
 
             // Transition group to stable state
-            group.state = ConsumerGroupState::Stable;
-            group.state_timestamp = SystemTime::now();
+            group_ref.state = ConsumerGroupState::Stable;
+            group_ref.state_timestamp = SystemTime::now();
 
             info!(
                 "Group {} transitioned to stable state with {} members",
                 group_id,
-                group.members.len()
+                group_ref.members.len()
             );
 
             // Return this consumer's assignment
@@ -758,20 +758,18 @@ impl ConsumerGroupCoordinator {
         consumer_id: ConsumerId,
         generation_id: i32,
     ) -> i16 {
-        let mut groups = self.groups.write().await;
-
-        let group = match groups.get_mut(&group_id) {
+        let mut group_ref = match self.groups.get_mut(&group_id) {
             Some(g) => g,
             None => return error_codes::UNKNOWN_GROUP_ID,
         };
 
         // Verify generation
-        if group.generation_id != generation_id {
+        if group_ref.generation_id != generation_id {
             return error_codes::ILLEGAL_GENERATION;
         }
 
         // Update member's last heartbeat
-        if let Some(member) = group.members.get_mut(&consumer_id) {
+        if let Some(member) = group_ref.members.get_mut(&consumer_id) {
             member.last_heartbeat = SystemTime::now();
             error_codes::NONE
         } else {
@@ -784,29 +782,28 @@ impl ConsumerGroupCoordinator {
         group_id: ConsumerGroupId,
         consumer_id: ConsumerId,
     ) -> i16 {
-        let mut groups = self.groups.write().await;
-
-        let group = match groups.get_mut(&group_id) {
+        let mut group_ref = match self.groups.get_mut(&group_id) {
             Some(g) => g,
             None => return error_codes::UNKNOWN_GROUP_ID,
         };
 
         // Remove member
-        if group.members.remove(&consumer_id).is_some() {
+        if group_ref.members.remove(&consumer_id).is_some() {
             // If leader left, select new leader
-            if group.leader_id.as_ref() == Some(&consumer_id) {
-                group.leader_id = group.members.keys().next().cloned();
-                if let Some(new_leader_id) = &group.leader_id {
-                    if let Some(new_leader) = group.members.get_mut(new_leader_id) {
+            if group_ref.leader_id.as_ref() == Some(&consumer_id) {
+                group_ref.leader_id = group_ref.members.keys().next().cloned();
+                // 🚀 Clone leader_id before mutable borrow to avoid borrow checker conflict
+                if let Some(new_leader_id) = group_ref.leader_id.clone() {
+                    if let Some(new_leader) = group_ref.members.get_mut(&new_leader_id) {
                         new_leader.is_leader = true;
                     }
                 }
             }
 
             // Update group state
-            if group.members.is_empty() {
-                group.state = ConsumerGroupState::Empty;
-                group.leader_id = None;
+            if group_ref.members.is_empty() {
+                group_ref.state = ConsumerGroupState::Empty;
+                group_ref.leader_id = None;
 
                 // Notify state change
                 let _ = self.state_change_tx.send(GroupStateChange::GroupEmpty {
@@ -814,8 +811,8 @@ impl ConsumerGroupCoordinator {
                 });
             } else {
                 // Trigger rebalance
-                group.state = ConsumerGroupState::PreparingRebalance;
-                group.generation_id += 1;
+                group_ref.state = ConsumerGroupState::PreparingRebalance;
+                group_ref.generation_id += 1;
 
                 // Notify state change
                 let _ = self
@@ -825,7 +822,7 @@ impl ConsumerGroupCoordinator {
                     });
             }
 
-            group.state_timestamp = SystemTime::now();
+            group_ref.state_timestamp = SystemTime::now();
 
             // Notify member left
             let _ = self.state_change_tx.send(GroupStateChange::MemberLeft {
@@ -855,11 +852,14 @@ impl ConsumerGroupCoordinator {
     }
 
     async fn check_expired_consumers(&self) -> Result<()> {
-        let mut groups = self.groups.write().await;
         let now = SystemTime::now();
         let mut expired_members = Vec::new();
 
-        for (group_id, group) in groups.iter() {
+        // First pass: collect expired members
+        for entry in self.groups.iter() {
+            let group_id = entry.key();
+            let group = entry.value();
+
             for (consumer_id, member) in &group.members {
                 let elapsed = now
                     .duration_since(member.last_heartbeat)
@@ -871,32 +871,33 @@ impl ConsumerGroupCoordinator {
             }
         }
 
-        // Remove expired members and trigger rebalances
+        // Second pass: remove expired members and trigger rebalances
         for (group_id, consumer_id) in expired_members {
-            if let Some(group) = groups.get_mut(&group_id) {
-                group.members.remove(&consumer_id);
+            if let Some(mut group_ref) = self.groups.get_mut(&group_id) {
+                group_ref.members.remove(&consumer_id);
 
                 // Update group state
-                if group.members.is_empty() {
-                    group.state = ConsumerGroupState::Empty;
-                    group.leader_id = None;
+                if group_ref.members.is_empty() {
+                    group_ref.state = ConsumerGroupState::Empty;
+                    group_ref.leader_id = None;
                 } else {
                     // Select new leader if needed
-                    if group.leader_id.as_ref() == Some(&consumer_id) {
-                        group.leader_id = group.members.keys().next().cloned();
-                        if let Some(new_leader_id) = &group.leader_id {
-                            if let Some(new_leader) = group.members.get_mut(new_leader_id) {
+                    if group_ref.leader_id.as_ref() == Some(&consumer_id) {
+                        group_ref.leader_id = group_ref.members.keys().next().cloned();
+                        // 🚀 Clone leader_id before mutable borrow to avoid borrow checker conflict
+                        if let Some(new_leader_id) = group_ref.leader_id.clone() {
+                            if let Some(new_leader) = group_ref.members.get_mut(&new_leader_id) {
                                 new_leader.is_leader = true;
                             }
                         }
                     }
 
                     // Trigger rebalance
-                    group.state = ConsumerGroupState::PreparingRebalance;
-                    group.generation_id += 1;
+                    group_ref.state = ConsumerGroupState::PreparingRebalance;
+                    group_ref.generation_id += 1;
                 }
 
-                group.state_timestamp = now;
+                group_ref.state_timestamp = now;
 
                 warn!(
                     "Removed expired consumer {} from group {}",
@@ -909,7 +910,7 @@ impl ConsumerGroupCoordinator {
                     consumer_id,
                 });
 
-                if group.members.is_empty() {
+                if group_ref.members.is_empty() {
                     let _ = self
                         .state_change_tx
                         .send(GroupStateChange::GroupEmpty { group_id });
@@ -976,8 +977,8 @@ impl ConsumerGroupCoordinator {
         group_id: &ConsumerGroupId,
         topics: &[TopicName],
     ) -> Result<HashMap<ConsumerId, Vec<TopicPartition>>> {
-        let groups = self.groups.read().await;
-        let group = groups
+        let group = self
+            .groups
             .get(group_id)
             .ok_or_else(|| crate::FluxmqError::Config(format!("Unknown group: {}", group_id)))?;
 
@@ -991,7 +992,7 @@ impl ConsumerGroupCoordinator {
         }
 
         // Get consumer IDs (sorted for consistent assignment)
-        let mut consumers: Vec<ConsumerId> = group.members.keys().cloned().collect();
+        let mut consumers: Vec<ConsumerId> = group.value().members.keys().cloned().collect();
         consumers.sort();
 
         // Use partition assignor
@@ -1114,9 +1115,8 @@ impl ConsumerGroupCoordinator {
 
     /// Check if a rebalance is needed for the group
     pub async fn needs_rebalance(&self, group_id: &ConsumerGroupId) -> bool {
-        let groups = self.groups.read().await;
-        if let Some(group) = groups.get(group_id) {
-            match group.state {
+        if let Some(group) = self.groups.get(group_id) {
+            match group.value().state {
                 ConsumerGroupState::PreparingRebalance
                 | ConsumerGroupState::CompletingRebalance => true,
                 _ => false,
@@ -1128,16 +1128,15 @@ impl ConsumerGroupCoordinator {
 
     /// Force a rebalance for a group (useful for administrative operations)
     pub async fn trigger_rebalance(&self, group_id: &ConsumerGroupId) -> Result<()> {
-        let mut groups = self.groups.write().await;
-        if let Some(group) = groups.get_mut(group_id) {
-            if !group.members.is_empty() {
-                group.state = ConsumerGroupState::PreparingRebalance;
-                group.generation_id += 1;
-                group.state_timestamp = SystemTime::now();
+        if let Some(mut group_ref) = self.groups.get_mut(group_id) {
+            if !group_ref.members.is_empty() {
+                group_ref.state = ConsumerGroupState::PreparingRebalance;
+                group_ref.generation_id += 1;
+                group_ref.state_timestamp = SystemTime::now();
 
                 info!(
                     "Manually triggered rebalance for group {} (generation {})",
-                    group_id, group.generation_id
+                    group_id, group_ref.generation_id
                 );
 
                 // Notify state change
@@ -1153,9 +1152,9 @@ impl ConsumerGroupCoordinator {
 
     /// Get detailed group statistics
     pub async fn get_group_stats(&self, group_id: &ConsumerGroupId) -> Option<GroupStats> {
-        let groups = self.groups.read().await;
-        groups.get(group_id).map(|group| {
+        self.groups.get(group_id).map(|group| {
             let total_partitions: usize = group
+                .value()
                 .members
                 .values()
                 .map(|member| member.assigned_partitions.len())
@@ -1163,14 +1162,14 @@ impl ConsumerGroupCoordinator {
 
             GroupStats {
                 group_id: group_id.clone(),
-                state: group.state.clone(),
-                member_count: group.members.len(),
-                generation_id: group.generation_id,
+                state: group.value().state.clone(),
+                member_count: group.value().members.len(),
+                generation_id: group.value().generation_id,
                 total_assigned_partitions: total_partitions,
-                leader_id: group.leader_id.clone(),
+                leader_id: group.value().leader_id.clone(),
                 assignment_strategy: self.config.default_assignment_strategy.clone(),
-                created_at: group.created_at,
-                last_state_change: group.state_timestamp,
+                created_at: group.value().created_at,
+                last_state_change: group.value().state_timestamp,
             }
         })
     }
@@ -1186,16 +1185,18 @@ impl ConsumerGroupCoordinator {
     ) -> std::result::Result<Vec<TopicPartitionError>, i16> {
         // Verify the consumer group exists and generation is valid
         {
-            let groups = self.groups.read().await;
-            let group = groups.get(&group_id).ok_or(error_codes::UNKNOWN_GROUP_ID)?;
+            let group = self
+                .groups
+                .get(&group_id)
+                .ok_or(error_codes::UNKNOWN_GROUP_ID)?;
 
             // Verify generation
-            if group.generation_id != generation_id {
+            if group.value().generation_id != generation_id {
                 return Err(error_codes::ILLEGAL_GENERATION);
             }
 
             // Verify member exists
-            if !group.members.contains_key(&consumer_id) {
+            if !group.value().members.contains_key(&consumer_id) {
                 return Err(error_codes::UNKNOWN_CONSUMER_ID);
             }
         }
@@ -1208,7 +1209,6 @@ impl ConsumerGroupCoordinator {
         };
 
         let mut topic_partition_errors = Vec::new();
-        let mut offset_storage = self.offset_storage.write().await;
 
         for offset in offsets {
             // Validate that the topic/partition exists
@@ -1247,7 +1247,7 @@ impl ConsumerGroupCoordinator {
 
             // Clone before moving for disk persistence
             let consumer_offset_for_disk = consumer_offset.clone();
-            offset_storage.insert(key, consumer_offset);
+            self.offset_storage.insert(key, consumer_offset);
 
             // Persist to disk storage if available
             if self.metadata_dir.is_some() {
@@ -1275,13 +1275,11 @@ impl ConsumerGroupCoordinator {
     ) -> std::result::Result<Vec<TopicPartitionOffsetResult>, i16> {
         // Verify the consumer group exists
         {
-            let groups = self.groups.read().await;
-            if !groups.contains_key(&group_id) {
+            if !self.groups.contains_key(&group_id) {
                 return Err(error_codes::UNKNOWN_GROUP_ID);
             }
         }
 
-        let offset_storage = self.offset_storage.read().await;
         let mut results = Vec::new();
 
         match topic_partitions {
@@ -1290,9 +1288,10 @@ impl ConsumerGroupCoordinator {
                 for tp in partitions {
                     let key = (group_id.clone(), tp.topic.clone(), tp.partition);
 
-                    if let Some(stored_offset) = offset_storage.get(&key) {
+                    if let Some(stored_offset) = self.offset_storage.get(&key) {
                         // Check if offset has expired
                         let is_expired = stored_offset
+                            .value()
                             .expire_timestamp
                             .map(|expire_time| SystemTime::now() > expire_time)
                             .unwrap_or(false);
@@ -1301,9 +1300,9 @@ impl ConsumerGroupCoordinator {
                             results.push(TopicPartitionOffsetResult {
                                 topic: tp.topic,
                                 partition: tp.partition,
-                                offset: stored_offset.offset,
+                                offset: stored_offset.value().offset,
                                 leader_epoch: -1, // Not tracked yet
-                                metadata: stored_offset.metadata.clone(),
+                                metadata: stored_offset.value().metadata.clone(),
                                 error_code: error_codes::NONE,
                             });
                         } else {
@@ -1332,7 +1331,10 @@ impl ConsumerGroupCoordinator {
             }
             None => {
                 // Fetch all offsets for this group
-                for ((stored_group_id, topic, partition), stored_offset) in offset_storage.iter() {
+                for entry in self.offset_storage.iter() {
+                    let (stored_group_id, topic, partition) = entry.key();
+                    let stored_offset = entry.value();
+
                     if stored_group_id == &group_id {
                         // Check if offset has expired
                         let is_expired = stored_offset
@@ -1375,10 +1377,9 @@ impl ConsumerGroupCoordinator {
 
     /// Clean up expired offsets (called periodically)
     pub async fn cleanup_expired_offsets(&self) -> Result<()> {
-        let mut offset_storage = self.offset_storage.write().await;
         let now = SystemTime::now();
 
-        offset_storage.retain(|_key, offset| {
+        self.offset_storage.retain(|_key, offset| {
             offset
                 .expire_timestamp
                 .map(|expire_time| now <= expire_time)
@@ -1428,8 +1429,10 @@ impl ConsumerGroupCoordinator {
 
     /// Get all active groups (for administrative purposes)
     pub async fn get_all_groups(&self) -> Vec<ConsumerGroupId> {
-        let groups = self.groups.read().await;
-        groups.keys().cloned().collect()
+        self.groups
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
     }
 
     /// Get group by ID with full metadata
@@ -1437,18 +1440,16 @@ impl ConsumerGroupCoordinator {
         &self,
         group_id: &ConsumerGroupId,
     ) -> Option<ConsumerGroupMetadata> {
-        let groups = self.groups.read().await;
-        groups.get(group_id).cloned()
+        self.groups.get(group_id).map(|entry| entry.value().clone())
     }
 
     /// Check if group exists and is active
     pub async fn is_group_active(&self, group_id: &ConsumerGroupId) -> bool {
-        let groups = self.groups.read().await;
-        groups
+        self.groups
             .get(group_id)
             .map(|group| {
                 !matches!(
-                    group.state,
+                    group.value().state,
                     ConsumerGroupState::Dead | ConsumerGroupState::Empty
                 )
             })
@@ -1467,7 +1468,6 @@ impl ConsumerGroupCoordinator {
             return Ok(());
         }
 
-        let mut groups = self.groups.write().await;
         let mut loaded_count = 0;
 
         // Read all JSON files in the metadata directory
@@ -1489,7 +1489,8 @@ impl ConsumerGroupCoordinator {
                                 "Loaded persisted group metadata for group: {}",
                                 group_metadata.group_id
                             );
-                            groups.insert(group_metadata.group_id.clone(), group_metadata);
+                            self.groups
+                                .insert(group_metadata.group_id.clone(), group_metadata);
                             loaded_count += 1;
                         }
                         Err(e) => {
@@ -1584,10 +1585,11 @@ impl ConsumerGroupCoordinator {
             fs::create_dir_all(metadata_dir).await?;
         }
 
-        let groups = self.groups.read().await;
+        // 🚀 LOCK-FREE: DashMap iteration without read lock
         let mut persisted_count = 0;
 
-        for group in groups.values() {
+        for entry in self.groups.iter() {
+            let group = entry.value();
             // Only persist active groups (not Dead state)
             if !matches!(group.state, ConsumerGroupState::Dead) {
                 match self.persist_group_metadata(group).await {
@@ -1947,8 +1949,7 @@ impl ConsumerGroupCoordinator {
                     Ok(content) => {
                         match serde_json::from_str::<Vec<SerializableConsumerOffset>>(&content) {
                             Ok(serializable_offsets) => {
-                                let mut offset_storage = self.offset_storage.write().await;
-
+                                // 🚀 LOCK-FREE: DashMap direct insert without write lock
                                 for serializable_offset in serializable_offsets {
                                     let consumer_offset = ConsumerOffset::from(serializable_offset);
                                     let key = (
@@ -1956,7 +1957,7 @@ impl ConsumerGroupCoordinator {
                                         consumer_offset.topic.clone(),
                                         consumer_offset.partition,
                                     );
-                                    offset_storage.insert(key, consumer_offset);
+                                    self.offset_storage.insert(key, consumer_offset);
                                     total_loaded += 1;
                                 }
                             }

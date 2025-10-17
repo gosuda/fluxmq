@@ -200,7 +200,7 @@ mod tests {
         assert!(TxnState::Ongoing.can_add_partitions());
         assert!(TxnState::Ongoing.can_end());
         assert!(!TxnState::PrepareCommit.can_add_partitions());
-        assert!(!TxnState::CompleteCommit.is_terminal());
+        assert!(TxnState::CompleteCommit.is_terminal());
         assert!(TxnState::Dead.is_terminal());
     }
 

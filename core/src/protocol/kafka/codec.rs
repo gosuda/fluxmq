@@ -13,7 +13,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::io::{self, Cursor, Read};
 use thiserror::Error;
 use tokio_util::codec::{Decoder, Encoder};
-use tracing::{debug, warn, info, error};
+use tracing::{debug, warn, error};
 
 use super::messages::*;
 use crate::protocol::kafka::{
@@ -246,20 +246,20 @@ impl KafkaCodec {
     pub fn encode_response(response: &KafkaResponse) -> Result<Bytes> {
         let mut buf = BytesMut::new();
         
-        info!("🎯 encode_response: Starting with empty buffer");
+        debug!("🎯 encode_response: Starting with empty buffer");
 
         match response {
             KafkaResponse::Produce(resp) => Self::encode_produce_response(resp, &mut buf)?,
             KafkaResponse::Fetch(resp) => Self::encode_fetch_response(resp, &mut buf)?,
             KafkaResponse::Metadata(resp) => {
-                info!("📝 encode_response: About to encode Metadata response");
+                debug!("📝 encode_response: About to encode Metadata response");
                 Self::encode_metadata_response(resp, &mut buf)?;
-                info!("✅ encode_response: Metadata response encoded, buffer size: {}", buf.len());
+                debug!("✅ encode_response: Metadata response encoded, buffer size: {}", buf.len());
                 
                 // DEBUG: Check first 12 bytes of encoded response
                 if buf.len() >= 12 {
                     let first_12_bytes = &buf[0..12];
-                    info!("📊 encode_response: First 12 bytes after Metadata encoding: [{:02x} {:02x} {:02x} {:02x}] [{:02x} {:02x} {:02x} {:02x}] [{:02x} {:02x} {:02x} {:02x}]",
+                    debug!("📊 encode_response: First 12 bytes after Metadata encoding: [{:02x} {:02x} {:02x} {:02x}] [{:02x} {:02x} {:02x} {:02x}] [{:02x} {:02x} {:02x} {:02x}]",
                           first_12_bytes[0], first_12_bytes[1], first_12_bytes[2], first_12_bytes[3],
                           first_12_bytes[4], first_12_bytes[5], first_12_bytes[6], first_12_bytes[7], 
                           first_12_bytes[8], first_12_bytes[9], first_12_bytes[10], first_12_bytes[11]);
@@ -367,11 +367,11 @@ impl KafkaCodec {
         // KafkaFrameCodec already adds length prefix, so we don't need it here
         // This was causing [LENGTH_PREFIX][BUFFER_SIZE][CORRELATION_ID] instead of [LENGTH_PREFIX][CORRELATION_ID]
         
-        info!("🔧 FIXED: Removed double length encoding, returning buffer directly");
-        info!("🔧 Buffer size: {}, first 8 bytes should be correlation_id + throttle_time", buf.len());
+        debug!("🔧 FIXED: Removed double length encoding, returning buffer directly");
+        debug!("🔧 Buffer size: {}, first 8 bytes should be correlation_id + throttle_time", buf.len());
         if buf.len() >= 8 {
             let first_8_bytes = &buf[0..8];
-            info!("🔧 First 8 bytes: [{:02x} {:02x} {:02x} {:02x}] [{:02x} {:02x} {:02x} {:02x}]", 
+            debug!("🔧 First 8 bytes: [{:02x} {:02x} {:02x} {:02x}] [{:02x} {:02x} {:02x} {:02x}]", 
                   first_8_bytes[0], first_8_bytes[1], first_8_bytes[2], first_8_bytes[3],
                   first_8_bytes[4], first_8_bytes[5], first_8_bytes[6], first_8_bytes[7]);
         }
@@ -524,8 +524,8 @@ impl KafkaCodec {
     }
 
     fn encode_fetch_response(response: &KafkaFetchResponse, buf: &mut BytesMut) -> Result<()> {
-        // TODO: Use the actual API version from the request. For now, try using a higher version
-        let api_version = 10i16; // Use v10 to match consumer's expected API version
+        // Use the actual API version from the request
+        let api_version = response.api_version;
         
         buf.put_i32(response.header.correlation_id);
         
@@ -755,7 +755,7 @@ impl KafkaCodec {
     ) -> Result<()> {
         // CRITICAL TEST: Try flexible encoding for v9+ as per Kafka spec
         let is_flexible = response.api_version >= 9; // Metadata v9+ uses flexible versions
-        info!("🔧 MetadataResponse encoding: version={}, flexible={}", response.api_version, is_flexible);
+        debug!("🔧 MetadataResponse encoding: version={}, flexible={}", response.api_version, is_flexible);
         
         debug!("Encoding Metadata response v{}, flexible={}", response.api_version, is_flexible);
         debug!("  - correlation_id: {}", response.header.correlation_id);
@@ -767,13 +767,13 @@ impl KafkaCodec {
         // All Kafka responses must start with correlation_id as the first field
         // This is consistent across all Kafka APIs including Metadata v0-v11
         
-        info!("🔍 BEFORE correlation_id encoding: buffer is empty, size={}", buf.len());
+        debug!("🔍 BEFORE correlation_id encoding: buffer is empty, size={}", buf.len());
         buf.put_i32(response.header.correlation_id);
-        info!("✅ AFTER correlation_id encoding: buffer size={}, correlation_id={}", buf.len(), response.header.correlation_id);
+        debug!("✅ AFTER correlation_id encoding: buffer size={}, correlation_id={}", buf.len(), response.header.correlation_id);
         // DEBUG: Show exact hex bytes at start of response
         if buf.len() >= 4 {
             let first_4_bytes = &buf[0..4];
-            info!("  - CORRELATION_ID BYTES: [{:02x}, {:02x}, {:02x}, {:02x}] = {}", 
+            debug!("  - CORRELATION_ID BYTES: [{:02x}, {:02x}, {:02x}, {:02x}] = {}", 
                   first_4_bytes[0], first_4_bytes[1], first_4_bytes[2], first_4_bytes[3], 
                   i32::from_be_bytes([first_4_bytes[0], first_4_bytes[1], first_4_bytes[2], first_4_bytes[3]]));
         }
@@ -789,7 +789,7 @@ impl KafkaCodec {
         }
 
         // Brokers array - CRITICAL for Java Kafka 4.1 compatibility
-        info!("  - CRITICAL: Encoding brokers array, count: {}", response.brokers.len());
+        debug!("  - CRITICAL: Encoding brokers array, count: {}", response.brokers.len());
         if response.brokers.is_empty() {
             error!("  - ERROR: brokers array is empty! This will cause Java client parsing failure");
         }
@@ -797,12 +797,12 @@ impl KafkaCodec {
         // Based on Kafka 4.1.0 source: _writable.writeUnsignedVarint(brokers.size() + 1)
         if is_flexible {
             Self::encode_varint(buf, (response.brokers.len() + 1) as u64);
-            info!("  - KAFKA v9+ FIX: Using compact array encoding for brokers, varint length: {}", response.brokers.len() + 1);
+            debug!("  - KAFKA v9+ FIX: Using compact array encoding for brokers, varint length: {}", response.brokers.len() + 1);
         } else {
             buf.put_i32(response.brokers.len() as i32);
-            info!("  - KAFKA v0-8: Using standard i32 array encoding for brokers, length: {}", response.brokers.len());
+            debug!("  - KAFKA v0-8: Using standard i32 array encoding for brokers, length: {}", response.brokers.len());
         }
-        info!("  - Wrote brokers array length, buffer size: {}", buf.len());
+        debug!("  - Wrote brokers array length, buffer size: {}", buf.len());
 
         for (i, broker) in response.brokers.iter().enumerate() {
             debug!("    broker[{}]: node_id={}, host='{}', port={}", i, broker.node_id, broker.host, broker.port);
@@ -842,7 +842,7 @@ impl KafkaCodec {
             let array_len = response.topics.len();
             let encoded_len = array_len + 1;
             Self::encode_varint(buf, encoded_len as u64);
-            info!("  - FIXED topics compact array: length={}, encoded as varint {} (Java will read {})", 
+            debug!("  - FIXED topics compact array: length={}, encoded as varint {} (Java will read {})", 
                   array_len, encoded_len, array_len);
         } else {
             buf.put_i32(response.topics.len() as i32);
@@ -1020,45 +1020,45 @@ impl KafkaCodec {
         // Tagged fields for response (v9+)
         if is_flexible {
             Self::encode_empty_tagged_fields(buf);
-            info!("  - Added response-level tagged fields, final buffer size: {}", buf.len());
+            debug!("  - Added response-level tagged fields, final buffer size: {}", buf.len());
         }
         
         // v2 does NOT have throttle_time_ms - removing incorrect implementation
         
-        info!("Completed Metadata response encoding, total bytes: {}", buf.len());
+        debug!("Completed Metadata response encoding, total bytes: {}", buf.len());
         
         // DEBUG: Log first 100 bytes of response for Java client debugging
         if buf.len() >= 10 {
             let preview: Vec<u8> = buf[0..std::cmp::min(100, buf.len())].to_vec();
-            info!("Response bytes (first 100): {:?}", preview);
+            debug!("Response bytes (first 100): {:?}", preview);
         }
         
         // CRITICAL DEBUG: Show exact structure for Java client correlation_id analysis
         if buf.len() >= 20 {
             let first_20_bytes = &buf[0..20];
-            info!("  - FULL METADATA STRUCTURE (20 bytes):");
-            info!("    Bytes 00-03: [{:02x} {:02x} {:02x} {:02x}] = correlation_id: {}", 
+            debug!("  - FULL METADATA STRUCTURE (20 bytes):");
+            debug!("    Bytes 00-03: [{:02x} {:02x} {:02x} {:02x}] = correlation_id: {}", 
                   first_20_bytes[0], first_20_bytes[1], first_20_bytes[2], first_20_bytes[3],
                   i32::from_be_bytes([first_20_bytes[0], first_20_bytes[1], first_20_bytes[2], first_20_bytes[3]]));
-            info!("    Bytes 04-07: [{:02x} {:02x} {:02x} {:02x}] = throttle_time: {}", 
+            debug!("    Bytes 04-07: [{:02x} {:02x} {:02x} {:02x}] = throttle_time: {}", 
                   first_20_bytes[4], first_20_bytes[5], first_20_bytes[6], first_20_bytes[7],
                   i32::from_be_bytes([first_20_bytes[4], first_20_bytes[5], first_20_bytes[6], first_20_bytes[7]]));
-            info!("    Byte 08: [{:02x}] = broker_count_varint: {}", first_20_bytes[8], first_20_bytes[8]);
-            info!("    Bytes 09-12: [{:02x} {:02x} {:02x} {:02x}] = broker_node_id: {}", 
+            debug!("    Byte 08: [{:02x}] = broker_count_varint: {}", first_20_bytes[8], first_20_bytes[8]);
+            debug!("    Bytes 09-12: [{:02x} {:02x} {:02x} {:02x}] = broker_node_id: {}", 
                   first_20_bytes[9], first_20_bytes[10], first_20_bytes[11], first_20_bytes[12],
                   i32::from_be_bytes([first_20_bytes[9], first_20_bytes[10], first_20_bytes[11], first_20_bytes[12]]));
-            info!("    Byte 13: [{:02x}] = host_length_varint: {}", first_20_bytes[13], first_20_bytes[13]);
-            info!("    Bytes 14-19: [{:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] = host_prefix: '{}'", 
+            debug!("    Byte 13: [{:02x}] = host_length_varint: {}", first_20_bytes[13], first_20_bytes[13]);
+            debug!("    Bytes 14-19: [{:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] = host_prefix: '{}'", 
                   first_20_bytes[14], first_20_bytes[15], first_20_bytes[16], first_20_bytes[17], first_20_bytes[18], first_20_bytes[19],
                   String::from_utf8_lossy(&first_20_bytes[14..20]));
             
             // CRITICAL: Try to understand where Java reads correlation_id=680 (0x02A8)
-            info!("  - CHECKING FOR 680 (0x02A8) IN RESPONSE:");
+            debug!("  - CHECKING FOR 680 (0x02A8) IN RESPONSE:");
             for i in 0..=(buf.len().saturating_sub(4)) {
                 if i + 3 < buf.len() {
                     let value = i32::from_be_bytes([buf[i], buf[i+1], buf[i+2], buf[i+3]]);
                     if value == 680 {
-                        info!("    Found 680 at byte offset {}: [{:02x} {:02x} {:02x} {:02x}]", i, buf[i], buf[i+1], buf[i+2], buf[i+3]);
+                        debug!("    Found 680 at byte offset {}: [{:02x} {:02x} {:02x} {:02x}]", i, buf[i], buf[i+1], buf[i+2], buf[i+3]);
                     }
                 }
             }
@@ -2579,7 +2579,7 @@ impl KafkaCodec {
         let len = s.len();
         let varint_len = len as u64 + 1;
         Self::encode_varint(buf, varint_len);
-        info!("  - FIXED compact string '{}': length={}, encoded as varint {} (Java will read {})", 
+        debug!("  - FIXED compact string '{}': length={}, encoded as varint {} (Java will read {})", 
               s, len, varint_len, len);
         buf.put_slice(s.as_bytes());
     }
@@ -2594,14 +2594,14 @@ impl KafkaCodec {
                 let len = s.len();
                 let varint_len = len as u64 + 1;
                 Self::encode_varint(buf, varint_len);
-                info!("  - FIXED compact nullable string '{}': length={}, encoded as varint {} (Java will read {})", 
+                debug!("  - FIXED compact nullable string '{}': length={}, encoded as varint {} (Java will read {})", 
                       s, len, varint_len, len);
                 buf.put_slice(s.as_bytes());
             }
             None => {
                 // CRITICAL FIX: Null string MUST be encoded as single byte 0, not varint
                 buf.put_u8(0);
-                info!("  - FIXED compact nullable string: null, encoded as 0x00");
+                debug!("  - FIXED compact nullable string: null, encoded as 0x00");
             }
         }
     }
@@ -2654,7 +2654,7 @@ impl Decoder for KafkaFrameCodec {
         // Skip the 4-byte length prefix to get just the Kafka message
         full_message.advance(4); // Remove first 4 bytes (length prefix)
         let message = full_message.freeze();
-        info!("KafkaFrameCodec: Decoded request without length prefix: {} bytes", message.len());
+        debug!("KafkaFrameCodec: Decoded request without length prefix: {} bytes", message.len());
         Ok(Some(message))
     }
 }
@@ -2669,17 +2669,17 @@ impl Encoder<Bytes> for KafkaFrameCodec {
         let message_len = item.len() as u32;
         dst.put_u32(message_len);  // Big-endian 4-byte length prefix
         dst.extend_from_slice(&item);
-        info!("KafkaFrameCodec: Encoded response with length prefix: {} bytes total", message_len + 4);
+        debug!("KafkaFrameCodec: Encoded response with length prefix: {} bytes total", message_len + 4);
         
         // DEBUG: Show exact hex bytes after framing (first 12 bytes)
         if dst.len() >= 12 {
             let first_12_bytes = &dst[0..12];
-            info!("  - FRAMED RESPONSE BYTES: [{:02x} {:02x} {:02x} {:02x}] [{:02x} {:02x} {:02x} {:02x}] [{:02x} {:02x} {:02x} {:02x}]",
+            debug!("  - FRAMED RESPONSE BYTES: [{:02x} {:02x} {:02x} {:02x}] [{:02x} {:02x} {:02x} {:02x}] [{:02x} {:02x} {:02x} {:02x}]",
                   first_12_bytes[0], first_12_bytes[1], first_12_bytes[2], first_12_bytes[3],
                   first_12_bytes[4], first_12_bytes[5], first_12_bytes[6], first_12_bytes[7], 
                   first_12_bytes[8], first_12_bytes[9], first_12_bytes[10], first_12_bytes[11]);
-            info!("  - LENGTH_PREFIX: {} = 0x{:08x}", message_len, message_len);
-            info!("  - ACTUAL_CORRELATION_ID_AT_BYTES_4-7: {} (this should be correlation_id=1)", 
+            debug!("  - LENGTH_PREFIX: {} = 0x{:08x}", message_len, message_len);
+            debug!("  - ACTUAL_CORRELATION_ID_AT_BYTES_4-7: {} (this should be correlation_id=1)", 
                   i32::from_be_bytes([first_12_bytes[4], first_12_bytes[5], first_12_bytes[6], first_12_bytes[7]]));
         }
         Ok(())

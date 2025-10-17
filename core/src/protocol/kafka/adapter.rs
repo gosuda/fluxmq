@@ -199,11 +199,11 @@ impl ProtocolAdapter {
                 Ok(KafkaResponse::Produce(kafka_resp))
             }
             Response::Fetch(resp) => {
-                let kafka_resp = Self::convert_fetch_response(resp, correlation_id)?;
+                let kafka_resp = Self::convert_fetch_response(resp, correlation_id, 10)?; // Default to v10
                 Ok(KafkaResponse::Fetch(kafka_resp))
             }
             Response::MultiFetch(resp) => {
-                let kafka_resp = Self::convert_multi_fetch_response(resp, correlation_id)?;
+                let kafka_resp = Self::convert_multi_fetch_response(resp, correlation_id, 10)?; // Default to v10
                 Ok(KafkaResponse::Fetch(kafka_resp))
             }
             Response::ListOffsets(resp) => {
@@ -425,7 +425,7 @@ impl ProtocolAdapter {
 
         // Convert Kafka record batch to FluxMQ messages
         let messages = if let Some(records_bytes) = partition_data.records {
-            tracing::info!(
+            tracing::debug!(
                 "🔍 JAVA DEBUG: Processing produce request for topic='{}', partition={}, records_bytes_len={}",
                 topic_data.topic,
                 partition_data.partition,
@@ -440,11 +440,11 @@ impl ProtocolAdapter {
                     .map(|b| format!("{:02x}", b))
                     .collect::<Vec<_>>()
                     .join(" ");
-                tracing::info!("🔍 JAVA DEBUG: Records bytes hex (first 64): {}", hex_dump);
+                tracing::debug!("🔍 JAVA DEBUG: Records bytes hex (first 64): {}", hex_dump);
             }
 
             let parsed_messages = Self::parse_kafka_record_batch(&records_bytes)?;
-            tracing::info!(
+            tracing::debug!(
                 "🔍 JAVA DEBUG: Parsed {} messages from {} bytes",
                 parsed_messages.len(),
                 records_bytes.len()
@@ -552,6 +552,7 @@ impl ProtocolAdapter {
     fn convert_fetch_response(
         fluxmq_resp: FetchResponse,
         correlation_id: i32,
+        api_version: i16,
     ) -> Result<KafkaFetchResponse> {
         // Convert FluxMQ messages to Kafka record batch format using proper KIP-98 format
         let records = if fluxmq_resp.messages.is_empty() {
@@ -585,6 +586,7 @@ impl ProtocolAdapter {
 
         Ok(KafkaFetchResponse {
             header: KafkaResponseHeader { correlation_id },
+            api_version,
             throttle_time_ms: 0,
             error_code: KafkaErrorCode::NoError.as_i16(),
             session_id: 0,
@@ -1208,7 +1210,7 @@ impl ProtocolAdapter {
     /// Parse modern Kafka RecordBatch format (magic byte 2)
     /// RecordBatch format introduced in Kafka 0.11.0
     fn parse_record_batch_v2(records_bytes: &Bytes) -> Result<Vec<Message>> {
-        tracing::info!(
+        tracing::debug!(
             "🔍 JAVA DEBUG: Parsing RecordBatch v2 format (magic=2), buffer_len: {}",
             records_bytes.len()
         );
@@ -1279,7 +1281,7 @@ impl ProtocolAdapter {
         ]);
         cursor += 4;
 
-        tracing::info!(
+        tracing::debug!(
             "🔍 JAVA DEBUG: RecordBatch contains {} records",
             records_count
         );
@@ -1341,7 +1343,7 @@ impl ProtocolAdapter {
         let decompressed_bytes = Bytes::from(decompressed_data);
         let mut decompressed_cursor = 0usize;
 
-        tracing::info!(
+        tracing::debug!(
             "🔍 DECOMPRESSED DEBUG: {} bytes of records data (compression_type={})",
             decompressed_bytes.len(),
             compression_type
@@ -1354,7 +1356,7 @@ impl ProtocolAdapter {
             .map(|b| format!("{:02x}", b))
             .collect::<Vec<_>>()
             .join(" ");
-        tracing::info!("🔍 DECOMPRESSED HEX: {}", hex_data);
+        tracing::debug!("🔍 DECOMPRESSED HEX: {}", hex_data);
 
         // Parse individual records from decompressed data
         for i in 0..records_count {
@@ -1426,14 +1428,14 @@ impl ProtocolAdapter {
         // keyLength(varint) + key + valueLength(varint) + value + headersCount(varint) + headers
 
         // Read record length (varint)
-        tracing::info!(
+        tracing::debug!(
             "🔍 SINGLE RECORD: Starting parse at cursor {}, buffer len {}",
             *cursor,
             records_bytes.len()
         );
         let initial_cursor = *cursor;
         let record_length = Self::read_varint_from_bytes(records_bytes, cursor)?;
-        tracing::info!(
+        tracing::debug!(
             "🔍 SINGLE RECORD: Record length = {} bytes, cursor advanced from {} to {}",
             record_length,
             initial_cursor,
@@ -1477,7 +1479,7 @@ impl ProtocolAdapter {
         // Read key
         let key_cursor_before = *cursor;
         let key_length = Self::read_varint_from_bytes(records_bytes, cursor)?;
-        tracing::info!(
+        tracing::debug!(
             "🔍 SINGLE RECORD: Key length = {}, cursor {} -> {}",
             key_length,
             key_cursor_before,
@@ -1509,21 +1511,21 @@ impl ProtocolAdapter {
             }
             let key_bytes = records_bytes[*cursor..end_pos].to_vec();
             *cursor += key_len_usize;
-            tracing::info!(
+            tracing::debug!(
                 "🔍 SINGLE RECORD: Read {} byte key, cursor now {}",
                 key_len_usize,
                 *cursor
             );
             Some(Bytes::from(key_bytes))
         } else {
-            tracing::info!("🔍 SINGLE RECORD: No key (length {})", key_length);
+            tracing::debug!("🔍 SINGLE RECORD: No key (length {})", key_length);
             None
         };
 
         // Read value
         let value_cursor_before = *cursor;
         let value_length = Self::read_varint_from_bytes(records_bytes, cursor)?;
-        tracing::info!(
+        tracing::debug!(
             "🔍 SINGLE RECORD: Value length = {}, cursor {} -> {}",
             value_length,
             value_cursor_before,
@@ -1555,14 +1557,14 @@ impl ProtocolAdapter {
             }
             let value_bytes = records_bytes[*cursor..end_pos].to_vec();
             *cursor += value_len_usize;
-            tracing::info!(
+            tracing::debug!(
                 "🔍 SINGLE RECORD: Read {} byte value, cursor now {}",
                 value_len_usize,
                 *cursor
             );
             Bytes::from(value_bytes)
         } else {
-            tracing::info!("🔍 SINGLE RECORD: Empty value (length {})", value_length);
+            tracing::debug!("🔍 SINGLE RECORD: Empty value (length {})", value_length);
             Bytes::new()
         };
 
@@ -1597,7 +1599,7 @@ impl ProtocolAdapter {
             headers: HashMap::new(),
         };
 
-        tracing::info!(
+        tracing::debug!(
             "🔍 SINGLE RECORD: ✅ Successfully created message - key: {} bytes, value: {} bytes",
             key.as_ref().map(|k| k.len()).unwrap_or(0),
             value.len()
@@ -2102,6 +2104,7 @@ impl ProtocolAdapter {
     fn convert_multi_fetch_response(
         fluxmq_resp: MultiFetchResponse,
         correlation_id: i32,
+        api_version: i16,
     ) -> Result<KafkaFetchResponse> {
         let topic_responses = fluxmq_resp
             .topics
@@ -2141,6 +2144,7 @@ impl ProtocolAdapter {
 
         Ok(KafkaFetchResponse {
             header: KafkaResponseHeader { correlation_id },
+            api_version,
             throttle_time_ms: 0,
             error_code: Self::map_error_code(fluxmq_resp.error_code),
             session_id: 0,

@@ -471,6 +471,25 @@ impl PerformanceAnalyzer {
             });
         }
 
+        // Error rate bottleneck
+        if latest.error_rate > 0.05 {
+            bottlenecks.push(PerformanceBottleneck {
+                component: "ErrorHandling".to_string(),
+                severity: if latest.error_rate > 0.1 {
+                    BottleneckSeverity::High
+                } else {
+                    BottleneckSeverity::Medium
+                },
+                description: format!("High error rate: {:.2}%", latest.error_rate * 100.0),
+                impact_score: latest.error_rate * 2.0, // Error rate directly impacts performance
+                suggested_fixes: vec![
+                    "Review error logs for patterns".to_string(),
+                    "Implement better error handling".to_string(),
+                    "Check resource constraints".to_string(),
+                ],
+            });
+        }
+
         bottlenecks
     }
 

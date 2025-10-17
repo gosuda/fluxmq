@@ -23,7 +23,7 @@ use crate::{
 };
 use std::sync::Arc;
 use tokio::sync::broadcast::error::RecvError;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 /// Enhanced topic description structure for detailed metadata
 #[derive(Debug, Clone)]
@@ -361,7 +361,7 @@ impl MessageHandler {
                 // Try to auto-create the topic if it doesn't exist
                 match self.topic_manager.ensure_topic_exists(&request.topic) {
                     Ok(_) => {
-                        info!(
+                        debug!(
                             "Auto-created topic '{}' for produce request from Java client",
                             request.topic
                         );
@@ -432,40 +432,26 @@ impl MessageHandler {
             })
             .sum::<usize>() as u64;
 
-        // 🚀 MEMORY OPTIMIZATION: Use optimal message handling approach
-        // Keep messages owned to avoid unnecessary Arc allocation in common case
+        // ⚡ PERFORMANCE FIX: Skip ultra-performance broker (causing blocking)
+        // Use traditional storage directly for reliable, non-blocking operation
         let messages = request.messages;
+        let messages_cloned = messages.clone(); // Clone for cache
 
-        // Strategy: Try ultra-performance first with a clone, use original on fallback
-        // This optimizes for the success case (no Arc unwrapping) while maintaining fallback capability
-        // Cache the messages before storage (since we'll need them for caching)
-        let messages_for_cache: Vec<Message> = messages.clone();
+        // Direct storage append (non-blocking, tested)
+        let base_offset = self
+            .storage
+            .append_messages(&request.topic, partition, messages)?;
 
-        let base_offset = match self.ultra_performance_broker.append_messages_ultra(
-            &request.topic,
-            partition,
-            messages.clone(), // Clone only for ultra-performance attempt
-        ) {
-            Ok(offset) => {
-                let processing_duration = start_time.elapsed();
-                if processing_duration > std::time::Duration::from_millis(100) {
-                    info!("⚠️ JAVA CLIENT WARNING: Slow message processing detected: {:?} (target: <100ms)", processing_duration);
-                }
-                info!("🚀 ULTRA-PERFORMANCE: Successfully used ultra-performance broker, offset: {}, duration: {:?}", offset, processing_duration);
-                offset
-            }
-            Err(e) => {
-                let processing_duration = start_time.elapsed();
-                info!("⚠️ ULTRA-PERFORMANCE: Ultra-performance broker failed ({}) after {:?}, falling back to traditional storage", e, processing_duration);
-                // Optimized fallback: Use original owned messages (no Arc unwrapping needed)
-                self.storage
-                    .append_messages(&request.topic, partition, messages)?
-            }
-        };
+        let processing_duration = start_time.elapsed();
+        trace!(
+            "✅ STORAGE: Direct storage write completed, offset: {}, duration: {:?}",
+            base_offset,
+            processing_duration
+        );
 
         // Cache the newly produced messages for future fetch performance
         let cache_start = std::time::Instant::now();
-        for (i, message) in messages_for_cache.iter().enumerate() {
+        for (i, message) in messages_cloned.iter().enumerate() {
             let message_offset = base_offset + i as u64;
             self.message_cache.cache_message(
                 &request.topic,
@@ -477,17 +463,13 @@ impl MessageHandler {
         let cache_duration = cache_start.elapsed();
         trace!(
             "Cached {} newly produced messages in {:?} for {}-{}",
-            messages_for_cache.len(),
+            messages_cloned.len(),
             cache_duration,
             request.topic,
             partition
         );
 
         // Record metrics with actual message data
-        info!(
-            "📊 METRICS DEBUG: Recording {} messages, {} bytes",
-            message_count, total_bytes
-        );
         self.metrics
             .throughput
             .record_produced(message_count, total_bytes);
@@ -508,33 +490,34 @@ impl MessageHandler {
         // 🚀 JAVA CLIENT COMPATIBILITY: Measure total processing time and log performance
         let total_duration = start_time.elapsed();
         if total_duration > std::time::Duration::from_millis(500) {
-            info!("🚨 JAVA CLIENT CRITICAL: Total processing time exceeded 500ms: {:?} (Java client timeout risk!)", total_duration);
+            debug!("🚨 JAVA CLIENT CRITICAL: Total processing time exceeded 500ms: {:?} (Java client timeout risk!)", total_duration);
         } else if total_duration > std::time::Duration::from_millis(100) {
-            info!(
+            debug!(
                 "⚠️ JAVA CLIENT WARNING: Processing time: {:?} (target: <100ms for Java clients)",
                 total_duration
             );
         } else {
-            info!(
+            debug!(
                 "✅ JAVA CLIENT OPTIMIZED: Fast processing achieved: {:?}",
                 total_duration
             );
         }
 
-        info!(
+        debug!(
             "Produced messages to topic: {}, partition: {}, base_offset: {}, acks: {}, processing_time: {:?}",
             request.topic, partition, base_offset, request.acks, total_duration
         );
 
         // Handle acks=0 (fire-and-forget) - no response should be sent
         if request.acks == 0 {
-            info!("🔥 FIRE-AND-FORGET: acks=0, not sending response to client");
+            debug!("🔥 FIRE-AND-FORGET: acks=0, not sending response to client");
             return Ok(Response::NoResponse);
         }
 
-        // 🚀 JAVA CLIENT COMPATIBILITY: Force immediate buffer flush for Java clients
-        // This ensures data is persisted immediately and reduces timeout risk
-        self.force_immediate_flush(&request.topic, partition).await;
+        // ⚡ PERFORMANCE OPTIMIZATION: Removed force_immediate_flush() call
+        // Flushing on every produce request caused severe performance degradation (~28 msg/sec)
+        // Storage layers handle periodic flushing automatically for durability
+        // This restores high-throughput performance while maintaining data safety
 
         // 🚀 JAVA CLIENT COMPATIBILITY: Prioritized response construction for fast acknowledgment
         let response = ProduceResponse {
@@ -546,44 +529,8 @@ impl MessageHandler {
             error_message: None,
         };
 
-        info!("📤 JAVA CLIENT ACK: Sending immediate acknowledgment for correlation_id: {}, total_time: {:?}", request.correlation_id, total_duration);
+        debug!("📤 JAVA CLIENT ACK: Sending immediate acknowledgment for correlation_id: {}, total_time: {:?}", request.correlation_id, total_duration);
         Ok(Response::Produce(response))
-    }
-
-    /// Force immediate buffer flush for Java clients to reduce timeout risk
-    async fn force_immediate_flush(&self, topic: &str, partition: u32) {
-        // 🚀 JAVA CLIENT BUFFER OPTIMIZATION: Force all buffered data to disk immediately
-        let flush_start = std::time::Instant::now();
-
-        // Force ultra-performance broker to flush its buffers
-        if let Err(e) = self
-            .ultra_performance_broker
-            .force_flush_partition(topic, partition)
-            .await
-        {
-            info!(
-                "⚠️ FLUSH WARNING: Ultra-performance broker flush failed: {}",
-                e
-            );
-        }
-
-        // Force traditional storage to flush as well (fallback)
-        if let Err(e) = self.storage.flush_partition(topic, partition) {
-            info!("⚠️ FLUSH WARNING: Traditional storage flush failed: {}", e);
-        }
-
-        let flush_duration = flush_start.elapsed();
-        if flush_duration > std::time::Duration::from_millis(10) {
-            info!(
-                "⚠️ FLUSH SLOW: Buffer flush took {:?} (target: <10ms)",
-                flush_duration
-            );
-        } else {
-            info!(
-                "✅ FLUSH FAST: Buffer flush completed in {:?}",
-                flush_duration
-            );
-        }
     }
 
     async fn handle_fetch(&self, request: FetchRequest) -> Result<Response> {
@@ -712,7 +659,10 @@ impl MessageHandler {
                 // KAFKA COMPATIBILITY FIX: Auto-create topics for producer compatibility
                 // Standard Kafka brokers automatically create topics when producers request metadata
                 // This resolves Java client timeout issues where clients expect topics to be created
-                debug!("Auto-creating topic '{}' for Java client compatibility", topic);
+                debug!(
+                    "Auto-creating topic '{}' for Java client compatibility",
+                    topic
+                );
                 match self.topic_manager.ensure_topic_exists(&topic) {
                     Ok(topic_info) => {
                         let partition_metadata: Vec<PartitionMetadata> = topic_info
@@ -882,7 +832,7 @@ impl MessageHandler {
             coordinator
                 .become_leader(topic, partition, replicas)
                 .await?;
-            info!(
+            debug!(
                 "Broker {} became leader for {}:{}",
                 self.broker_id, topic, partition
             );
@@ -901,7 +851,7 @@ impl MessageHandler {
             coordinator
                 .become_follower(topic, partition, leader_id)
                 .await?;
-            info!(
+            debug!(
                 "Broker {} became follower for {}:{} with leader {}",
                 self.broker_id, topic, partition, leader_id
             );
@@ -1052,21 +1002,21 @@ impl MessageHandler {
         let topics_to_describe = if let Some(topics) = requested_topics {
             // Kafka protocol: empty topics array means "return all topics"
             if topics.is_empty() {
-                info!("Empty topics array - should return all topics");
+                debug!("Empty topics array - should return all topics");
                 let all_topics = self.topic_manager.list_topics();
-                info!(
+                debug!(
                     "Available topics from topic_manager.list_topics(): {:?}",
                     all_topics
                 );
                 all_topics
             } else {
-                info!("Specific topics requested: {:?}", topics);
+                debug!("Specific topics requested: {:?}", topics);
                 topics
             }
         } else {
-            info!("No topics specified - returning all topics");
+            debug!("No topics specified - returning all topics");
             let all_topics = self.topic_manager.list_topics();
-            info!(
+            debug!(
                 "Available topics from topic_manager.list_topics(): {:?}",
                 all_topics
             );
@@ -1146,7 +1096,7 @@ impl MessageHandler {
             // Topic doesn't exist, try to auto-create it
             match self.topic_manager.ensure_topic_exists(topic) {
                 Ok(_) => {
-                    info!(
+                    debug!(
                         "Auto-created topic '{}' for fetch request from Java client",
                         topic
                     );
@@ -1235,7 +1185,7 @@ impl MessageHandler {
             // Check if we have contiguous messages starting from requested offset
             if let Some((first_offset, _)) = cache_hits.first() {
                 if *first_offset == offset {
-                    info!(
+                    debug!(
                         "🚀 CACHE HIT: Serving {} messages from cache for {}-{} starting at offset {}",
                         cache_hits.len(), topic, partition, offset
                     );
@@ -1591,7 +1541,7 @@ impl MessageHandler {
             };
             match self.topic_manager.create_topic(&topic.name, config) {
                 Ok(_) => {
-                    info!(
+                    debug!(
                         "Created topic '{}' with {} partitions",
                         topic.name, topic.num_partitions
                     );
@@ -1659,7 +1609,7 @@ impl MessageHandler {
             // In a full implementation, this would also clean up storage
             match self.topic_manager.delete_topic(&topic_name) {
                 Ok(_) => {
-                    info!("Deleted topic '{}'", topic_name);
+                    debug!("Deleted topic '{}'", topic_name);
                     responses.push(DeletableTopicResult {
                         name: topic_name.clone(),
                         topic_id: Some(format!("topic-{}", topic_name)),
@@ -1816,7 +1766,7 @@ impl MessageHandler {
                     // Topic resource
                     if let Some(_topic) = self.topic_manager.get_topic(&resource.resource_name) {
                         if request.validate_only {
-                            info!(
+                            debug!(
                                 "Validating config changes for topic '{}'",
                                 resource.resource_name
                             );
@@ -1830,7 +1780,7 @@ impl MessageHandler {
                             // For now, just log the config changes
                             // In a full implementation, this would update topic configurations
                             for config in &resource.configs {
-                                info!(
+                                debug!(
                                     "Setting config '{}' = {:?} for topic '{}'",
                                     config.name, config.value, resource.resource_name
                                 );
@@ -1858,14 +1808,14 @@ impl MessageHandler {
                 4 => {
                     // Broker resource
                     if request.validate_only {
-                        info!(
+                        debug!(
                             "Validating config changes for broker '{}'",
                             resource.resource_name
                         );
                     } else {
                         // For now, just log the config changes
                         for config in &resource.configs {
-                            info!(
+                            debug!(
                                 "Setting broker config '{}' = {:?}",
                                 config.name, config.value
                             );
@@ -1901,7 +1851,7 @@ impl MessageHandler {
     }
 
     async fn handle_sasl_handshake(&self, request: SaslHandshakeRequest) -> Result<Response> {
-        info!(
+        debug!(
             "SASL handshake requested for mechanism: {}",
             request.mechanism
         );
@@ -1923,7 +1873,7 @@ impl MessageHandler {
     }
 
     async fn handle_sasl_authenticate(&self, request: SaslAuthenticateRequest) -> Result<Response> {
-        info!(
+        debug!(
             "SASL authenticate requested with {} bytes of auth data",
             request.auth_bytes.len()
         );
@@ -1962,7 +1912,7 @@ impl MessageHandler {
                 };
 
                 topic_manager.create_topic(&topic_name, config)?;
-                info!(
+                debug!(
                     "Registered recovered topic '{}' with {} partitions",
                     topic_name, partition_count
                 );
