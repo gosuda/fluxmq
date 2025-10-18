@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::protocol::{Message, Offset, PartitionId};
 use crate::Result;
 use memmap2::{MmapMut, MmapOptions};
@@ -288,9 +287,24 @@ impl MemoryMappedStorage {
 
         // Pre-allocate file space for performance
         if self.config.preallocate_segments {
-            file.seek(SeekFrom::Start((size - 1) as u64))?;
-            file.write_all(&[0])?;
+            // On macOS, we need to actually write zeros to allocate disk space
+            // to avoid SIGBUS errors when accessing memory-mapped regions
+            file.set_len(size as u64)?;
+
+            // Write a zero byte at regular intervals to force allocation
+            // This is more efficient than writing the entire file
+            const CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks
+            let zero_chunk = vec![0u8; CHUNK_SIZE];
+            let mut written = 0;
+
+            while written < size {
+                let to_write = std::cmp::min(CHUNK_SIZE, size - written);
+                file.write_all(&zero_chunk[..to_write])?;
+                written += to_write;
+            }
+
             file.flush()?;
+            file.seek(SeekFrom::Start(0))?;  // Reset to beginning
         }
 
         // Create memory-mapped region
@@ -755,14 +769,12 @@ impl MMapPerformanceStats {
 }
 
 #[cfg(test)]
-#[allow(dead_code)] // Temporarily disable mmap tests due to SIGBUS issues
 mod tests {
     use super::*;
     use bytes::Bytes;
     use tempfile::tempdir;
 
     #[test]
-    #[ignore = "Temporarily disabled due to SIGBUS memory mapping issues"]
     fn test_mmap_storage_basic_operations() {
         let temp_dir = tempdir().unwrap();
         let config = MMapStorageConfig {
@@ -795,7 +807,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Temporarily disabled due to SIGBUS memory mapping issues"]
     fn test_segment_rotation() {
         let temp_dir = tempdir().unwrap();
 
@@ -863,7 +874,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Temporarily disabled due to SIGBUS memory mapping issues"]
     fn test_segment_statistics() {
         let temp_dir = tempdir().unwrap();
         let storage = MemoryMappedStorage::with_config(MMapStorageConfig {
