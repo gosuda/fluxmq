@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::performance::numa_allocator::{init_thread_local_numa_allocator, NumaAwareAllocator};
 
 // Global allocator configuration for maximum performance
