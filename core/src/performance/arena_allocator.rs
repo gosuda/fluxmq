@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+
 //! # Arena Memory Allocator for FluxMQ Java Client Optimization
 //!
 //! This module provides high-performance arena memory allocation specifically optimized

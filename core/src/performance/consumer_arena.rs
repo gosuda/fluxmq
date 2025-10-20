@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+
 /// Consumer Group arena allocator for high-efficiency rebalancing operations
 ///
 /// This module provides specialized arena memory allocation for consumer group

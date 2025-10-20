@@ -516,9 +516,13 @@ impl BrokerServer {
 
             // 첫 응답이면 초기화 (compare-and-swap으로 race-free)
             if current == -1 {
-                // DashMap에서 가장 작은 키 찾기
-                if let Some(first_entry) = response_buffer.iter().next() {
-                    let first_key = *first_entry.key();
+                // 🔧 FIX: DashMap에서 **실제로 가장 작은 키** 찾기 (iter()는 순서 보장 안 함!)
+                let min_key = response_buffer
+                    .iter()
+                    .map(|entry| *entry.key())
+                    .min();
+
+                if let Some(first_key) = min_key {
                     // CAS로 안전하게 초기화 (다른 task가 먼저 초기화할 수 있음)
                     match next_send_correlation.compare_exchange(
                         -1,
@@ -528,13 +532,14 @@ impl BrokerServer {
                     ) {
                         Ok(_) => {
                             debug!(
-                                "🔍 FLUSH: Initialized next_send_correlation to {}",
+                                "🔍 FLUSH: Initialized next_send_correlation to {} (min from buffer)",
                                 first_key
                             );
                             current = first_key;
                         }
                         Err(updated) => {
                             // 다른 task가 먼저 초기화함
+                            debug!("🔍 FLUSH: Another task initialized to {}", updated);
                             current = updated;
                         }
                     }

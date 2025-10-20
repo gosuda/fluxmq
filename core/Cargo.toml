@@ -14,9 +14,16 @@ description.workspace = true
 
 [features]
 default = []
+
+# Individual performance features
 jemalloc = ["tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
-ultra-performance = ["jemalloc"] # jemalloc is generally fastest for FluxMQ workloads
+java-arena = []
+consumer-arena = []
+
+# Preset combinations
+ultra-performance = ["jemalloc", "java-arena", "consumer-arena"]
+production = ["java-arena", "consumer-arena", "jemalloc"]
 
 [[bin]]
 name = "fluxmq"
