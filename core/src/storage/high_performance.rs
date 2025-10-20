@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+
 use crate::performance::{
     memory::OptimizedMessageStorage, object_pool::MessagePools, quick_wins::QuickOptimizedStorage,
 };

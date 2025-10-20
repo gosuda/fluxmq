@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+
 /// Kernel-level zero-copy using sendfile/splice system calls
 ///
 /// This module implements true kernel-level zero-copy for network I/O,

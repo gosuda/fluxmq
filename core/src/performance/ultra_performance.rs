@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+
 use crate::performance::{
     advanced_networking::AdvancedConnectionManager,
     arena_allocator::{ArenaAllocator, ArenaConfig},

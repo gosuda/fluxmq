@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+
 /// High-performance I/O optimizations for FluxMQ
 ///
 /// This module implements advanced I/O optimizations to achieve 400k+ msg/sec:

@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+
 use crate::performance::object_pool::MessagePools;
 use crate::performance::protocol_arena::ProtocolArenaPool;
 /// High-performance Kafka protocol codec optimizations

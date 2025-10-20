@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+
 /// Protocol-specific arena allocator for high-frequency request/response processing
 ///
 /// This module provides specialized arena memory allocation for Kafka protocol parsing
