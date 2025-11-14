@@ -5,7 +5,7 @@ use crate::protocol::kafka::{KafkaCodec, KafkaFrameCodec, ProtocolAdapter};
 use crate::tls::FluxTlsAcceptor;
 use crate::{broker::MessageHandler, config::BrokerConfig, HttpMetricsServer, Result};
 use bytes::Bytes;
-use futures::{SinkExt, StreamExt as FuturesStreamExt};
+use futures::SinkExt;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
@@ -285,8 +285,9 @@ impl BrokerServer {
                     let connection_pool = Arc::clone(&self.connection_pool);
 
                     tokio::spawn(async move {
-                        // 🚀 PIPELINED: Using FuturesUnordered + Lock-Free for maximum concurrency
-                        if let Err(e) = Self::handle_client_pipelined(stream, handler).await {
+                        // ✅ OPTION A: Using single-task sequential architecture
+                        // Simple, predictable, no race conditions, guaranteed ordering
+                        if let Err(e) = Self::handle_client(stream, handler).await {
                             error!("Error handling client {}: {}", peer_addr, e);
                         } else {
                             info!("Client {} disconnected", peer_addr);
@@ -336,245 +337,55 @@ impl BrokerServer {
         Ok(())
     }
 
-    /// 🚀 HYBRID OPTIMIZATION: Action-Based + Lock-Free for maximum performance
-    /// - Direct await (no tokio::spawn overhead)
-    /// - DashMap (no lock contention)
-    /// - AtomicI32 (lock-free ordering)
-    async fn handle_client_pipelined(
-        stream: TcpStream,
-        handler: Arc<MessageHandler>,
-    ) -> Result<()> {
-        info!("🚀 PIPELINED-REORDER: New client connected - parallel processing with response reordering");
+    /// 🔵 SIMPLE SYNCHRONOUS: Original sequential request-response handling
+    /// - No pipelining, process one request at a time
+    /// - Guaranteed ordering, no race conditions
+    async fn handle_client(stream: TcpStream, handler: Arc<MessageHandler>) -> Result<()> {
+        info!("🔵 SYNC: New client connected - sequential processing");
 
-        // Track connection metrics
         let metrics = handler.get_metrics();
         metrics.broker.connection_opened();
 
-        // Framed를 읽기/쓰기로 분리
-        let kafka_framed = Framed::new(stream, KafkaFrameCodec);
-        let (mut kafka_write, mut kafka_read) = kafka_framed.split();
-
-        // 🚀 LOCK-FREE: DashMap for concurrent response storage without lock contention
-        let response_buffer = Arc::new(dashmap::DashMap::<i32, Bytes>::new());
-        // 🔥 CRITICAL FIX: Track first correlation_id to establish ordering
-        let next_send_correlation = Arc::new(std::sync::atomic::AtomicI32::new(-1));
-
-        // Write channel for ordered delivery
-        let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<Bytes>(1000);
-
-        // High-performance codec 생성
+        let mut kafka_framed = Framed::new(stream, KafkaFrameCodec);
         let hp_codec = Arc::new(HighPerformanceKafkaCodec::new());
 
-        // 1️⃣ Read Loop: 요청을 읽고 병렬로 처리 (tokio::spawn)
-        let read_handle = {
-            let handler = Arc::clone(&handler);
-            let hp_codec = Arc::clone(&hp_codec);
-            let response_buffer = Arc::clone(&response_buffer);
-            let next_send_correlation = Arc::clone(&next_send_correlation);
-            let write_tx = write_tx.clone();
-
-            tokio::spawn(async move {
-                use futures::stream::{FuturesUnordered, StreamExt as FuturesStreamExt};
-
-                // 🚀 FUTURES-UNORDERED: Async parallel processing without tokio::spawn overhead
-                let mut processing_futures = FuturesUnordered::new();
-                let mut read_done = false;
-
-                loop {
-                    tokio::select! {
-                        // 새 요청 읽기 (읽기가 완료되지 않았을 때만)
-                        result = tokio_stream::StreamExt::next(&mut kafka_read), if !read_done => {
-                            match result {
-                                Some(Ok(message_bytes)) => {
-                                    // Correlation ID 추출
-                                    let correlation_id = if message_bytes.len() >= 8 {
-                                        i32::from_be_bytes([
-                                            message_bytes[4],
-                                            message_bytes[5],
-                                            message_bytes[6],
-                                            message_bytes[7],
-                                        ])
-                                    } else {
-                                        warn!("🚀 FUTURES-UNORDERED: Invalid message format (too short)");
-                                        continue;
-                                    };
-
-                                    debug!("🔍 READ: Received request with client correlation_id={}", correlation_id);
-
-                                    // 🚀 FUTURES-UNORDERED: Add future to concurrent processing queue
-                                    let handler = Arc::clone(&handler);
-                                    let hp_codec = Arc::clone(&hp_codec);
-                                    let response_buffer = Arc::clone(&response_buffer);
-                                    let next_send_correlation = Arc::clone(&next_send_correlation);
-                                    let write_tx = write_tx.clone();
-
-                                    let future = async move {
-                                        match Self::process_kafka_message_pipelined(
-                                            &handler,
-                                            &hp_codec,
-                                            message_bytes,
-                                        )
-                                        .await
-                                        {
-                                            Ok(response_bytes) => {
-                                                // 🚀 LOCK-FREE: DashMap insert (no lock contention!)
-                                                response_buffer.insert(correlation_id, response_bytes.clone());
-                                                debug!("🔍 FUTURES-UNORDERED: Inserted response for corr_id={}, empty={}, buffer_size={}",
-                                                       correlation_id, response_bytes.is_empty(), response_buffer.len());
-
-                                                // 순서대로 전송 가능한 응답들을 flush (lock-free!)
-                                                Self::flush_ordered_responses_lockfree(
-                                                    &response_buffer,
-                                                    &next_send_correlation,
-                                                    &write_tx,
-                                                )
-                                                .await;
-                                            }
-                                            Err(e) => {
-                                                warn!("🚀 FUTURES-UNORDERED: Request processing failed: {}", e);
-                                            }
-                                        }
-                                    };
-
-                                    processing_futures.push(future);
+        // Simple loop: read request → process → write response
+        while let Some(result) = tokio_stream::StreamExt::next(&mut kafka_framed).await {
+            match result {
+                Ok(request_bytes) => {
+                    // Process request
+                    match Self::process_kafka_message_pipelined(&handler, &hp_codec, request_bytes)
+                        .await
+                    {
+                        Ok(response_bytes) => {
+                            // Send response immediately
+                            if !response_bytes.is_empty() {
+                                info!("🔵 Sending response, size={} bytes", response_bytes.len());
+                                if kafka_framed.send(response_bytes).await.is_err() {
+                                    warn!("Failed to send response");
+                                    break;
                                 }
-                                Some(Err(e)) => {
-                                    warn!("Failed to decode Kafka message: {}", e);
-                                    read_done = true;
-                                }
-                                None => {
-                                    info!("🚀 FUTURES-UNORDERED: Read stream closed");
-                                    read_done = true;
-                                }
+                            } else {
+                                warn!("⚠️ EMPTY RESPONSE - client will hang!");
                             }
                         }
-
-                        // 처리 중인 요청 완료 대기
-                        _ = FuturesStreamExt::next(&mut processing_futures), if !processing_futures.is_empty() => {
-                            // Future completed (response already flushed)
-                        }
-
-                        // 모든 작업 완료
-                        else => {
-                            if read_done && processing_futures.is_empty() {
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                info!("🚀 FUTURES-UNORDERED: All processing complete, dropping write_tx");
-                // write_tx는 여기서 drop됨 -> Write Loop가 정상 종료
-            })
-        };
-
-        // 2️⃣ Write Loop: 순서대로 응답 전송
-        let write_handle = {
-            tokio::spawn(async move {
-                let mut sent = 0;
-                while let Some(response_bytes) = write_rx.recv().await {
-                    if kafka_write.send(response_bytes).await.is_err() {
-                        warn!("🚀 PIPELINED: Write failed, sent {} responses", sent);
-                        break;
-                    }
-                    // 🔥 CRITICAL FIX: Flush immediately to ensure response reaches client
-                    if kafka_write.flush().await.is_err() {
-                        warn!("🚀 PIPELINED: Flush failed, sent {} responses", sent);
-                        break;
-                    }
-                    sent += 1;
-                    debug!("🔍 WRITE: Sent response #{} successfully", sent);
-                }
-                info!(
-                    "🚀 PIPELINED: Write loop terminated (sent {} responses)",
-                    sent
-                );
-            })
-        };
-
-        // 모든 루프가 종료될 때까지 대기
-        let _ = tokio::join!(read_handle, write_handle);
-
-        // Track connection closure
-        metrics.broker.connection_closed();
-        info!("🚀 PIPELINED: Client disconnected");
-
-        Ok(())
-    }
-
-    /// 🚀 LOCK-FREE: DashMap 기반 응답 순서 보장 flush (Mutex 없음!)
-    async fn flush_ordered_responses_lockfree(
-        response_buffer: &Arc<dashmap::DashMap<i32, Bytes>>,
-        next_send_correlation: &Arc<std::sync::atomic::AtomicI32>,
-        write_tx: &tokio::sync::mpsc::Sender<Bytes>,
-    ) {
-        use std::sync::atomic::Ordering;
-
-        loop {
-            // 🚀 LOCK-FREE: Atomic load (no mutex!)
-            let mut current = next_send_correlation.load(Ordering::Acquire);
-
-            // 첫 응답이면 초기화 (compare-and-swap으로 race-free)
-            if current == -1 {
-                // 🔧 FIX: DashMap에서 **실제로 가장 작은 키** 찾기 (iter()는 순서 보장 안 함!)
-                let min_key = response_buffer
-                    .iter()
-                    .map(|entry| *entry.key())
-                    .min();
-
-                if let Some(first_key) = min_key {
-                    // CAS로 안전하게 초기화 (다른 task가 먼저 초기화할 수 있음)
-                    match next_send_correlation.compare_exchange(
-                        -1,
-                        first_key,
-                        Ordering::Release,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => {
-                            debug!(
-                                "🔍 FLUSH: Initialized next_send_correlation to {} (min from buffer)",
-                                first_key
-                            );
-                            current = first_key;
-                        }
-                        Err(updated) => {
-                            // 다른 task가 먼저 초기화함
-                            debug!("🔍 FLUSH: Another task initialized to {}", updated);
-                            current = updated;
-                        }
-                    }
-                } else {
-                    // 버퍼가 아직 비어있음
-                    return;
-                }
-            }
-
-            // 🚀 LOCK-FREE: DashMap remove (no mutex!)
-            match response_buffer.remove(&current) {
-                Some((corr_id, response)) => {
-                    // 다음 correlation_id로 증가 (atomic!)
-                    next_send_correlation.store(corr_id + 1, Ordering::Release);
-
-                    // Empty response는 전송하지 않지만 sequence는 증가됨
-                    if !response.is_empty() {
-                        if write_tx.send(response).await.is_err() {
-                            debug!("🔍 FLUSH: Write channel closed");
+                        Err(e) => {
+                            warn!("Request processing failed: {}", e);
                             break;
                         }
-                        debug!("🔍 FLUSH: Sent response for corr_id={}", corr_id);
-                    } else {
-                        debug!("🔍 FLUSH: Skipped empty response for corr_id={}", corr_id);
                     }
                 }
-                None => {
-                    // 다음 응답이 아직 준비되지 않음
-                    debug!("🔍 FLUSH: Waiting for corr_id={}", current);
+                Err(e) => {
+                    warn!("Failed to decode message: {}", e);
                     break;
                 }
             }
         }
-    }
 
+        metrics.broker.connection_closed();
+        info!("🔵 SYNC: Client disconnected");
+        Ok(())
+    }
 
     async fn process_kafka_message<IO>(
         handler: &Arc<MessageHandler>,
@@ -679,8 +490,19 @@ impl BrokerServer {
 
         // 🚀 PERFORMANCE: Hot path - logging removed
 
+        // 🔍 DEBUG: Log API key for request routing investigation
+        info!(
+            "🔍 REQUEST ROUTING: api_key={}, correlation_id={}",
+            kafka_request.api_key(),
+            kafka_request.correlation_id()
+        );
+
         // Check if this is a consumer group request (zero-copy check)
         if ProtocolAdapter::is_consumer_group_request(&kafka_request) {
+            info!(
+                "🔍 ROUTE: Taking CONSUMER_GROUP path for api_key={}",
+                kafka_request.api_key()
+            );
             // Extract metadata before consuming the request
             let correlation_id = kafka_request.correlation_id();
             let api_version = kafka_request.api_version();
@@ -725,8 +547,14 @@ impl BrokerServer {
                 .await?;
             }
         } else {
+            info!(
+                "🔍 ROUTE: Taking ELSE path for api_key={}",
+                kafka_request.api_key()
+            );
+
             // Handle Metadata requests directly (like ApiVersions)
             if kafka_request.api_key() == 3 {
+                info!("🔍 ROUTE: Handling METADATA request (api_key=3)");
                 // API_KEY_METADATA - 🚀 PERFORMANCE: Hot path
                 let metadata_response = Self::create_metadata_response(&kafka_request, handler);
                 let response_bytes = KafkaCodec::encode_response(&metadata_response)?;
@@ -734,7 +562,137 @@ impl BrokerServer {
                 return Ok(());
             }
 
+            // 🔧 CRITICAL FIX: Handle PRODUCE requests directly to support multi-partition batches
+            // Java Kafka clients send PRODUCE requests with multiple partitions in a single request.
+            // The adapter.rs only processes the first partition, causing clients to hang waiting
+            // for responses for the other partitions. This bypasses the adapter and handles ALL partitions.
+            if kafka_request.api_key() == 0 {
+                info!("🔍 ROUTE: Detected PRODUCE request (api_key=0), entering multi-partition handler");
+                // API_KEY_PRODUCE
+                use crate::protocol::kafka::{
+                    KafkaPartitionProduceResponse, KafkaProduceResponse, KafkaRequest,
+                    KafkaResponse, KafkaResponseHeader, KafkaTopicProduceResponse,
+                };
+
+                if let KafkaRequest::Produce(kafka_produce_req) = kafka_request.clone() {
+                    info!("🔍 MULTI-PARTITION: Successfully matched KafkaRequest::Produce variant");
+                    debug!(
+                        "🔧 MULTI-PARTITION: Handling PRODUCE request with {} topics",
+                        kafka_produce_req.topic_data.len()
+                    );
+
+                    let mut topic_responses = Vec::new();
+                    let correlation_id = kafka_produce_req.header.correlation_id;
+                    let acks = kafka_produce_req.acks;
+
+                    // Handle acks=0 (fire-and-forget) early - no response needed
+                    if acks == 0 {
+                        debug!("🔥 FIRE-AND-FORGET: acks=0, skipping response");
+                        return Ok(());
+                    }
+
+                    // Process each topic
+                    for topic_data in kafka_produce_req.topic_data {
+                        let mut partition_responses = Vec::new();
+
+                        debug!(
+                            "🔧 MULTI-PARTITION: Processing topic '{}' with {} partitions",
+                            topic_data.topic,
+                            topic_data.partition_data.len()
+                        );
+
+                        // Process each partition
+                        for partition_data in topic_data.partition_data {
+                            let partition_id = partition_data.partition;
+
+                            // Parse and produce messages for this partition
+                            let result = if let Some(records_bytes) = partition_data.records {
+                                // Parse Kafka record batch
+                                match ProtocolAdapter::parse_kafka_record_batch(&records_bytes) {
+                                    Ok(messages) => {
+                                        // Store messages using handler
+                                        match handler.storage.append_messages(
+                                            &topic_data.topic,
+                                            partition_id as u32,
+                                            messages.clone(),
+                                        ) {
+                                            Ok(base_offset) => {
+                                                // Record metrics
+                                                handler.metrics.throughput.record_produced(
+                                                    messages.len() as u64,
+                                                    messages
+                                                        .iter()
+                                                        .map(|m| m.value.len() as u64)
+                                                        .sum(),
+                                                );
+
+                                                debug!("✅ MULTI-PARTITION: Produced {} messages to {}-{}, offset={}",
+                                                       messages.len(), topic_data.topic, partition_id, base_offset);
+
+                                                (0i16, base_offset as i64) // error_code=0 (success), base_offset
+                                            }
+                                            Err(e) => {
+                                                warn!("❌ MULTI-PARTITION: Failed to append messages: {}", e);
+                                                (1i16, 0i64) // error_code=1 (unknown error)
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "❌ MULTI-PARTITION: Failed to parse record batch: {}",
+                                            e
+                                        );
+                                        (1i16, 0i64)
+                                    }
+                                }
+                            } else {
+                                warn!(
+                                    "❌ MULTI-PARTITION: No records in partition {}",
+                                    partition_id
+                                );
+                                (1i16, 0i64)
+                            };
+
+                            partition_responses.push(KafkaPartitionProduceResponse {
+                                partition: partition_id,
+                                error_code: result.0,
+                                base_offset: result.1,
+                                log_append_time_ms: -1,
+                                log_start_offset: 0,
+                            });
+                        }
+
+                        topic_responses.push(KafkaTopicProduceResponse {
+                            topic: topic_data.topic,
+                            partition_responses,
+                        });
+                    }
+
+                    // Create complete PRODUCE response with ALL partitions
+                    let kafka_response = KafkaResponse::Produce(KafkaProduceResponse {
+                        header: KafkaResponseHeader { correlation_id },
+                        responses: topic_responses,
+                        throttle_time_ms: 0,
+                    });
+
+                    debug!(
+                        "🔧 MULTI-PARTITION: Sending complete response for correlation_id={}",
+                        correlation_id
+                    );
+
+                    let response_bytes = KafkaCodec::encode_response(&kafka_response)?;
+                    kafka_framed.send(response_bytes).await?;
+                    return Ok(());
+                } else {
+                    warn!("🔍 MULTI-PARTITION: Failed to match KafkaRequest::Produce - falling through to adapter");
+                }
+            }
+
             // Handle regular message request
+            info!(
+                "🔍 ROUTE: Taking ADAPTER path for api_key={}",
+                kafka_request.api_key()
+            );
             match ProtocolAdapter::kafka_to_fluxmq(kafka_request.clone()) {
                 Ok(fluxmq_request) => match handler.handle_request(fluxmq_request).await {
                     Ok(fluxmq_response) => {
@@ -832,6 +790,127 @@ impl BrokerServer {
             let response_bytes = KafkaCodec::encode_response(&metadata_response)?;
             debug!("🔍 BLOCKING: Metadata encoded");
             return Ok(response_bytes);
+        }
+
+        // 🔧 CRITICAL FIX: Handle PRODUCE requests directly to support multi-partition batches
+        // Java Kafka clients send PRODUCE requests with multiple partitions in a single request.
+        // The adapter.rs only processes the first partition, causing clients to hang waiting
+        // for responses for the other partitions. This bypasses the adapter and handles ALL partitions.
+        if kafka_request.api_key() == 0 {
+            info!("🔧 MULTI-PARTITION: Handling PRODUCE request with direct partition processing");
+            use crate::protocol::kafka::{
+                KafkaPartitionProduceResponse, KafkaProduceResponse, KafkaRequest, KafkaResponse,
+                KafkaResponseHeader, KafkaTopicProduceResponse,
+            };
+
+            if let KafkaRequest::Produce(kafka_produce_req) = kafka_request.clone() {
+                info!(
+                    "🔧 MULTI-PARTITION: Processing {} topics",
+                    kafka_produce_req.topic_data.len()
+                );
+
+                let mut topic_responses = Vec::new();
+                let correlation_id = kafka_produce_req.header.correlation_id;
+                let acks = kafka_produce_req.acks;
+
+                // Handle acks=0 (fire-and-forget) early - no response needed
+                if acks == 0 {
+                    info!("🔥 FIRE-AND-FORGET: acks=0, skipping response");
+                    return Ok(Bytes::new());
+                }
+
+                // Process each topic
+                for topic_data in kafka_produce_req.topic_data {
+                    let mut partition_responses = Vec::new();
+
+                    info!(
+                        "🔧 MULTI-PARTITION: Processing topic '{}' with {} partitions",
+                        topic_data.topic,
+                        topic_data.partition_data.len()
+                    );
+
+                    // Process each partition
+                    for partition_data in topic_data.partition_data {
+                        let partition_id = partition_data.partition;
+
+                        // Parse and produce messages for this partition
+                        let result = if let Some(records_bytes) = partition_data.records {
+                            // Parse Kafka record batch
+                            match ProtocolAdapter::parse_kafka_record_batch(&records_bytes) {
+                                Ok(messages) => {
+                                    // Store messages using handler
+                                    match handler.storage.append_messages(
+                                        &topic_data.topic,
+                                        partition_id as u32,
+                                        messages.clone(),
+                                    ) {
+                                        Ok(base_offset) => {
+                                            // Record metrics
+                                            handler.metrics.throughput.record_produced(
+                                                messages.len() as u64,
+                                                messages.iter().map(|m| m.value.len() as u64).sum(),
+                                            );
+
+                                            info!("✅ MULTI-PARTITION: Produced {} messages to {}-{}, offset={}",
+                                                   messages.len(), topic_data.topic, partition_id, base_offset);
+
+                                            (0i16, base_offset as i64) // error_code=0 (success), base_offset
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "❌ MULTI-PARTITION: Failed to append messages: {}",
+                                                e
+                                            );
+                                            (1i16, 0i64) // error_code=1 (unknown error)
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "❌ MULTI-PARTITION: Failed to parse record batch: {}",
+                                        e
+                                    );
+                                    (1i16, 0i64)
+                                }
+                            }
+                        } else {
+                            warn!(
+                                "❌ MULTI-PARTITION: No records in partition {}",
+                                partition_id
+                            );
+                            (1i16, 0i64)
+                        };
+
+                        partition_responses.push(KafkaPartitionProduceResponse {
+                            partition: partition_id,
+                            error_code: result.0,
+                            base_offset: result.1,
+                            log_append_time_ms: -1,
+                            log_start_offset: 0,
+                        });
+                    }
+
+                    topic_responses.push(KafkaTopicProduceResponse {
+                        topic: topic_data.topic,
+                        partition_responses,
+                    });
+                }
+
+                // Create complete PRODUCE response with ALL partitions
+                let kafka_response = KafkaResponse::Produce(KafkaProduceResponse {
+                    header: KafkaResponseHeader { correlation_id },
+                    responses: topic_responses,
+                    throttle_time_ms: 0,
+                });
+
+                info!(
+                    "🔧 MULTI-PARTITION: Sending complete response for correlation_id={}",
+                    correlation_id
+                );
+
+                let response_bytes = KafkaCodec::encode_response(&kafka_response)?;
+                return Ok(response_bytes);
+            }
         }
 
         debug!(
@@ -938,7 +1017,6 @@ impl BrokerServer {
 
         Ok(KafkaCodec::encode_response(&error_response)?)
     }
-
 
     async fn send_kafka_error_response<IO>(
         kafka_framed: &mut Framed<IO, KafkaFrameCodec>,

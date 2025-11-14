@@ -984,7 +984,7 @@ impl ProtocolAdapter {
     // ========================================================================
 
     /// Parse Kafka record batch into FluxMQ messages with compression support
-    fn parse_kafka_record_batch(records_bytes: &Bytes) -> Result<Vec<Message>> {
+    pub fn parse_kafka_record_batch(records_bytes: &Bytes) -> Result<Vec<Message>> {
         if records_bytes.is_empty() {
             return Ok(vec![]);
         }
