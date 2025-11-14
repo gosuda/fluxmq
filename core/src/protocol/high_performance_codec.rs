@@ -1,4 +1,3 @@
-
 use crate::performance::object_pool::MessagePools;
 use crate::performance::protocol_arena::ProtocolArenaPool;
 /// High-performance Kafka protocol codec optimizations
@@ -14,9 +13,11 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 /// High-performance codec with optimizations
+#[allow(dead_code)]
 pub struct HighPerformanceKafkaCodec {
     // Pre-compiled response templates
-    api_versions_response: Bytes,
+    api_versions_response: Bytes,    // v0-v2 non-flexible format
+    api_versions_response_v3: Bytes, // v3+ flexible format
     metadata_response_template: Bytes,
     // Object pools for reusing buffers
     pools: MessagePools,
@@ -36,6 +37,7 @@ impl HighPerformanceKafkaCodec {
     pub fn new() -> Self {
         let mut codec = Self {
             api_versions_response: Bytes::new(),
+            api_versions_response_v3: Bytes::new(),
             metadata_response_template: Bytes::new(),
             pools: MessagePools::new(),
             arena_pool: Mutex::new(ProtocolArenaPool::new()),
@@ -53,9 +55,13 @@ impl HighPerformanceKafkaCodec {
 
     /// Pre-compile frequently used responses to avoid repeated serialization
     fn precompile_responses(&mut self) {
-        // Pre-compile ApiVersions response (most common request)
+        // Pre-compile ApiVersions response v0-v2 (non-flexible format)
         let api_versions = self.build_api_versions_response();
         self.api_versions_response = api_versions;
+
+        // Pre-compile ApiVersions response v3+ (flexible format)
+        let api_versions_v3 = self.build_api_versions_response_v3();
+        self.api_versions_response_v3 = api_versions_v3;
 
         // Pre-compile basic metadata response template
         let metadata_template = self.build_metadata_template();
@@ -74,12 +80,13 @@ impl HighPerformanceKafkaCodec {
         // CRITICAL FIX: Use non-flexible format for better compatibility
         // This matches what standard Kafka brokers send for ApiVersions v0-v2
 
-        // 1. ErrorCode (int16) - first field in non-flexible format
-        buf.put_u16(0);
+        // 1. ErrorCode (SIGNED int16) - first field in non-flexible format
+        // Kafka protocol uses signed integers for error codes
+        buf.put_i16(0);
 
         // 2. ApiKeys (standard array) - NOT compact array
-        // Standard array: length as int32, not varint
-        buf.put_u32(20); // Number of API entries as int32
+        // Standard array: length as SIGNED int32, not unsigned
+        buf.put_i32(20); // Number of API entries as SIGNED int32 (Kafka protocol requirement)
 
         // Add supported API versions - use conservative versions for compatibility
         let apis = [
@@ -112,8 +119,70 @@ impl HighPerformanceKafkaCodec {
             // No tagged fields in non-flexible format
         }
 
+        // 3. ThrottleTimeMs (int32) - added in ApiVersions v1+
+        // Set to 0 (no throttling)
+        buf.put_i32(0);
+
         // No tagged fields section in non-flexible format
         // No length field update needed - length prefix will be added by framing layer
+
+        buf.freeze()
+    }
+
+    /// Build ApiVersions response v3+ using flexible format (KIP-482)
+    /// This is required for rdkafka and other strict Kafka clients
+    fn build_api_versions_response_v3(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(200);
+
+        // Response header: correlation_id (will be patched at runtime)
+        buf.put_i32(0); // Correlation ID placeholder
+
+        // FLEXIBLE FORMAT (KIP-482):
+        // 1. ErrorCode (int16)
+        buf.put_i16(0);
+
+        // 2. ApiKeys - COMPACT ARRAY (varint length + 1)
+        // Compact array: length is encoded as unsigned varint, value is length + 1
+        let num_apis = 20u32;
+        self.put_unsigned_varint(&mut buf, num_apis + 1); // 20 + 1 = 21
+
+        // Add supported API versions
+        let apis = [
+            (0u16, 0u16, 7u16), // Produce
+            (1, 0, 11),         // Fetch
+            (2, 0, 5),          // ListOffsets
+            (3, 0, 8),          // Metadata
+            (8, 0, 6),          // OffsetCommit
+            (9, 0, 5),          // OffsetFetch
+            (10, 0, 3),         // FindCoordinator
+            (11, 0, 5),         // JoinGroup
+            (12, 0, 4),         // Heartbeat
+            (13, 0, 2),         // LeaveGroup
+            (14, 0, 3),         // SyncGroup
+            (15, 0, 4),         // DescribeGroups
+            (16, 0, 3),         // ListGroups
+            (17, 0, 1),         // SaslHandshake
+            (18, 0, 3),         // ApiVersions
+            (19, 0, 4),         // CreateTopics
+            (20, 0, 3),         // DeleteTopics
+            (32, 0, 3),         // DescribeConfigs
+            (33, 0, 2),         // AlterConfigs
+            (36, 0, 2),         // SaslAuthenticate
+        ];
+
+        for (api_key, min_version, max_version) in apis {
+            buf.put_u16(api_key);
+            buf.put_u16(min_version);
+            buf.put_u16(max_version);
+            // Each ApiKey entry ends with tagged fields
+            buf.put_u8(0); // Empty tagged fields (TAG_BUFFER with 0 tags)
+        }
+
+        // 3. ThrottleTimeMs (int32)
+        buf.put_i32(0);
+
+        // 4. Tagged fields section (required in flexible versions)
+        buf.put_u8(0); // Empty tagged fields (TAG_BUFFER with 0 tags)
 
         buf.freeze()
     }
@@ -139,14 +208,23 @@ impl HighPerformanceKafkaCodec {
     }
 
     /// Ultra-fast ApiVersions response using pre-compiled template
-    pub fn encode_api_versions_fast(&self, correlation_id: i32) -> Bytes {
+    /// Automatically selects flexible (v3+) or non-flexible (v0-v2) format
+    pub fn encode_api_versions_fast(&self, correlation_id: i32, api_version: i16) -> Bytes {
         self.fast_path_hits
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+        // Select appropriate template based on API version
+        // v3+ requires flexible format with compact arrays and tagged fields
+        let template = if api_version >= 3 {
+            &self.api_versions_response_v3
+        } else {
+            &self.api_versions_response
+        };
+
         // SAFETY: Clone the template to avoid bounds issues
-        let template_len = self.api_versions_response.len();
+        let template_len = template.len();
         let mut response = BytesMut::with_capacity(template_len);
-        response.extend_from_slice(&self.api_versions_response);
+        response.extend_from_slice(template);
 
         // DEBUG: Log template size and correlation ID
         tracing::debug!(
@@ -274,7 +352,10 @@ impl HighPerformanceKafkaCodec {
                 // CRITICAL FIX: Use the proper method that patches correlation ID
                 self.fast_path_hits
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok(self.encode_api_versions_fast(api_response.header.correlation_id))
+                Ok(self.encode_api_versions_fast(
+                    api_response.header.correlation_id,
+                    api_response.api_version,
+                ))
             }
             _ => {
                 // Fallback to standard codec with performance tracking

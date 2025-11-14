@@ -1,4 +1,3 @@
-
 /// High-performance I/O optimizations for FluxMQ
 ///
 /// This module implements advanced I/O optimizations to achieve 400k+ msg/sec:
@@ -15,6 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// High-performance batch processor for maximizing throughput
+#[allow(dead_code)]
 pub struct BatchProcessor {
     // Batch configuration
     max_batch_size: usize,
@@ -347,6 +347,7 @@ pub struct IOStats {
 }
 
 /// Advanced connection pooling for reduced connection overhead
+#[allow(dead_code)]
 pub struct ConnectionPool {
     // Connection pool configuration
     max_connections: usize,

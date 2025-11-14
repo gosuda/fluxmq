@@ -1,4 +1,3 @@
-
 use crate::performance::{
     advanced_networking::AdvancedConnectionManager,
     arena_allocator::{ArenaAllocator, ArenaConfig},
@@ -68,6 +67,7 @@ impl Default for UltraPerformanceConfig {
 }
 
 /// Ultra-high performance broker with all optimizations
+#[allow(dead_code)]
 pub struct UltraPerformanceBroker {
     // Configuration
     config: UltraPerformanceConfig,
@@ -706,32 +706,6 @@ impl UltraPerformanceBroker {
     pub fn get_simd_stats(&self) -> String {
         let simd_stats = self.simd_processor.get_batch_stats();
         simd_stats.report()
-    }
-
-    /// Update performance metrics
-    fn update_performance_metrics(&self) {
-        let current_time = Self::current_timestamp();
-        let last_check = self.last_perf_check.load(Ordering::Relaxed);
-
-        if current_time > last_check {
-            let time_diff = current_time - last_check;
-            if time_diff > 0 {
-                let total_messages = self.total_messages.load(Ordering::Relaxed);
-                let ops_per_sec = total_messages / time_diff;
-                self.operations_per_second
-                    .store(ops_per_sec, Ordering::Relaxed);
-
-                // Send performance update
-                let _ = self
-                    .notification_tx
-                    .send(PerformanceEvent::PerformanceUpdate {
-                        msg_per_sec: ops_per_sec,
-                        total_messages,
-                    });
-            }
-
-            self.last_perf_check.store(current_time, Ordering::Relaxed);
-        }
     }
 
     /// Get current timestamp

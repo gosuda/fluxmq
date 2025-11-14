@@ -560,12 +560,14 @@ impl AffinityStats {
 }
 
 /// High-performance thread pool with CPU affinity
+#[allow(dead_code)]
 pub struct AffinityThreadPool {
     affinity_manager: Arc<ThreadAffinityManager>,
     workers: Vec<AffinityWorker>,
     task_queue: crossbeam_channel::Sender<Box<dyn FnOnce() + Send>>,
 }
 
+#[allow(dead_code)]
 struct AffinityWorker {
     thread_handle: JoinHandle<()>,
     assigned_cpu: usize,

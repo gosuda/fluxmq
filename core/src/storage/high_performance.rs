@@ -1,4 +1,3 @@
-
 use crate::performance::{
     memory::OptimizedMessageStorage, object_pool::MessagePools, quick_wins::QuickOptimizedStorage,
 };
@@ -15,6 +14,7 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 
 /// High-performance storage that combines all optimizations
+#[allow(dead_code)]
 pub struct HighPerformanceStorage {
     // Core storage using optimized structures
     storage: QuickOptimizedStorage,

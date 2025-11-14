@@ -409,8 +409,10 @@ impl BrokerServer {
                 // Handle ApiVersions requests directly
                 if kafka_request.api_key() == 18 {
                     // API_KEY_API_VERSIONS - 🚀 ULTRA-FAST with pre-compiled template!
-                    let response_bytes =
-                        hp_codec.encode_api_versions_fast(kafka_request.correlation_id());
+                    let response_bytes = hp_codec.encode_api_versions_fast(
+                        kafka_request.correlation_id(),
+                        kafka_request.api_version(),
+                    );
                     kafka_framed.send(response_bytes).await?;
                     return Ok(());
                 }
@@ -446,7 +448,8 @@ impl BrokerServer {
                     if api_key == 18 {
                         warn!("Detected Java ApiVersions request - using compatibility mode");
                         // Send a compatible ApiVersions response for Java clients
-                        let response_bytes = hp_codec.encode_api_versions_fast(correlation_id);
+                        let response_bytes =
+                            hp_codec.encode_api_versions_fast(correlation_id, api_version as i16);
                         info!(
                             "Sending Java-compatible ApiVersions response: {} bytes",
                             response_bytes.len()
@@ -779,7 +782,10 @@ impl BrokerServer {
         // Handle ApiVersions requests with pre-compiled template
         if kafka_request.api_key() == 18 {
             debug!("🔍 BLOCKING: ApiVersions fast path");
-            let response_bytes = hp_codec.encode_api_versions_fast(kafka_request.correlation_id());
+            let response_bytes = hp_codec.encode_api_versions_fast(
+                kafka_request.correlation_id(),
+                kafka_request.api_version(),
+            );
             return Ok(response_bytes);
         }
 

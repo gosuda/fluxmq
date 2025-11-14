@@ -1,5 +1,3 @@
-use crate::performance::numa_allocator::{init_thread_local_numa_allocator, NumaAwareAllocator};
-
 // Global allocator configuration for maximum performance
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
@@ -18,7 +16,6 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::alloc::Layout;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use std::sync::Arc;
 
 /// High-performance arena allocator for batch message processing
 pub struct ArenaAllocator {
@@ -427,6 +424,7 @@ pub struct SlabAllocator {
     size_classes: Vec<usize>,
 }
 
+#[allow(dead_code)]
 struct SlabPool {
     object_size: usize,
     objects_per_slab: usize,
@@ -436,6 +434,7 @@ struct SlabPool {
     allocated_objects: AtomicUsize,
 }
 
+#[allow(dead_code)]
 struct Slab {
     memory: NonNull<u8>,
     size: usize,
@@ -657,43 +656,6 @@ pub struct SlabPoolStats {
     pub utilization: f64,
 }
 
-/// Combined custom allocator manager
-pub struct CustomAllocatorManager {
-    arena: Arc<ArenaAllocator>,
-    ring_buffer: Arc<RingBufferAllocator>,
-    stack: Arc<StackAllocator>,
-    slab: Arc<SlabAllocator>,
-    numa_allocator: Arc<NumaAwareAllocator>,
-}
-
-impl CustomAllocatorManager {
-    pub fn new() -> Self {
-        Self {
-            arena: Arc::new(ArenaAllocator::new(1024 * 1024, 8)), // 8 × 1MB chunks
-            ring_buffer: Arc::new(RingBufferAllocator::new(2 * 1024 * 1024)), // 2MB ring
-            stack: Arc::new(StackAllocator::new(512 * 1024)),     // 512KB stack
-            slab: Arc::new(SlabAllocator::new()),
-            numa_allocator: init_thread_local_numa_allocator(),
-        }
-    }
-
-    pub fn get_comprehensive_stats(&self) -> CustomAllocatorStats {
-        CustomAllocatorStats {
-            arena: self.arena.get_stats(),
-            ring_buffer: self.ring_buffer.get_stats(),
-            stack: self.stack.get_stats(),
-            slab_pools: self.slab.get_stats(),
-            numa: Default::default(),
-        }
-    }
-
-    pub fn reset_allocators(&self) {
-        self.arena.reset();
-        self.stack.reset();
-        // Note: Ring buffer and slab allocators maintain their own state
-    }
-}
-
 /// Get information about the currently active global allocator
 pub fn get_global_allocator_info() -> &'static str {
     #[cfg(feature = "jemalloc")]
@@ -704,80 +666,6 @@ pub fn get_global_allocator_info() -> &'static str {
 
     #[cfg(not(any(feature = "jemalloc", feature = "mimalloc")))]
     return "System default (glibc malloc/macOS malloc) - Standard system allocator";
-}
-
-#[derive(Debug, Clone)]
-pub struct CustomAllocatorStats {
-    pub arena: ArenaStats,
-    pub ring_buffer: RingBufferStats,
-    pub stack: StackStats,
-    pub slab_pools: Vec<SlabPoolStats>,
-    pub numa: crate::performance::numa_allocator::NumaStats,
-}
-
-impl CustomAllocatorStats {
-    pub fn report(&self) -> String {
-        let mut report = String::new();
-
-        report.push_str("Custom Allocator Statistics:\n\n");
-
-        // Global allocator information
-        report.push_str(&format!(
-            "Global Allocator: {}\n",
-            get_global_allocator_info()
-        ));
-        report.push_str("\n");
-
-        // Arena allocator
-        report.push_str(&format!(
-            "Arena: {:.1}% utilization, {} allocations, {}/{}MB used\n",
-            self.arena.utilization * 100.0,
-            self.arena.allocations,
-            self.arena.used_bytes / (1024 * 1024),
-            self.arena.total_capacity / (1024 * 1024)
-        ));
-
-        // Ring buffer allocator
-        report.push_str(&format!(
-            "Ring Buffer: {:.1}% utilization, {} allocs, {} deallocs, {}/{}MB\n",
-            self.ring_buffer.utilization * 100.0,
-            self.ring_buffer.allocations,
-            self.ring_buffer.deallocations,
-            self.ring_buffer.used_bytes / (1024 * 1024),
-            self.ring_buffer.size / (1024 * 1024)
-        ));
-
-        // Stack allocator
-        report.push_str(&format!(
-            "Stack: {:.1}% current, {:.1}% peak, {} allocations, {}/{}KB\n",
-            self.stack.utilization * 100.0,
-            self.stack.peak_utilization * 100.0,
-            self.stack.allocations,
-            self.stack.current_usage / 1024,
-            self.stack.size / 1024
-        ));
-
-        // Slab allocators
-        report.push_str("Slab Pools:\n");
-        for slab_stat in &self.slab_pools {
-            report.push_str(&format!(
-                "  {}B: {:.1}% util, {}/{} objects allocated\n",
-                slab_stat.size_class,
-                slab_stat.utilization * 100.0,
-                slab_stat.allocated_objects,
-                slab_stat.total_objects
-            ));
-        }
-
-        // NUMA allocator summary
-        report.push_str(&format!(
-            "\nNUMA: {:.1}% locality, {:.1}% pool efficiency\n",
-            self.numa.allocation_stats.numa_locality_rate() * 100.0,
-            self.numa.allocation_stats.pool_efficiency() * 100.0
-        ));
-
-        report
-    }
 }
 
 /// Configure jemalloc for optimal FluxMQ performance

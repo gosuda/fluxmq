@@ -86,6 +86,7 @@ impl Clone for PartitionMMapSegment {
 
 /// Individual memory-mapped segment
 #[derive(Debug)]
+#[allow(dead_code)]
 struct MMapSegment {
     mmap: MmapMut,
     file: File,
@@ -304,7 +305,7 @@ impl MemoryMappedStorage {
             }
 
             file.flush()?;
-            file.seek(SeekFrom::Start(0))?;  // Reset to beginning
+            file.seek(SeekFrom::Start(0))?; // Reset to beginning
         }
 
         // Create memory-mapped region
