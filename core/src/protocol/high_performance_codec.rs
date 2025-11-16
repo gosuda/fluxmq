@@ -1,5 +1,4 @@
 use crate::performance::object_pool::MessagePools;
-use crate::performance::protocol_arena::ProtocolArenaPool;
 /// High-performance Kafka protocol codec optimizations
 ///
 /// This module implements aggressive optimizations for Kafka protocol processing:
@@ -10,7 +9,6 @@ use crate::performance::protocol_arena::ProtocolArenaPool;
 use crate::protocol::{ProduceRequest, ProduceResponse};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 /// High-performance codec with optimizations
 #[allow(dead_code)]
@@ -21,8 +19,6 @@ pub struct HighPerformanceKafkaCodec {
     metadata_response_template: Bytes,
     // Object pools for reusing buffers
     pools: MessagePools,
-    // 🚀 Protocol arena pool for request/response processing
-    arena_pool: Mutex<ProtocolArenaPool>,
     // Response cache for frequently requested data
     response_cache: HashMap<String, Bytes>,
     // Performance counters
@@ -40,7 +36,6 @@ impl HighPerformanceKafkaCodec {
             api_versions_response_v3: Bytes::new(),
             metadata_response_template: Bytes::new(),
             pools: MessagePools::new(),
-            arena_pool: Mutex::new(ProtocolArenaPool::new()),
             response_cache: HashMap::new(),
             fast_path_hits: std::sync::atomic::AtomicU64::new(0),
             slow_path_hits: std::sync::atomic::AtomicU64::new(0),

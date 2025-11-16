@@ -2,7 +2,7 @@ use crate::{
     acl::{AclManager, AuthorizationResult, Operation, Principal, ResourceType},
     consumer::{ConsumerGroupConfig, ConsumerGroupCoordinator, ConsumerGroupMessage},
     metrics::MetricsRegistry,
-    performance::{object_pool::MessagePools, ultra_performance::UltraPerformanceBroker},
+    performance::object_pool::MessagePools,
     protocol::{
         high_performance_codec::HighPerformanceKafkaCodec, AlterConfigsRequest,
         AlterConfigsResponse, BrokerMetadata, CreateTopicsRequest, CreateTopicsResponse,
@@ -56,7 +56,6 @@ pub struct MessageHandler {
     consumer_group_coordinator: Option<Arc<ConsumerGroupCoordinator>>,
     pub(crate) metrics: Arc<MetricsRegistry>,
     acl_manager: Option<Arc<parking_lot::RwLock<AclManager>>>,
-    ultra_performance_broker: Arc<UltraPerformanceBroker>,
     message_cache: Arc<MessageCacheManager>,
     #[allow(dead_code)]
     high_performance_codec: HighPerformanceKafkaCodec,
@@ -128,8 +127,6 @@ impl MessageHandler {
             metrics_clone.start_background_tasks().await;
         });
 
-        let ultra_performance_broker = Arc::new(UltraPerformanceBroker::new());
-
         // Initialize message cache with optimized configuration
         let cache_config = MessageCacheConfig {
             max_messages_per_partition: 20000, // 20k messages per partition
@@ -150,7 +147,6 @@ impl MessageHandler {
             consumer_group_coordinator,
             metrics,
             acl_manager: None, // ACL disabled by default
-            ultra_performance_broker,
             message_cache,
             high_performance_codec: HighPerformanceKafkaCodec::new(),
             message_pools: MessagePools::new(),
@@ -209,8 +205,6 @@ impl MessageHandler {
             metrics_clone.start_background_tasks().await;
         });
 
-        let ultra_performance_broker = Arc::new(UltraPerformanceBroker::new());
-
         // Initialize message cache with optimized configuration
         let cache_config = MessageCacheConfig {
             max_messages_per_partition: 20000, // 20k messages per partition
@@ -231,7 +225,6 @@ impl MessageHandler {
             consumer_group_coordinator,
             metrics,
             acl_manager: None, // ACL disabled by default
-            ultra_performance_broker,
             message_cache,
             high_performance_codec: HighPerformanceKafkaCodec::new(),
             message_pools: MessagePools::new(),
@@ -1196,18 +1189,9 @@ impl MessageHandler {
 
         // Step 3: Cache miss or insufficient coverage - fetch from storage
         let storage_start = std::time::Instant::now();
-        let all_messages = match self
-            .ultra_performance_broker
-            .fetch_messages_ultra(topic, partition, offset, max_bytes)
-            .await
-        {
-            Ok(messages) if !messages.is_empty() => messages,
-            _ => {
-                // Fallback to basic storage
-                self.storage
-                    .fetch_messages(topic, partition, offset, max_bytes)?
-            }
-        };
+        let all_messages = self
+            .storage
+            .fetch_messages(topic, partition, offset, max_bytes)?;
 
         let storage_duration = storage_start.elapsed();
         debug!(

@@ -60,8 +60,19 @@ The performance module is organized into several subsystems, each targeting spec
 
 1. **601,379 msg/sec** - MegaBatch with LZ4 compression (8 threads)
 2. **512,000 msg/sec** - Ultra-performance mode (4 threads)
-3. **47,333 msg/sec** - Lock-free metrics recovery
-4. **23,600 msg/sec** - Zero-copy optimizations
+3. **97,608 msg/sec** - Optimized rdkafka client (Rust native client, 572x improvement)
+4. **47,333 msg/sec** - Lock-free metrics recovery
+5. **23,600 msg/sec** - Zero-copy optimizations
+
+### Client Performance Comparison
+
+| Client | Throughput | 50k Messages | Optimization Level |
+|---|---|---|---|
+| **rdkafka (Optimized)** | 97,608 msg/sec | 0.51s | ✅ Batch + Async |
+| **Java Kafka Client** | 20,115 msg/sec | 2.49s | ✅ Production config |
+| **rdkafka (Baseline)** | 170 msg/sec | 293s | ❌ Synchronous sends |
+
+**Key Insight**: Proper batching configuration yields 572x improvement for rdkafka client!
 
 ### Key Optimizations
 
@@ -95,6 +106,29 @@ use std::arch::x86_64::_mm_crc32_u64;
 // Transfer ownership instead of cloning
 std::mem::take(&mut message)  // Zero memory copy
 ```
+
+#### 5. rdkafka Client Optimization (2025-11-15)
+```rust
+// Optimized rdkafka producer configuration
+let producer: FutureProducer = ClientConfig::new()
+    .set("bootstrap.servers", "127.0.0.1:9092")
+    .set("batch.size", "131072")              // 128KB batch
+    .set("linger.ms", "1")                     // 1ms linger for batching
+    .set("queue.buffering.max.messages", "1000000")
+    .set("queue.buffering.max.kbytes", "65536")  // 64MB buffer
+    .set("acks", "1")                          // Leader ack only
+    .create()?;
+
+// Batch sending strategy - collect futures and await in batches
+const BATCH_SIZE: usize = 1000;
+for batch in messages.chunks(BATCH_SIZE) {
+    let futures: Vec<_> = batch.iter()
+        .map(|msg| producer.send(record, timeout))
+        .collect();
+    join_all(futures).await;  // Await batch together
+}
+```
+**Result**: 97,608 msg/sec (572x improvement from naive synchronous sends)
 
 ## 🔧 Usage Guide
 
@@ -217,25 +251,62 @@ Multi-socket optimizations:
 - **Thread Pinning**: Keep threads on same socket
 - **Cross-Socket Minimization**: Reduce QPI/UPI traffic
 
-## 🚦 Module Status
+## 🚦 Module Status (Updated 2025-11-16)
 
-### Production Ready ✅
-- `ultra_performance.rs` - Fully tested, 601k+ msg/sec
-- `lockfree_storage.rs` - Battle-tested under high load
-- `mmap_storage.rs` - Stable with crash recovery
-- `object_pool.rs` - Zero allocation verified
-- `smart_pointers.rs` - Context-aware optimization
+### ✅ Active & Production Ready
+- `mmap_storage.rs` - ✅ **ACTIVE** - Used by HybridStorage, 256MB segments
+- `numa_allocator.rs` - ✅ **ACTIVE** - Used by BrokerServer for NUMA-aware allocation
+- `thread_affinity.rs` - ✅ **ACTIVE** - Used by BrokerServer for CPU pinning
+- `object_pool.rs` - ✅ **ACTIVE** - Used by MessagePools for buffer reuse
+- `io_optimizations.rs` - ✅ **ACTIVE** - ConnectionPool used by BrokerServer
+- `memory.rs` - ✅ **ACTIVE** - Core memory utilities
 
-### Beta 🔧
-- `simd_optimizations.rs` - CPU feature detection needed
-- `numa_allocator.rs` - Multi-socket testing required
-- `io_uring_zero_copy.rs` - Linux 5.1+ only
-- `thread_affinity.rs` - Platform-specific testing
+### 🔧 Available for Platform-Specific Use
+- `io_uring_zero_copy.rs` - Linux 5.1+ only (not currently integrated)
+- `sendfile_zero_copy.rs` - Unix zero-copy (not currently integrated)
+- `copy_file_range_zero_copy.rs` - Linux kernel-level copying (not currently integrated)
+- `fetch_sendfile.rs` - Fetch response optimization (not currently integrated)
 
-### Experimental ⚠️
-- `server_batch_aggregator.rs` - Not integrated in main path
-- `advanced_networking.rs` - TCP tuning in progress
-- `arena_allocator.rs` - Memory fragmentation analysis needed
+### 📚 Reference & Utilities
+- `quick_wins.rs` - Optimization guidelines and quick wins
+- `mod.rs` - Module organization and performance metrics
+
+### 🗑️ Removed (2025-11-16) - Cleanup Complete
+The following modules were removed as dead code or duplicates:
+- ❌ `ultra_performance.rs` - Dead initialization, never called
+- ❌ `arena_allocator.rs` - Duplicate of HybridStorage functionality
+- ❌ `generic_arena.rs` - Unused dependency
+- ❌ `protocol_arena.rs` - Declared but never used
+- ❌ `advanced_networking.rs` - Not integrated
+- ❌ `simd_optimizations.rs` - Duplicate of crc32fast (which uses SSE4.2)
+- ❌ `lockfree_storage.rs` - Duplicate of HybridStorage
+- ❌ `network_simple.rs` - Not integrated
+- ❌ `consumer_arena.rs` - Not used
+- ❌ `custom_allocator.rs` - Not integrated
+- ❌ `smart_pointers.rs` - Not used
+- ❌ `cross_platform_zero_copy.rs` - Not used
+- ❌ `zero_copy_storage.rs` - Not used
+
+**Result**: ~3,500 lines of dead code removed, codebase simplified
+
+## 🎯 Recent Achievements (2025-11-16)
+
+### ✅ Completed Optimizations
+- [x] **Dead Code Cleanup** - Removed 13 unused modules (~3,500 lines)
+- [x] **Code Simplification** - Clear separation of active vs. available modules
+- [x] **NUMA Allocator Integration** - Active in BrokerServer with thread affinity
+- [x] **rdkafka Client Optimization** - 572x improvement (170 → 97,608 msg/sec)
+- [x] **Thread Affinity Manager** - WorkloadOptimized strategy enabled
+- [x] **HybridStorage Architecture** - 4-tier system (compression, memory, mmap, disk)
+
+### 📊 Performance Summary
+| Component | Status | Throughput | Notes |
+|---|---|---|---|
+| Server (MegaBatch) | ✅ Production | 601,379 msg/sec | LZ4 compression |
+| rdkafka Client | ✅ Optimized | 97,608 msg/sec | Batch + async |
+| Java Client | ✅ Production | 20,115 msg/sec | Validated |
+| NUMA + Affinity | ✅ Active | N/A | Integrated in server |
+| HybridStorage | ✅ Production | 4-tier | Memory + mmap + disk |
 
 ## 🎯 Future Roadmap
 

@@ -1,5 +1,7 @@
 use crate::acl::{AclManager, Principal};
 use crate::performance::io_optimizations::ConnectionPool;
+use crate::performance::numa_allocator::NumaAwareAllocator;
+use crate::performance::thread_affinity::{AffinityStrategy, ThreadAffinityManager};
 use crate::protocol::high_performance_codec::HighPerformanceKafkaCodec;
 use crate::protocol::kafka::{KafkaCodec, KafkaFrameCodec, ProtocolAdapter};
 use crate::tls::FluxTlsAcceptor;
@@ -19,6 +21,10 @@ pub struct BrokerServer {
     connection_pool: Arc<ConnectionPool>,
     // Graceful shutdown coordination
     shutdown_tx: broadcast::Sender<()>,
+    // NUMA-aware memory allocation for optimal performance
+    numa_allocator: Option<Arc<NumaAwareAllocator>>,
+    // Thread affinity manager for CPU pinning
+    thread_affinity: Option<Arc<ThreadAffinityManager>>,
 }
 
 impl BrokerServer {
@@ -39,11 +45,24 @@ impl BrokerServer {
         )?); // Use config values
         let connection_pool = Arc::new(ConnectionPool::new(10000)); // Support 10k connections
         let (shutdown_tx, _) = broadcast::channel(16); // Graceful shutdown coordination
+
+        // Initialize NUMA allocator for optimal memory performance
+        let numa_allocator = Some(Arc::new(NumaAwareAllocator::new()));
+
+        // Initialize thread affinity manager with workload-optimized strategy
+        let thread_affinity = Some(Arc::new(ThreadAffinityManager::new(
+            AffinityStrategy::WorkloadOptimized,
+        )));
+
+        info!("🚀 NUMA allocator and thread affinity manager initialized");
+
         Ok(Self {
             config,
             handler,
             connection_pool,
             shutdown_tx,
+            numa_allocator,
+            thread_affinity,
         })
     }
 
@@ -79,11 +98,23 @@ impl BrokerServer {
             // Graceful shutdown coordination
             let (shutdown_tx, _) = broadcast::channel(16);
 
+            // Initialize NUMA allocator for optimal memory performance
+            let numa_allocator = Some(Arc::new(NumaAwareAllocator::new()));
+
+            // Initialize thread affinity manager with workload-optimized strategy
+            let thread_affinity = Some(Arc::new(ThreadAffinityManager::new(
+                AffinityStrategy::WorkloadOptimized,
+            )));
+
+            info!("🚀 NUMA allocator and thread affinity manager initialized");
+
             Ok(Self {
                 config,
                 handler,
                 connection_pool,
                 shutdown_tx,
+                numa_allocator,
+                thread_affinity,
             })
         } else {
             let mut handler = MessageHandler::new_with_features(
@@ -108,11 +139,23 @@ impl BrokerServer {
             // Graceful shutdown coordination
             let (shutdown_tx, _) = broadcast::channel(16);
 
+            // Initialize NUMA allocator for optimal memory performance
+            let numa_allocator = Some(Arc::new(NumaAwareAllocator::new()));
+
+            // Initialize thread affinity manager with workload-optimized strategy
+            let thread_affinity = Some(Arc::new(ThreadAffinityManager::new(
+                AffinityStrategy::WorkloadOptimized,
+            )));
+
+            info!("🚀 NUMA allocator and thread affinity manager initialized");
+
             Ok(Self {
                 config,
                 handler,
                 connection_pool,
                 shutdown_tx,
+                numa_allocator,
+                thread_affinity,
             })
         }
     }
@@ -169,11 +212,24 @@ impl BrokerServer {
         // 🚀 ULTRA-PERFORMANCE: High-throughput I/O optimizations
         let connection_pool = Arc::new(ConnectionPool::new(10000)); // Support 10k connections
         let (shutdown_tx, _) = broadcast::channel(16); // Graceful shutdown coordination
+
+        // Initialize NUMA allocator for optimal memory performance
+        let numa_allocator = Some(Arc::new(NumaAwareAllocator::new()));
+
+        // Initialize thread affinity manager with workload-optimized strategy
+        let thread_affinity = Some(Arc::new(ThreadAffinityManager::new(
+            AffinityStrategy::WorkloadOptimized,
+        )));
+
+        info!("🚀 NUMA allocator and thread affinity manager initialized (with recovery)");
+
         Ok(Self {
             config,
             handler,
             connection_pool,
             shutdown_tx,
+            numa_allocator,
+            thread_affinity,
         })
     }
 
@@ -181,6 +237,33 @@ impl BrokerServer {
     pub fn shutdown(&self) {
         info!("Initiating graceful shutdown...");
         let _ = self.shutdown_tx.send(()); // Notify all background tasks to shutdown
+    }
+
+    /// Get NUMA allocation statistics
+    pub fn get_numa_stats(&self) -> Option<String> {
+        self.numa_allocator.as_ref().map(|allocator| {
+            let stats = allocator.get_comprehensive_stats();
+            stats.report()
+        })
+    }
+
+    /// Get thread affinity statistics
+    pub fn get_affinity_stats(&self) -> Option<String> {
+        self.thread_affinity.as_ref().map(|manager| {
+            let stats = manager.get_stats();
+            stats.report()
+        })
+    }
+
+    /// Print performance optimization statistics
+    pub fn print_performance_stats(&self) {
+        if let Some(numa_stats) = self.get_numa_stats() {
+            info!("📊 NUMA Statistics:\n{}", numa_stats);
+        }
+
+        if let Some(affinity_stats) = self.get_affinity_stats() {
+            info!("🎯 Thread Affinity Statistics:\n{}", affinity_stats);
+        }
     }
 
     /// Run the server with graceful shutdown support
