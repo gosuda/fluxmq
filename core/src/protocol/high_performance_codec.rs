@@ -11,21 +11,23 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
 
 /// High-performance codec with optimizations
-#[allow(dead_code)]
 pub struct HighPerformanceKafkaCodec {
     // Pre-compiled response templates
     api_versions_response: Bytes,    // v0-v2 non-flexible format
     api_versions_response_v3: Bytes, // v3+ flexible format
     metadata_response_template: Bytes,
-    // Object pools for reusing buffers
+    // Object pools for reusing buffers (planned for future optimization)
+    #[allow(dead_code)]
     pools: MessagePools,
     // Response cache for frequently requested data
     response_cache: HashMap<String, Bytes>,
     // Performance counters
     fast_path_hits: std::sync::atomic::AtomicU64,
     slow_path_hits: std::sync::atomic::AtomicU64,
-    // Arena allocation statistics
+    // Arena allocation statistics (planned for future optimization)
+    #[allow(dead_code)]
     arena_allocations: std::sync::atomic::AtomicU64,
+    #[allow(dead_code)]
     arena_bytes_saved: std::sync::atomic::AtomicU64,
 }
 

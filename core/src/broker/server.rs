@@ -424,50 +424,187 @@ impl BrokerServer {
     /// - No pipelining, process one request at a time
     /// - Guaranteed ordering, no race conditions
     async fn handle_client(stream: TcpStream, handler: Arc<MessageHandler>) -> Result<()> {
-        info!("🔵 SYNC: New client connected - sequential processing");
+        info!("🚀 PIPELINED: New client connected - async processing");
 
         let metrics = handler.get_metrics();
         metrics.broker.connection_opened();
 
-        let mut kafka_framed = Framed::new(stream, KafkaFrameCodec);
+        // Split stream for concurrent read/write
+        let (read_half, write_half) = tokio::io::split(stream);
+        let mut kafka_read = tokio_util::codec::FramedRead::new(read_half, KafkaFrameCodec);
+        let mut kafka_write = tokio_util::codec::FramedWrite::new(write_half, KafkaFrameCodec);
+
+        // Response buffer with DashMap for lock-free concurrent access
+        let response_buffer = Arc::new(dashmap::DashMap::<i32, Bytes>::new());
+        let next_send_correlation = Arc::new(std::sync::atomic::AtomicI32::new(-1));
+
+        // Write channel for ordered delivery
+        let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<Bytes>(1000);
+
         let hp_codec = Arc::new(HighPerformanceKafkaCodec::new());
 
-        // Simple loop: read request → process → write response
-        while let Some(result) = tokio_stream::StreamExt::next(&mut kafka_framed).await {
-            match result {
-                Ok(request_bytes) => {
-                    // Process request
-                    match Self::process_kafka_message_pipelined(&handler, &hp_codec, request_bytes)
-                        .await
-                    {
-                        Ok(response_bytes) => {
-                            // Send response immediately
-                            if !response_bytes.is_empty() {
-                                info!("🔵 Sending response, size={} bytes", response_bytes.len());
-                                if kafka_framed.send(response_bytes).await.is_err() {
-                                    warn!("Failed to send response");
-                                    break;
+        // 1️⃣ Read Loop: Process requests in parallel
+        let read_handle = {
+            let handler = Arc::clone(&handler);
+            let hp_codec = Arc::clone(&hp_codec);
+            let response_buffer = Arc::clone(&response_buffer);
+            let next_send_correlation = Arc::clone(&next_send_correlation);
+            let write_tx = write_tx.clone();
+
+            tokio::spawn(async move {
+                use futures::stream::{FuturesUnordered, StreamExt as FuturesStreamExt};
+
+                let mut processing_futures = FuturesUnordered::new();
+                let mut read_done = false;
+
+                loop {
+                    tokio::select! {
+                        result = tokio_stream::StreamExt::next(&mut kafka_read), if !read_done => {
+                            match result {
+                                Some(Ok(message_bytes)) => {
+                                    // Extract correlation ID
+                                    let correlation_id = if message_bytes.len() >= 8 {
+                                        i32::from_be_bytes([
+                                            message_bytes[4],
+                                            message_bytes[5],
+                                            message_bytes[6],
+                                            message_bytes[7],
+                                        ])
+                                    } else {
+                                        warn!("Invalid message format");
+                                        continue;
+                                    };
+
+                                    debug!("🚀 READ: correlation_id={}", correlation_id);
+
+                                    let handler = Arc::clone(&handler);
+                                    let hp_codec = Arc::clone(&hp_codec);
+                                    let response_buffer = Arc::clone(&response_buffer);
+                                    let next_send_correlation = Arc::clone(&next_send_correlation);
+                                    let write_tx = write_tx.clone();
+
+                                    let future = async move {
+                                        match Self::process_kafka_message_pipelined(&handler, &hp_codec, message_bytes).await {
+                                            Ok(response_bytes) => {
+                                                response_buffer.insert(correlation_id, response_bytes);
+                                                Self::flush_ordered_responses_dashmap(&response_buffer, &next_send_correlation, &write_tx).await;
+                                            }
+                                            Err(e) => {
+                                                warn!("Request processing failed: {}", e);
+                                            }
+                                        }
+                                    };
+
+                                    processing_futures.push(future);
                                 }
-                            } else {
-                                warn!("⚠️ EMPTY RESPONSE - client will hang!");
+                                Some(Err(e)) => {
+                                    warn!("Failed to decode message: {}", e);
+                                    read_done = true;
+                                }
+                                None => {
+                                    info!("🚀 Read stream closed");
+                                    read_done = true;
+                                }
                             }
                         }
-                        Err(e) => {
-                            warn!("Request processing failed: {}", e);
+
+                        _ = FuturesStreamExt::next(&mut processing_futures), if !processing_futures.is_empty() => {
+                            // Future completed
+                        }
+
+                        else => {
+                            if read_done && processing_futures.is_empty() {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                info!("🚀 All processing complete");
+            })
+        };
+
+        // 2️⃣ Write Loop: Send responses in order
+        let write_handle = {
+            tokio::spawn(async move {
+                let mut sent = 0;
+                while let Some(response_bytes) = write_rx.recv().await {
+                    if kafka_write.send(response_bytes).await.is_err() {
+                        warn!("Write failed, sent {} responses", sent);
+                        break;
+                    }
+                    if kafka_write.flush().await.is_err() {
+                        warn!("Flush failed, sent {} responses", sent);
+                        break;
+                    }
+                    sent += 1;
+                }
+                info!("🚀 Write loop terminated (sent {} responses)", sent);
+            })
+        };
+
+        let _ = tokio::join!(read_handle, write_handle);
+
+        metrics.broker.connection_closed();
+        info!("🚀 PIPELINED: Client disconnected");
+        Ok(())
+    }
+
+    /// 🚀 LOCK-FREE: DashMap-based flush with simple, high-performance logic
+    async fn flush_ordered_responses_dashmap(
+        response_buffer: &Arc<dashmap::DashMap<i32, Bytes>>,
+        next_send_correlation: &Arc<std::sync::atomic::AtomicI32>,
+        write_tx: &tokio::sync::mpsc::Sender<Bytes>,
+    ) {
+        use std::sync::atomic::Ordering;
+
+        loop {
+            // 🚀 LOCK-FREE: Atomic load (no mutex!)
+            let mut current = next_send_correlation.load(Ordering::Acquire);
+
+            // Initialize on first response (compare-and-swap for race-free init)
+            if current == -1 {
+                let min_key = response_buffer.iter().map(|entry| *entry.key()).min();
+                if let Some(first_key) = min_key {
+                    // CAS to safely initialize (another task may initialize first)
+                    match next_send_correlation.compare_exchange(
+                        -1,
+                        first_key,
+                        Ordering::Release,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => {
+                            current = first_key;
+                        }
+                        Err(updated) => {
+                            current = updated;
+                        }
+                    }
+                } else {
+                    // Buffer still empty
+                    return;
+                }
+            }
+
+            // 🚀 LOCK-FREE: DashMap remove (no mutex!)
+            match response_buffer.remove(&current) {
+                Some((corr_id, response)) => {
+                    // Increment to next correlation_id (atomic!)
+                    next_send_correlation.store(corr_id + 1, Ordering::Release);
+
+                    // Empty responses are skipped but sequence is still incremented
+                    if !response.is_empty() {
+                        if write_tx.send(response).await.is_err() {
                             break;
                         }
                     }
                 }
-                Err(e) => {
-                    warn!("Failed to decode message: {}", e);
+                None => {
+                    // Next response not ready yet
                     break;
                 }
             }
         }
-
-        metrics.broker.connection_closed();
-        info!("🔵 SYNC: Client disconnected");
-        Ok(())
     }
 
     async fn process_kafka_message<IO>(
@@ -1440,45 +1577,6 @@ impl BrokerServer {
                 _ = shutdown_rx.recv() => {
                     info!("TLS listener shutting down gracefully...");
                     break;
-                }
-            }
-        }
-    }
-
-    /// Run TLS listener for secure connections
-    #[allow(dead_code)]
-    async fn run_tls_listener(
-        listener: TcpListener,
-        handler: Arc<MessageHandler>,
-        acceptor: Arc<FluxTlsAcceptor>,
-    ) {
-        info!("Starting TLS listener...");
-
-        loop {
-            match listener.accept().await {
-                Ok((stream, peer_addr)) => {
-                    info!("New TLS client connected: {}", peer_addr);
-                    let handler = Arc::clone(&handler);
-                    let acceptor = Arc::clone(&acceptor);
-
-                    tokio::spawn(async move {
-                        match acceptor.accept(stream).await {
-                            Ok(tls_stream) => {
-                                info!("TLS handshake completed for {}", peer_addr);
-                                if let Err(e) = Self::handle_tls_client(tls_stream, handler).await {
-                                    error!("Error handling TLS client {}: {}", peer_addr, e);
-                                } else {
-                                    info!("TLS client {} disconnected", peer_addr);
-                                }
-                            }
-                            Err(e) => {
-                                error!("TLS handshake failed for {}: {}", peer_addr, e);
-                            }
-                        }
-                    });
-                }
-                Err(e) => {
-                    error!("Failed to accept TLS connection: {}", e);
                 }
             }
         }

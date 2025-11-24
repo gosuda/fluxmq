@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 /// Kernel-level file-to-file copying using copy_file_range
 ///
 /// This module implements zero-copy file operations using Linux copy_file_range
@@ -17,6 +16,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(target_os = "linux")]
+use std::io;
+
+#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 
 #[cfg(target_os = "linux")]
@@ -24,24 +26,25 @@ use libc::{copy_file_range, loff_t};
 
 /// High-performance file copying using copy_file_range
 pub struct CopyFileRangeHandler {
+    // Configuration
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    max_copy_size: usize,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    enable_cross_fs: bool,
     // Statistics
     copy_operations: AtomicU64,
     bytes_copied: AtomicU64,
     fallback_operations: AtomicU64,
-
-    // Configuration
-    max_copy_size: usize,
-    enable_cross_fs: bool,
 }
 
 impl CopyFileRangeHandler {
     pub fn new() -> Self {
         Self {
+            max_copy_size: 1024 * 1024 * 1024, // 1GB max per copy_file_range call
+            enable_cross_fs: true,
             copy_operations: AtomicU64::new(0),
             bytes_copied: AtomicU64::new(0),
             fallback_operations: AtomicU64::new(0),
-            max_copy_size: 1024 * 1024 * 1024, // 1GB max per operation
-            enable_cross_fs: true,
         }
     }
 
@@ -645,7 +648,8 @@ mod tests {
 
             match result {
                 Ok(bytes_copied) => {
-                    let throughput_mbps = (bytes_copied as f64 / duration.as_secs_f64()) / (1024.0 * 1024.0);
+                    let throughput_mbps =
+                        (bytes_copied as f64 / duration.as_secs_f64()) / (1024.0 * 1024.0);
 
                     println!("   ✅ Copy successful:");
                     println!("      📦 Bytes copied: {} ({} bytes)", name, bytes_copied);
@@ -661,7 +665,10 @@ mod tests {
                     assert_eq!(bytes_copied as usize, size);
                 }
                 Err(e) => {
-                    println!("   ⚠️  Copy failed: {} (fallback used on non-Linux systems)", e);
+                    println!(
+                        "   ⚠️  Copy failed: {} (fallback used on non-Linux systems)",
+                        e
+                    );
                 }
             }
         }
@@ -670,7 +677,10 @@ mod tests {
         let stats = handler.get_stats();
         println!("\n📈 Copy File Range Benchmark Results:");
         println!("   {}", stats.report());
-        println!("   🎯 Zero-copy efficiency: {:.1}%", stats.zero_copy_ratio * 100.0);
+        println!(
+            "   🎯 Zero-copy efficiency: {:.1}%",
+            stats.zero_copy_ratio * 100.0
+        );
 
         if stats.zero_copy_ratio > 0.0 {
             println!("   🔥 Kernel-level zero-copy working optimally!");
@@ -710,7 +720,10 @@ mod tests {
             src_file.flush().unwrap();
         }
 
-        println!("📦 Test file size: {:.2} MB", test_size as f64 / (1024.0 * 1024.0));
+        println!(
+            "📦 Test file size: {:.2} MB",
+            test_size as f64 / (1024.0 * 1024.0)
+        );
 
         // Test 1: Zero-copy method
         println!("\n🚀 Testing zero-copy method (copy_file_range):");
@@ -722,9 +735,13 @@ mod tests {
 
         match zero_copy_result {
             Ok(bytes_copied) => {
-                let throughput = (bytes_copied as f64 / zero_copy_duration.as_secs_f64()) / (1024.0 * 1024.0);
-                println!("   ✅ Zero-copy completed: {:.2} MB/s in {:.3} ms",
-                        throughput, zero_copy_duration.as_millis());
+                let throughput =
+                    (bytes_copied as f64 / zero_copy_duration.as_secs_f64()) / (1024.0 * 1024.0);
+                println!(
+                    "   ✅ Zero-copy completed: {:.2} MB/s in {:.3} ms",
+                    throughput,
+                    zero_copy_duration.as_millis()
+                );
             }
             Err(ref e) => {
                 println!("   ⚠️  Zero-copy failed: {}", e);
@@ -739,13 +756,18 @@ mod tests {
 
         match traditional_result {
             Ok(bytes_copied) => {
-                let throughput = (bytes_copied as f64 / traditional_duration.as_secs_f64()) / (1024.0 * 1024.0);
-                println!("   ✅ Traditional completed: {:.2} MB/s in {:.3} ms",
-                        throughput, traditional_duration.as_millis());
+                let throughput =
+                    (bytes_copied as f64 / traditional_duration.as_secs_f64()) / (1024.0 * 1024.0);
+                println!(
+                    "   ✅ Traditional completed: {:.2} MB/s in {:.3} ms",
+                    throughput,
+                    traditional_duration.as_millis()
+                );
 
                 // Performance comparison
                 if zero_copy_success && zero_copy_duration.as_millis() > 0 {
-                    let speedup = traditional_duration.as_secs_f64() / zero_copy_duration.as_secs_f64();
+                    let speedup =
+                        traditional_duration.as_secs_f64() / zero_copy_duration.as_secs_f64();
                     println!("\n🏆 Performance Comparison:");
                     println!("   📈 Zero-copy speedup: {:.2}x faster", speedup);
 
@@ -767,7 +789,10 @@ mod tests {
         if dst_zero_copy.exists() && dst_traditional.exists() {
             let zero_copy_content = std::fs::read(&dst_zero_copy).unwrap();
             let traditional_content = std::fs::read(&dst_traditional).unwrap();
-            assert_eq!(zero_copy_content, traditional_content, "Copy methods produced different results");
+            assert_eq!(
+                zero_copy_content, traditional_content,
+                "Copy methods produced different results"
+            );
             println!("\n✅ Content integrity verified: both methods produce identical output");
         }
 
@@ -793,15 +818,24 @@ mod tests {
         assert_eq!(initial_stats.zero_copy_ratio, 0.0);
 
         println!("✅ Handler initialized successfully");
-        println!("   📊 Max copy size: {} GB", handler.max_copy_size / (1024 * 1024 * 1024));
-        println!("   🔄 Cross-filesystem support: {}", handler.enable_cross_fs);
+        println!(
+            "   📊 Max copy size: {} GB",
+            handler.max_copy_size / (1024 * 1024 * 1024)
+        );
+        println!(
+            "   🔄 Cross-filesystem support: {}",
+            handler.enable_cross_fs
+        );
 
         // Test manager initialization
         let manager = LogSegmentCopyManager::new();
         assert_eq!(manager.segment_size, 256 * 1024 * 1024); // 256MB
 
         println!("✅ Log Segment Copy Manager initialized");
-        println!("   📦 Segment size: {} MB", manager.segment_size / (1024 * 1024));
+        println!(
+            "   📦 Segment size: {} MB",
+            manager.segment_size / (1024 * 1024)
+        );
 
         let manager_stats = manager.get_stats();
         println!("   📈 Manager status: {}", manager_stats);

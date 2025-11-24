@@ -20,6 +20,7 @@
 //! - [`numa_allocator`] - NUMA-aware memory allocation (used by BrokerServer)
 //!
 //! ### ✅ I/O & Storage (Active)
+//! - [`adaptive_io`] - Automatic I/O strategy selection (io_uring → sendfile → standard)
 //! - [`io_optimizations`] - ConnectionPool and batch processing (used by BrokerServer)
 //! - [`mmap_storage`] - Memory-mapped storage with 256MB segments (used by HybridStorage)
 //!
@@ -27,11 +28,25 @@
 //! - [`thread_affinity`] - CPU thread pinning (used by BrokerServer with NUMA)
 //! - [`quick_wins`] - Optimization guidelines and quick wins
 //!
-//! ### 🔧 Platform-Specific (Available but not integrated)
-//! - [`sendfile_zero_copy`] - Kernel-level zero-copy using sendfile/splice
-//! - [`io_uring_zero_copy`] - Ultra-high performance Linux io_uring networking
-//! - [`copy_file_range_zero_copy`] - Kernel-level file-to-file copying
-//! - [`fetch_sendfile`] - Fetch response optimization using sendfile
+//! ### 🎯 Feature-Gated Optimizations (2025-11-18)
+//!
+//! **Unix-compatible:**
+//! - [`fetch_sendfile`] - Zero-copy Fetch (enable: `--features fetch-sendfile`)
+//!   - Expected: 40-60% Consumer throughput improvement
+//!   - Platform: Linux, macOS
+//!
+//! **Linux-only:**
+//! - [`io_uring_zero_copy`] - Kernel bypass networking (enable: `--features io-uring`)
+//!   - Expected: 800k+ msg/sec, p99 < 1ms latency
+//!   - Platform: Linux 5.1+
+//! - [`copy_file_range_zero_copy`] - Kernel file operations (enable: `--features copy-file-range`)
+//!   - Expected: 5-10x faster compaction, 90% CPU reduction
+//!   - Platform: Linux 4.5+
+//!
+//! **Linux preset:** `cargo build --features linux-optimized`
+//!
+//! ### 🔧 Supporting Modules
+//! - [`sendfile_zero_copy`] - Unix sendfile syscall (used by fetch_sendfile)
 //!
 //! ## Key Optimization Techniques
 //!
@@ -67,15 +82,14 @@
 //! - NUMA topology utilization
 //! - Buffer pool efficiency
 
+pub mod adaptive_io; // Adaptive I/O strategy selection (io_uring -> sendfile -> standard)
 pub mod copy_file_range_zero_copy; // Kernel-level file-to-file copying
 pub mod fetch_sendfile; // Integration of sendfile for Fetch responses
 pub mod io_optimizations;
 pub mod io_uring_zero_copy; // Ultra-high performance Linux io_uring networking
-pub mod memory;
 pub mod mmap_storage;
 pub mod numa_allocator;
 pub mod object_pool;
-pub mod quick_wins;
 pub mod sendfile_zero_copy; // Kernel-level zero-copy using sendfile/splice
 pub mod thread_affinity;
 

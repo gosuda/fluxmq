@@ -2,114 +2,14 @@
 ///
 /// This module implements advanced I/O optimizations to achieve 400k+ msg/sec:
 /// - Zero-copy networking with io_uring-style operations
-/// - Advanced batching strategies
 /// - CPU cache optimization
 /// - Asynchronous disk I/O with vectored writes
-use crate::protocol::{Message, PartitionId, TopicName};
 use crate::Result;
 use bytes::{Bytes, BytesMut};
 use parking_lot::RwLock;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-
-/// High-performance batch processor for maximizing throughput
-#[allow(dead_code)]
-pub struct BatchProcessor {
-    // Batch configuration
-    max_batch_size: usize,
-    max_batch_timeout_ms: u64,
-
-    // Batch queues per topic-partition
-    batches: Arc<RwLock<HashMap<(TopicName, PartitionId), VecDeque<Message>>>>,
-
-    // Performance counters
-    processed_batches: AtomicUsize,
-    total_messages: AtomicUsize,
-    batch_sizes: Arc<RwLock<Vec<usize>>>,
-}
-
-impl BatchProcessor {
-    pub fn new() -> Self {
-        Self {
-            max_batch_size: 10000,    // Much larger batch size for throughput
-            max_batch_timeout_ms: 10, // Very low latency timeout
-            batches: Arc::new(RwLock::new(HashMap::new())),
-            processed_batches: AtomicUsize::new(0),
-            total_messages: AtomicUsize::new(0),
-            batch_sizes: Arc::new(RwLock::new(Vec::with_capacity(10000))),
-        }
-    }
-
-    /// Add message to batch with intelligent batching strategy
-    pub fn add_message(&self, topic: &str, partition: PartitionId, message: Message) {
-        let mut batches = self.batches.write();
-        let key = (topic.to_string(), partition);
-
-        let queue = batches.entry(key).or_insert_with(VecDeque::new);
-        queue.push_back(message);
-
-        // Auto-flush large batches immediately
-        if queue.len() >= self.max_batch_size {
-            // Signal for immediate processing
-            self.total_messages
-                .fetch_add(queue.len(), Ordering::Relaxed);
-        }
-    }
-
-    /// Extract ready batches for processing
-    pub fn extract_ready_batches(&self) -> Vec<(TopicName, PartitionId, Vec<Message>)> {
-        let mut batches = self.batches.write();
-        let mut ready_batches = Vec::new();
-
-        // Process all queues and extract ready batches
-        for ((topic, partition), queue) in batches.iter_mut() {
-            if !queue.is_empty() && queue.len() >= 100 {
-                // Minimum batch size for efficiency
-                let batch: Vec<Message> = queue.drain(..).collect();
-                let batch_size = batch.len();
-
-                ready_batches.push((topic.clone(), *partition, batch));
-
-                // Track batch size for optimization
-                self.batch_sizes.write().push(batch_size);
-                self.processed_batches.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        ready_batches
-    }
-
-    /// Get batch processing statistics
-    pub fn get_stats(&self) -> BatchStats {
-        let batch_sizes = self.batch_sizes.read();
-        let avg_batch_size = if batch_sizes.is_empty() {
-            0.0
-        } else {
-            batch_sizes.iter().sum::<usize>() as f64 / batch_sizes.len() as f64
-        };
-
-        let max_batch_size = batch_sizes.iter().max().copied().unwrap_or(0);
-        let min_batch_size = batch_sizes.iter().min().copied().unwrap_or(0);
-
-        BatchStats {
-            processed_batches: self.processed_batches.load(Ordering::Relaxed),
-            total_messages: self.total_messages.load(Ordering::Relaxed),
-            avg_batch_size,
-            max_batch_size,
-            min_batch_size,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct BatchStats {
-    pub processed_batches: usize,
-    pub total_messages: usize,
-    pub avg_batch_size: f64,
-    pub max_batch_size: usize,
-    pub min_batch_size: usize,
-}
 
 /// Zero-copy network buffer manager
 pub struct ZeroCopyBufferManager {
@@ -424,64 +324,4 @@ pub struct ConnectionStats {
     pub max_connections: usize,
     pub utilization: f64,
     pub reuse_rate: f64,
-}
-
-/// Combined I/O optimization manager
-pub struct IOOptimizationManager {
-    pub batch_processor: BatchProcessor,
-    pub buffer_manager: ZeroCopyBufferManager,
-    pub io_manager: VectoredIOManager,
-    pub connection_pool: ConnectionPool,
-}
-
-impl IOOptimizationManager {
-    pub fn new() -> Self {
-        Self {
-            batch_processor: BatchProcessor::new(),
-            buffer_manager: ZeroCopyBufferManager::new(),
-            io_manager: VectoredIOManager::new(),
-            connection_pool: ConnectionPool::new(10000), // Support 10k connections
-        }
-    }
-
-    /// Get comprehensive I/O optimization statistics
-    pub fn get_comprehensive_stats(&self) -> IOOptimizationStats {
-        IOOptimizationStats {
-            batch_stats: self.batch_processor.get_stats(),
-            buffer_stats: self.buffer_manager.get_stats(),
-            io_stats: self.io_manager.get_stats(),
-            connection_stats: self.connection_pool.get_stats(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct IOOptimizationStats {
-    pub batch_stats: BatchStats,
-    pub buffer_stats: BufferStats,
-    pub io_stats: IOStats,
-    pub connection_stats: ConnectionStats,
-}
-
-impl IOOptimizationStats {
-    pub fn report(&self) -> String {
-        format!(
-            "I/O Optimization Stats:\n\
-             Batching: {} batches, avg size {:.1}\n\
-             Buffers: {:.1}% reuse rate, {} pools\n\
-             I/O: {} vectored writes, {:.1} avg batch size\n\
-             Connections: {} active ({:.1}% util), {:.1}% reuse rate",
-            self.batch_stats.processed_batches,
-            self.batch_stats.avg_batch_size,
-            self.buffer_stats.reuse_efficiency() * 100.0,
-            self.buffer_stats.small_pool_size
-                + self.buffer_stats.medium_pool_size
-                + self.buffer_stats.large_pool_size,
-            self.io_stats.vectored_writes,
-            self.io_stats.avg_batch_size,
-            self.connection_stats.active_connections,
-            self.connection_stats.utilization * 100.0,
-            self.connection_stats.reuse_rate * 100.0
-        )
-    }
 }

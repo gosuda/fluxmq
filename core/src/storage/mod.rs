@@ -25,9 +25,7 @@
 //! - [`segment`] - Log segment rotation and management
 //! - [`index`] - Offset indexing for fast seeking
 //! - [`immediate_optimizations`] - Performance optimization implementations
-//! - [`high_performance`] - Advanced high-performance storage strategies
 
-pub mod high_performance;
 pub mod immediate_optimizations;
 pub mod message_cache;
 // pub mod ultra_high_performance;
@@ -57,12 +55,7 @@ enum PersistenceCommand {
         topic: TopicName,
         partition: PartitionId,
         messages: Vec<Message>,
-        #[allow(dead_code)] // Used for future replication features
         offset: Offset,
-    },
-    #[allow(dead_code)] // Reserved for future batch persistence optimization
-    BatchAppend {
-        batch: Vec<(TopicName, PartitionId, Vec<Message>, Offset)>,
     },
     Flush {
         topic: TopicName,
@@ -316,9 +309,7 @@ pub struct HybridStorage {
     // Tier 2: Memory-mapped storage for zero-copy I/O
     mmap_storage: Arc<MemoryMappedStorage>,
     // Tier 3: Background persistence to disk
-    #[allow(dead_code)] // Used for cleanup and management operations
     base_dir: String,
-    #[allow(dead_code)] // Used for direct segment access in replication
     segments:
         Arc<RwLock<HashMap<(TopicName, PartitionId), Arc<parking_lot::Mutex<SegmentManager>>>>>,
     // Channel for async persistence
@@ -417,13 +408,6 @@ impl HybridStorage {
                                     // Flush batch if it gets too large
                                     if pending_batch.len() >= MAX_BATCH_SIZE {
                                         Self::process_batch(&segments, &base_dir, &mut pending_batch);
-                                    }
-                                }
-                                PersistenceCommand::BatchAppend { batch } => {
-                                    for (topic, partition, messages, _offset) in batch {
-                                        if let Err(e) = Self::persist_messages(&segments, &base_dir, &topic, partition, &messages) {
-                                            error!("Failed to persist batch messages: {}", e);
-                                        }
                                     }
                                 }
                                 PersistenceCommand::Flush { topic, partition } => {

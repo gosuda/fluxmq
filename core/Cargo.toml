@@ -13,17 +13,29 @@ categories.workspace = true
 description.workspace = true
 
 [features]
-default = []
+# Default: Platform-optimized features (automatically selected by conditional compilation)
+default = [
+    "mimalloc",        # All platforms: High-performance allocator
+    "fetch-sendfile",  # Unix only: Zero-copy Fetch (auto-disabled on Windows)
+    "io-uring",        # Linux only: Kernel bypass networking (auto-disabled on macOS/Windows)
+    "copy-file-range", # Linux only: Kernel file operations (auto-disabled on macOS/Windows)
+]
 
 # Individual performance features
 jemalloc = ["tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
-java-arena = []
-consumer-arena = []
+fetch-sendfile = []              # Zero-copy Fetch responses using sendfile (Unix)
+io-uring = []                    # Ultra-high performance io_uring networking (Linux 5.1+)
+copy-file-range = []             # Kernel-level file-to-file copying (Linux 4.5+)
 
-# Preset combinations
-ultra-performance = ["jemalloc", "java-arena", "consumer-arena"]
-production = ["java-arena", "consumer-arena", "jemalloc"]
+# Preset combinations (for manual override)
+minimal = ["mimalloc"] # Minimal feature set
+linux-optimized = [
+    "io-uring",
+    "copy-file-range",
+    "fetch-sendfile",
+    "jemalloc",
+] # Linux-specific optimizations with jemalloc
 
 [[bin]]
 name = "fluxmq"

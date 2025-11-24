@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 /// Integration of sendfile for Fetch responses
 ///
 /// This module provides efficient zero-copy transfer of messages from

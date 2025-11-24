@@ -2,16 +2,16 @@ use crate::{
     acl::{AclManager, AuthorizationResult, Operation, Principal, ResourceType},
     consumer::{ConsumerGroupConfig, ConsumerGroupCoordinator, ConsumerGroupMessage},
     metrics::MetricsRegistry,
-    performance::object_pool::MessagePools,
+    performance::adaptive_io::AdaptiveFetchHandler,
     protocol::{
-        high_performance_codec::HighPerformanceKafkaCodec, AlterConfigsRequest,
-        AlterConfigsResponse, BrokerMetadata, CreateTopicsRequest, CreateTopicsResponse,
-        DeleteTopicsRequest, DeleteTopicsResponse, DescribeConfigsRequest, DescribeConfigsResponse,
-        FetchRequest, FetchResponse, ListOffsetsRequest, ListOffsetsResponse, Message,
-        MetadataRequest, MetadataResponse, MultiFetchRequest, MultiFetchResponse, Offset,
-        PartitionFetchResponse, PartitionId, PartitionMetadata, ProduceRequest, ProduceResponse,
-        Request, Response, SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest,
-        SaslHandshakeResponse, TopicFetchResponse, TopicMetadata,
+        AlterConfigsRequest, AlterConfigsResponse, BrokerMetadata, CreateTopicsRequest,
+        CreateTopicsResponse, DeleteTopicsRequest, DeleteTopicsResponse, DescribeConfigsRequest,
+        DescribeConfigsResponse, FetchRequest, FetchResponse, ListOffsetsRequest,
+        ListOffsetsResponse, Message, MetadataRequest, MetadataResponse, MultiFetchRequest,
+        MultiFetchResponse, Offset, PartitionFetchResponse, PartitionId, PartitionMetadata,
+        ProduceRequest, ProduceResponse, Request, Response, SaslAuthenticateRequest,
+        SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse, TopicFetchResponse,
+        TopicMetadata,
     },
     replication::{BrokerId, ReplicationConfig, ReplicationCoordinator},
     storage::{
@@ -57,10 +57,9 @@ pub struct MessageHandler {
     pub(crate) metrics: Arc<MetricsRegistry>,
     acl_manager: Option<Arc<parking_lot::RwLock<AclManager>>>,
     message_cache: Arc<MessageCacheManager>,
+    // Adaptive I/O handler for optimized fetch operations (planned for future optimization)
     #[allow(dead_code)]
-    high_performance_codec: HighPerformanceKafkaCodec,
-    #[allow(dead_code)]
-    message_pools: MessagePools,
+    adaptive_fetch: AdaptiveFetchHandler,
 }
 
 impl MessageHandler {
@@ -137,6 +136,20 @@ impl MessageHandler {
         };
         let message_cache = Arc::new(MessageCacheManager::new(cache_config));
 
+        // Initialize adaptive fetch handler with automatic I/O strategy selection
+        let adaptive_fetch = AdaptiveFetchHandler::new().unwrap_or_else(|e| {
+            tracing::warn!(
+                "Failed to initialize adaptive fetch handler: {}, using defaults",
+                e
+            );
+            AdaptiveFetchHandler::default()
+        });
+
+        tracing::info!(
+            "Adaptive I/O strategy selected: {:?}",
+            adaptive_fetch.strategy()
+        );
+
         let handler = Self {
             broker_id,
             broker_port,
@@ -148,8 +161,7 @@ impl MessageHandler {
             metrics,
             acl_manager: None, // ACL disabled by default
             message_cache,
-            high_performance_codec: HighPerformanceKafkaCodec::new(),
-            message_pools: MessagePools::new(),
+            adaptive_fetch,
         };
 
         // Update topic metrics
@@ -215,6 +227,20 @@ impl MessageHandler {
         };
         let message_cache = Arc::new(MessageCacheManager::new(cache_config));
 
+        // Initialize adaptive fetch handler with automatic I/O strategy selection
+        let adaptive_fetch = AdaptiveFetchHandler::new().unwrap_or_else(|e| {
+            tracing::warn!(
+                "Failed to initialize adaptive fetch handler: {}, using defaults",
+                e
+            );
+            AdaptiveFetchHandler::default()
+        });
+
+        tracing::info!(
+            "Adaptive I/O strategy selected: {:?}",
+            adaptive_fetch.strategy()
+        );
+
         let handler = Self {
             broker_id,
             broker_port,
@@ -226,8 +252,7 @@ impl MessageHandler {
             metrics,
             acl_manager: None, // ACL disabled by default
             message_cache,
-            high_performance_codec: HighPerformanceKafkaCodec::new(),
-            message_pools: MessagePools::new(),
+            adaptive_fetch,
         };
 
         // Update topic metrics after recovery

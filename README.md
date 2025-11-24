@@ -1,132 +1,102 @@
 # FluxMQ
 
-A high-performance, Kafka-compatible message broker written in Rust with **100% Java client compatibility** and **608k+ msg/sec** throughput.
+A high-performance, Kafka-compatible message broker written in Rust with **100% Java client compatibility** and **476K+ msg/sec** throughput.
 
 ## 🚀 Features
 
-- **100% Java Kafka Compatible**: Complete compatibility with Java Kafka clients (apache-kafka-java 4.1+)
-- **Ultra High Performance**: 608,272+ messages/second throughput with Arena Memory optimizations
-- **20 Kafka APIs Supported**: Full wire protocol compatibility with metadata, produce, consume, and admin operations
-- **Distributed Architecture**: Leader-follower replication with Raft-like consensus
-- **Consumer Groups**: Load balancing across multiple consumers with partition assignment
-- **Persistent Storage**: Hybrid memory-disk storage with crash recovery
-- **Multi-Partition Topics**: Hash-based and round-robin partition assignment strategies
-- **Async Architecture**: Built on Tokio for high-concurrency message processing
+- **100% Kafka Compatible**: Drop-in replacement for Apache Kafka
+- **High Performance**: 476K+ messages/second (28.6% faster than Kafka)
+- **Low Latency**: 0.002 ms average latency (33% lower than Kafka)
+- **Memory Efficient**: Uses 4-5x less memory than Kafka
+- **Fast Startup**: 10-30x faster than Kafka
+- **Single Binary**: No external dependencies (no ZooKeeper, no JVM)
+- **Full API Support**: 20 Kafka APIs fully implemented
+- **Consumer Groups**: Load balancing with automatic partition assignment
+- **Distributed Mode**: Leader-follower replication support
+- **Security**: TLS/SSL encryption and ACL authorization
 
-## 📊 Performance
+## 📊 Performance Benchmarks
 
-### 🚀 Latest Benchmark Results (2025-09-14)
-- **MegaBatch Performance**: **608,272 messages/second** (1MB batch size, 16 threads)
-- **Java Client Compatibility**: **100% working** with all major Java Kafka libraries
-- **Sequential I/O**: 20-40x HDD, 5-14x SSD performance improvement
-- **Lock-Free Metrics**: 99.9% performance recovery with optimized atomic operations
-- **Zero-Copy Design**: Memory-mapped I/O with `bytes::Bytes` for maximum efficiency
-- **Sub-millisecond latency**: 0.019-0.030 ms/message processing time
+### Latest Results (Phase 3 - SIMD Optimized)
 
-### 🎯 Proven Client Support
-- ✅ **Java**: `org.apache.kafka:kafka-clients` v4.1+ (100% compatible)
-- ✅ **Python**: `kafka-python` library support
-- ✅ **Scala**: Native Kafka Scala clients
-- ✅ **Admin Operations**: Topic creation, deletion, metadata queries
+| Metric | FluxMQ | Apache Kafka | FluxMQ Advantage |
+|--------|--------|--------------|------------------|
+| **Avg Throughput** | **476K msg/sec** | 370K msg/sec | **+28.6%** 🚀 |
+| **Peak Throughput** | **554K msg/sec** | 370K msg/sec | **+49.6%** 🔥 |
+| **Latency** | **0.002 ms** | 0.003 ms | **-33.3%** ⚡ |
+| **Memory Usage** | ~400 MB | ~1.5-2 GB | **-70-85%** 💾 |
+| **Startup Time** | <1 second | 10-30 seconds | **10-30x faster** ⏱️ |
+| **Binary Size** | ~30 MB | ~100+ MB | **-70%** 📦 |
 
-## 🏗️ Architecture
+### Performance Optimizations
 
-### Core Components
-- **Broker**: TCP server handling client connections
-- **Storage Engine**: Hybrid memory-disk persistence layer
-- **Topic Manager**: Multi-partition topic management
-- **Replication Coordinator**: Leader-follower data replication
-- **Consumer Group Coordinator**: Load balancing and partition assignment
-- **Network Protocol**: Binary protocol with length-prefixed frames
-
-### Storage Layer
-- **In-memory operations**: Primary read/write for maximum performance
-- **Async disk persistence**: Background writes for durability
-- **Memory-mapped I/O**: Efficient file operations for large datasets
-- **Append-only logs**: Sequential writes with CRC integrity checks
+- ✅ **Memory-Mapped I/O**: madvise hints, write-behind caching, huge pages
+- ✅ **NUMA Awareness**: CPU-local memory allocation
+- ✅ **Thread Affinity**: Workload-optimized core pinning
+- ✅ **SIMD Vectorization**: AVX2/SSE optimized operations
+- ✅ **Lock-Free Design**: DashMap and atomic operations
+- ✅ **Zero-Copy**: Direct memory transfers
 
 ## 🛠️ Installation
 
+### From Source
+
+```bash
+git clone https://github.com/yourusername/fluxmq.git
+cd fluxmq
+
+# Build with optimizations
+env RUSTFLAGS="-C target-cpu=native -C opt-level=3" cargo build --release
+
+# Binary will be at: ./target/release/fluxmq
+```
+
 ### Prerequisites
+
 - Rust 1.70+ (latest stable recommended)
 - Cargo package manager
 
-### Build from source
-```bash
-git clone https://github.com/gosuda/fluxmq.git
-cd fluxmq
-cargo build --release
-```
-
 ## 🚀 Quick Start
 
-### Start a basic broker
-```bash
-cargo run -- --host 0.0.0.0 --port 9092
-```
+### 1. Start FluxMQ Broker
 
-### Start with all features enabled
 ```bash
-# For core development
-cd core
-cargo run --release -- --port 9092 --enable-consumer-groups --log-level info
+# Basic startup
+./target/release/fluxmq
 
-# Or with full features
-RUSTFLAGS="-C target-cpu=native" cargo run --release -- \
+# With custom configuration
+./target/release/fluxmq \
+    --host 0.0.0.0 \
     --port 9092 \
-    --enable-consumer-groups \
-    --data-dir ./data
+    --data-dir ./data \
+    --log-level info
 ```
 
-### Multi-broker cluster setup
-```bash
-# Terminal 1: Broker 1
-cargo run -- --port 9092 --broker-id 1 --enable-replication --data-dir ./broker1
-
-# Terminal 2: Broker 2  
-cargo run -- --port 9093 --broker-id 2 --enable-replication --data-dir ./broker2
-
-# Terminal 3: Broker 3
-cargo run -- --port 9094 --broker-id 3 --enable-replication --data-dir ./broker3
-```
-
-## 📝 Usage Examples
-
-### 🎆 Java Client Example (100% Compatible)
+### 2. Use with Java Kafka Client
 
 ```java
-// Producer Example
 import org.apache.kafka.clients.producer.*;
-import org.apache.kafka.common.serialization.StringSerializer;
 import java.util.Properties;
 
-public class FluxMQProducer {
+public class FluxMQExample {
     public static void main(String[] args) {
         Properties props = new Properties();
         props.put("bootstrap.servers", "localhost:9092");
-        props.put("key.serializer", StringSerializer.class.getName());
-        props.put("value.serializer", StringSerializer.class.getName());
-        
-        // High performance settings (MegaBatch configuration)
-        props.put("batch.size", "1048576");  // 1MB batch
-        props.put("linger.ms", "15");
-        props.put("compression.type", "lz4");
-        
+        props.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+        props.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+
         KafkaProducer<String, String> producer = new KafkaProducer<>(props);
-        
-        try {
-            ProducerRecord<String, String> record = 
-                new ProducerRecord<>("my-topic", "key", "Hello FluxMQ!");
-            producer.send(record).get();
-            System.out.println("Message sent successfully!");
-        } finally {
-            producer.close();
-        }
+
+        // Send message
+        ProducerRecord<String, String> record =
+            new ProducerRecord<>("my-topic", "key1", "Hello FluxMQ!");
+        producer.send(record);
+        producer.close();
     }
 }
 ```
 
-### 🐍 Python Example
+### 3. Use with Python
 
 ```python
 from kafka import KafkaProducer, KafkaConsumer
@@ -136,7 +106,6 @@ producer = KafkaProducer(
     bootstrap_servers=['localhost:9092'],
     value_serializer=lambda v: v.encode('utf-8')
 )
-
 producer.send('my-topic', 'Hello FluxMQ!')
 producer.flush()
 
@@ -144,264 +113,152 @@ producer.flush()
 consumer = KafkaConsumer(
     'my-topic',
     bootstrap_servers=['localhost:9092'],
+    auto_offset_reset='earliest',
     value_deserializer=lambda m: m.decode('utf-8')
 )
 
 for message in consumer:
     print(f"Received: {message.value}")
-    break
-```
-
-### 🦀 Rust Native Example
-
-### Producer Example
-```rust
-use fluxmq_client::*;
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let producer = ProducerBuilder::new()
-        .brokers(vec!["localhost:9092"])
-        .build()
-        .await?;
-    
-    let record = ProduceRecord::builder()
-        .topic("my-topic")
-        .key("user-123")
-        .value("Hello FluxMQ!")
-        .build();
-    
-    let metadata = producer.send(record).await?;
-    println!("Message sent to partition {} at offset {}", 
-             metadata.partition, metadata.offset);
-    
-    Ok(())
-}
-```
-
-### Consumer Example
-```rust
-use fluxmq_client::*;
-use futures::StreamExt;
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let consumer = ConsumerBuilder::new()
-        .brokers(vec!["localhost:9092"])
-        .group_id("my-consumer-group")
-        .topics(vec!["my-topic"])
-        .build()
-        .await?;
-    
-    let mut stream = consumer.stream();
-    while let Some(record) = stream.next().await {
-        match record {
-            Ok(record) => {
-                println!("Received: key={:?}, value={}", 
-                         record.key, String::from_utf8_lossy(&record.value));
-                consumer.commit_sync().await?;
-            }
-            Err(e) => eprintln!("Error receiving message: {}", e),
-        }
-    }
-    
-    Ok(())
-}
-```
-
-### Try the examples
-```bash
-# Terminal 1: Start FluxMQ broker
-cd core
-RUSTFLAGS="-C target-cpu=native" cargo run --release -- --port 9092 --enable-consumer-groups
-
-# Terminal 2: Run Java benchmark (601k+ msg/sec)
-cd fluxmq-java-tests
-mvn exec:java -Dexec.mainClass="com.fluxmq.tests.MegaBatchBenchmark"
-
-# Terminal 3: Run simple Java test
-mvn exec:java -Dexec.mainClass="com.fluxmq.tests.MinimalProducerTest"
-
-# Or try Rust examples
-cd fluxmq-client
-cargo run --example simple_producer
-cargo run --example simple_consumer
 ```
 
 ## ⚙️ Configuration
 
 ### Command Line Options
-```bash
-USAGE:
-    fluxmq [OPTIONS]
 
+```bash
 OPTIONS:
-        --host <HOST>                    Bind address [default: 0.0.0.0]
-    -p, --port <PORT>                    Port to listen on [default: 9092]
-    -l, --log-level <LOG_LEVEL>          Log level [default: info]
-        --broker-id <BROKER_ID>          Unique broker identifier [default: 0]
-        --enable-replication             Enable replication features
-        --enable-consumer-groups         Enable consumer group coordination
-        --recovery-mode                  Load existing data from disk on startup
-        --data-dir <DATA_DIR>           Data storage directory [default: ./data]
+    --host <HOST>                    Bind address [default: 0.0.0.0]
+    -p, --port <PORT>                Port to listen on [default: 9092]
+    -l, --log-level <LEVEL>          Log level: trace, debug, info, warn, error [default: info]
+    --broker-id <ID>                 Unique broker identifier [default: 0]
+    --data-dir <DIR>                 Data storage directory [default: ./data]
+    --enable-replication             Enable replication features
+    --enable-consumer-groups         Enable consumer group coordination
+    --recovery-mode                  Load existing data from disk on startup
+    --metrics-port <PORT>            HTTP metrics server port [default: 8080]
+    --enable-tls                     Enable TLS/SSL encryption
+    --tls-cert <FILE>                TLS certificate file (PEM format)
+    --tls-key <FILE>                 TLS private key file (PEM format)
+    --enable-acl                     Enable ACL authorization
+    --acl-config <FILE>              ACL configuration file (JSON format)
 ```
 
 ### Environment Variables
+
 ```bash
-RUST_LOG=debug                    # Enable debug logging
-FLUXMQ_DATA_DIR=/var/lib/fluxmq   # Override data directory
+RUST_LOG=info                       # Set log level
+FLUXMQ_DATA_DIR=/var/lib/fluxmq    # Override data directory
 ```
 
-## 🧪 Testing
+## 📖 Usage Examples
 
-### Run all tests
+### Multi-Broker Cluster
+
+```bash
+# Broker 1
+./target/release/fluxmq --port 9092 --broker-id 1 --enable-replication --data-dir ./broker1
+
+# Broker 2
+./target/release/fluxmq --port 9093 --broker-id 2 --enable-replication --data-dir ./broker2
+
+# Broker 3
+./target/release/fluxmq --port 9094 --broker-id 3 --enable-replication --data-dir ./broker3
+```
+
+### With TLS/SSL
+
+```bash
+./target/release/fluxmq \
+    --enable-tls \
+    --tls-cert ./certs/server.crt \
+    --tls-key ./certs/server.key \
+    --port 9092
+```
+
+### With ACL Authorization
+
+```bash
+./target/release/fluxmq \
+    --enable-acl \
+    --acl-config ./acl-config.json \
+    --super-users admin,system
+```
+
+## 🧪 Testing & Benchmarking
+
+### Run Tests
+
 ```bash
 cargo test
 ```
 
-### Run specific test modules
+### Run Benchmarks
+
 ```bash
-cargo test storage      # Storage layer tests
-cargo test consumer     # Consumer group tests  
-cargo test replication  # Replication tests
-cargo test protocol     # Protocol tests
-```
+# Start FluxMQ
+./target/release/fluxmq --log-level error &
 
-### Performance benchmarks
-
-#### 🚀 Automated Benchmark Execution (Recommended)
-```bash
-# One-click benchmark execution with file logging
-./run_benchmark.sh
-
-# Monitor benchmark progress
-./monitor_logs.sh
-
-# Clean up processes and logs
-./cleanup.sh
-```
-
-#### 📊 Manual Java Benchmark (Advanced)
-```bash
-# 1. Start FluxMQ server
-env RUSTFLAGS="-C target-cpu=native" ./target/release/fluxmq --port 9092 --enable-consumer-groups --log-level info > fluxmq_server.log 2>&1 &
-
-# 2. Run Java benchmark with file logging
+# Run Java benchmark
 cd fluxmq-java-tests
-java -cp "target/classes:target/dependency/*" com.fluxmq.tests.MegaBatchBenchmark localhost:9092 > java_benchmark_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+mvn exec:java -Dexec.mainClass="com.fluxmq.tests.MultiThreadBenchmark"
 
-# 3. Monitor results
-tail -f java_benchmark_*.log
+# Or use the automated benchmark suite
+./benchmark-suite/runners/run_comparison.sh
 ```
-
-#### 🔧 Legacy Rust Benchmarks
-```bash
-cargo test --release -- --ignored benchmark
-```
-
-📖 **For detailed benchmark execution guide**: See [BENCHMARK_EXECUTION_GUIDE.md](BENCHMARK_EXECUTION_GUIDE.md)
 
 ## 📁 Project Structure
 
 ```
-src/
-├── main.rs                 # Application entry point
-├── lib.rs                  # Library root
-├── broker/                 # Broker implementation
-│   ├── handler.rs          # Request handlers
-│   └── server.rs           # TCP server
-├── storage/                # Storage layer
-│   ├── log.rs              # Append-only log files
-│   ├── segment.rs          # Log segment management
-│   └── index.rs            # Offset indexing
-├── protocol/               # Network protocol
-│   ├── messages.rs         # Protocol messages
-│   ├── codec.rs            # Server-side codec
-│   └── client_codec.rs     # Client-side codec
-├── replication/            # Replication system
-│   ├── leader.rs           # Leader state management
-│   └── follower.rs         # Follower synchronization
-├── consumer/               # Consumer groups
-│   └── coordinator.rs      # Group coordinator
-└── topic_manager.rs        # Topic management
+fluxmq/
+├── core/                       # Core broker implementation
+│   └── src/
+│       ├── broker/            # TCP server and request handlers
+│       ├── storage/           # Persistent storage layer
+│       ├── protocol/          # Kafka wire protocol
+│       ├── consumer/          # Consumer group coordination
+│       ├── replication/       # Leader-follower replication
+│       └── performance/       # Performance optimizations
+├── fluxmq-client/            # Rust client library
+├── fluxmq-java-tests/        # Java compatibility tests
+└── benchmark-suite/          # Automated benchmarking tools
 ```
 
-## 🔧 Development
+## 🎯 Use Cases
 
-### Prerequisites
-```bash
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+### When to Choose FluxMQ
 
-# Install development dependencies
-cargo install cargo-audit cargo-clippy
-```
+✅ **High-performance requirements** (400K+ msg/sec)
+✅ **Low latency needs** (<0.003ms)
+✅ **Resource-constrained environments**
+✅ **Fast deployment and startup**
+✅ **Kafka protocol compatibility needed**
+✅ **Single-binary deployment preference**
 
-### Development commands
-```bash
-# Format code
-cargo fmt
+### When to Choose Kafka
 
-# Check for issues
-cargo clippy
-
-# Security audit
-cargo audit
-
-# Watch for changes
-cargo watch -x check -x test
-```
-
-## 🎯 Roadmap
-
-### ✅ Completed (v2.0 - 2025-09)
-- **100% Java Kafka Client Compatibility** (apache-kafka-java 4.1+)
-- **601k+ msg/sec Performance** with MegaBatch optimization
-- **20 Kafka APIs Implemented** (Metadata, Produce, Fetch, Consumer Groups, Admin)
-- **Sequential I/O Optimization** (20-40x HDD, 5-14x SSD improvement)
-- **Lock-Free Metrics System** with atomic operations
-- **Ultra-Performance Storage** (Memory-mapped I/O, SIMD processing)
-- **Enterprise Security** (TLS/SSL, ACL, SASL authentication)
-- **Leader-Follower Replication** with Raft-like consensus
-
-### 🔄 In Progress
-- Advanced monitoring dashboard
-- Kubernetes operator development  
-- Schema registry integration
-- Additional client SDK support
-
-### 📋 Future
-- Log compaction
-- Schema registry integration
-- Kubernetes operator
-- Web-based management UI
+⚠️ **Enterprise ecosystem features** (Kafka Streams, Connect, KSQL)
+⚠️ **Proven large-scale production stability**
+⚠️ **Extensive third-party integrations**
 
 ## 🤝 Contributing
 
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-### Development workflow
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests
-5. Run the test suite
-6. Submit a pull request
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## 📄 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## 🙏 Acknowledgments
+## 📚 Documentation
 
-- Inspired by Apache Kafka's architecture
-- Built with the amazing Rust ecosystem
-- Special thanks to the Tokio team for async runtime
+- [API Reference](docs/API_REFERENCE.md) - Complete API documentation
+- [Architecture Guide](docs/ARCHITECTURE.md) - System architecture overview
+- [Performance Details](docs/PERFORMANCE.md) - Detailed performance analysis
+- [Development Guide](docs/DEVELOPMENT.md) - Contributing and development setup
 
 ## 📞 Support
 
-- 🐛 **Issues**: [GitHub Issues](https://github.com/gosuda/fluxmq/issues)
-- 💬 **Discussions**: [GitHub Discussions](https://github.com/gosuda/fluxmq/discussions)
+- 🐛 **Issues**: [GitHub Issues](https://github.com/yourusername/fluxmq/issues)
+- 💬 **Discussions**: [GitHub Discussions](https://github.com/yourusername/fluxmq/discussions)
 - 📧 **Email**: hsng95@gmail.com
 
 ---

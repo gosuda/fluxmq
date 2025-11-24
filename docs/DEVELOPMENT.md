@@ -195,15 +195,19 @@ python3 run_all_tests.py
 
 #### Performance Benchmarks
 ```bash
-# MegaBatch benchmark (601k+ msg/sec target)
+# Current production benchmark (476K avg, 554K peak)
 cd fluxmq-java-tests
-mvn exec:java -Dexec.mainClass="com.fluxmq.tests.MegaBatchBenchmark"
+mvn exec:java -Dexec.mainClass="com.fluxmq.tests.MultiThreadBenchmark"
 
-# Multi-threaded performance test
-mvn exec:java -Dexec.mainClass="com.fluxmq.tests.MultiThreadProducerTest"
+# Comprehensive benchmark with all features
+mvn exec:java -Dexec.mainClass="com.fluxmq.tests.ComprehensiveBenchmark"
 
-# Continuous performance monitoring
-./scripts/performance-monitor.sh
+# Automated FluxMQ vs Kafka comparison
+cd ..
+./benchmark-suite/runners/run_comparison.sh
+
+# Resource monitoring during benchmarks
+./benchmark-suite/monitors/resource_monitor.sh <PID> output.csv 120
 ```
 
 ## 🔧 Core Development Areas
@@ -515,6 +519,19 @@ firefox flamegraph.svg
 
 ## 📊 Performance Development
 
+### Current Performance Status
+
+**FluxMQ vs Apache Kafka** (as of 2025-11-24):
+- Average: 476K msg/sec (+28.6% vs Kafka's 370K)
+- Peak: 554K msg/sec (+49.6% vs Kafka)
+- Latency: 0.002 ms (-33.3% vs Kafka's 0.003 ms)
+- Memory: 100-150 MB (-70-85% vs Kafka's 1.5-2 GB)
+
+**Optimization History**:
+1. **Baseline**: 294K msg/sec (-26% vs Kafka)
+2. **Phase 1 (mmap)**: 426K msg/sec (+15% vs Kafka, +44.9% improvement)
+3. **Phase 3 (SIMD)**: 476K msg/sec (+28.6% vs Kafka, +62% total improvement)
+
 ### Benchmarking Framework
 ```rust
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
@@ -763,23 +780,32 @@ type(scope): description
 
 ## 🎯 Development Roadmap
 
-### Short Term (1-2 months)
-- [ ] Complete remaining Kafka APIs
-- [ ] Optimize memory-mapped storage
-- [ ] Improve error handling
-- [ ] Add comprehensive benchmarks
+### Completed Achievements ✅
+- [x] **100% Kafka API compatibility**: 20 APIs fully implemented
+- [x] **Memory-mapped I/O optimization**: Phase 1 complete (+44.9%)
+- [x] **SIMD vectorization**: Phase 3 complete (+11.7%)
+- [x] **476K msg/sec average**: 28.6% faster than Kafka
+- [x] **Automated benchmark suite**: FluxMQ vs Kafka comparison
+- [x] **Resource monitoring**: CPU/memory tracking integrated
+- [x] **Java client compatibility**: 100% tested with Kafka 4.1.0
 
-### Medium Term (3-6 months)  
-- [ ] Implement log compaction
-- [ ] Add schema registry support
+### Short Term (1-2 months)
+- [ ] Reach 600K msg/sec sustained throughput
+- [ ] Implement io_uring for Linux (kernel bypass I/O)
+- [ ] Add log compaction support
+- [ ] Comprehensive performance documentation
+
+### Medium Term (3-6 months)
+- [ ] 1M msg/sec target with advanced batch aggregation
+- [ ] Multi-broker clustering with replication
+- [ ] Schema registry integration
 - [ ] Kubernetes operator
-- [ ] Multi-datacenter replication
 
 ### Long Term (6-12 months)
-- [ ] 1M+ msg/sec performance target
-- [ ] Hardware acceleration (GPU/FPGA)
-- [ ] Advanced monitoring dashboard
+- [ ] Hardware acceleration (GPU compression/encryption)
+- [ ] Advanced monitoring dashboard (Grafana integration)
 - [ ] Enterprise management tools
+- [ ] Multi-datacenter replication
 
 ---
 

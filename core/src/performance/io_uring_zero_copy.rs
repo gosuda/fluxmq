@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 /// Ultra-high performance networking using Linux io_uring
 ///
 /// This module implements kernel bypass networking using io_uring,
@@ -36,7 +35,6 @@ pub struct IoUringNetworkHandler {
 
     // Active operations tracking
     active_operations: HashMap<u64, IoUringOperation>,
-    next_operation_id: AtomicU64,
 }
 
 /// Configuration for io_uring optimizations
@@ -73,10 +71,15 @@ impl Default for IoUringConfig {
 /// Represents an active io_uring operation
 #[derive(Debug)]
 struct IoUringOperation {
+    #[allow(dead_code)] // Kept for debugging and future monitoring
     operation_id: u64,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     operation_type: IoUringOperationType,
+    #[allow(dead_code)] // Kept for debugging and future monitoring
     file_fd: Option<RawFd>,
+    #[allow(dead_code)] // Kept for debugging and future monitoring
     socket_fd: RawFd,
+    #[allow(dead_code)] // Kept for debugging and future monitoring
     bytes_expected: usize,
 }
 
@@ -133,7 +136,6 @@ impl IoUringNetworkHandler {
             bytes_transferred: AtomicU64::new(0),
             config,
             active_operations: HashMap::new(),
-            next_operation_id: AtomicU64::new(1),
         })
     }
 
