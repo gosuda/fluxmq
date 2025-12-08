@@ -272,13 +272,13 @@ impl ConsumerGroupCoordinator {
                 .await;
 
             match result {
-                Ok((generation_id, group_protocol, leader_id, members)) => {
+                Ok((generation_id, group_protocol, leader_id, assigned_member_id, members)) => {
                     ConsumerGroupMessage::JoinGroupResponse {
                         error_code: error_codes::NONE,
                         generation_id,
                         group_protocol,
                         leader_id,
-                        consumer_id,
+                        consumer_id: assigned_member_id, // Use the server-assigned member_id
                         members,
                     }
                 }
@@ -287,7 +287,7 @@ impl ConsumerGroupCoordinator {
                     generation_id: -1,
                     group_protocol: String::new(),
                     leader_id: String::new(),
-                    consumer_id,
+                    consumer_id, // Keep original consumer_id on error
                     members: Vec::new(),
                 },
             }
@@ -588,8 +588,32 @@ impl ConsumerGroupCoordinator {
         rebalance_timeout_ms: u64,
         protocol_type: String,
         group_protocols: Vec<GroupProtocol>,
-    ) -> std::result::Result<(i32, String, ConsumerId, Vec<ConsumerGroupMember>), i16> {
+    ) -> std::result::Result<
+        (
+            i32,
+            String,
+            ConsumerId,
+            ConsumerId,
+            Vec<ConsumerGroupMember>,
+        ),
+        i16,
+    > {
+        // Return: (generation_id, protocol_name, leader_id, assigned_member_id, members)
         let now = SystemTime::now();
+
+        // Generate a new member_id if the client sent an empty one (first join)
+        // Kafka protocol: client sends empty memberId on first join, server assigns a unique one
+        let actual_consumer_id = if consumer_id.is_empty() {
+            // Generate unique member_id: <client_id>-<timestamp_nanos>-<random_suffix>
+            let timestamp = now
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let random_suffix: u32 = rand::random();
+            format!("{}-{}-{:08x}", client_id, timestamp, random_suffix)
+        } else {
+            consumer_id
+        };
 
         // Get or create group
         let mut group_ref =
@@ -618,14 +642,14 @@ impl ConsumerGroupCoordinator {
         debug!(
             "Extracted {} subscribed topics for consumer {}: {:?}",
             subscribed_topics.len(),
-            consumer_id,
+            actual_consumer_id,
             subscribed_topics
         );
 
         // Add or update member
-        let is_new_member = !group_ref.members.contains_key(&consumer_id);
+        let is_new_member = !group_ref.members.contains_key(&actual_consumer_id);
         let member = ConsumerGroupMember {
-            consumer_id: consumer_id.clone(),
+            consumer_id: actual_consumer_id.clone(),
             group_id: group_id.clone(),
             client_id,
             client_host,
@@ -637,12 +661,18 @@ impl ConsumerGroupCoordinator {
             is_leader: false,
         };
 
-        group_ref.members.insert(consumer_id.clone(), member);
+        group_ref.members.insert(actual_consumer_id.clone(), member);
 
         // If this is a new member or group was empty, trigger rebalance
+        // IMPORTANT: Only increment generation_id when transitioning TO PreparingRebalance,
+        // not when already in PreparingRebalance (to ensure all consumers get the same generation)
         if is_new_member || group_ref.state == ConsumerGroupState::Empty {
+            // Only increment generation if we're not already in PreparingRebalance state
+            // This ensures all consumers joining during a rebalance get the same generation_id
+            if group_ref.state != ConsumerGroupState::PreparingRebalance {
+                group_ref.generation_id += 1;
+            }
             group_ref.state = ConsumerGroupState::PreparingRebalance;
-            group_ref.generation_id += 1;
             group_ref.state_timestamp = now;
 
             // Select leader (first member or existing leader if still present)
@@ -651,8 +681,8 @@ impl ConsumerGroupCoordinator {
                     .members
                     .contains_key(group_ref.leader_id.as_ref().unwrap())
             {
-                group_ref.leader_id = Some(consumer_id.clone());
-                if let Some(leader_member) = group_ref.members.get_mut(&consumer_id) {
+                group_ref.leader_id = Some(actual_consumer_id.clone());
+                if let Some(leader_member) = group_ref.members.get_mut(&actual_consumer_id) {
                     leader_member.is_leader = true;
                 }
             }
@@ -660,21 +690,43 @@ impl ConsumerGroupCoordinator {
             // Notify state change
             let _ = self.state_change_tx.send(GroupStateChange::MemberJoined {
                 group_id: group_id.clone(),
-                consumer_id: consumer_id.clone(),
+                consumer_id: actual_consumer_id.clone(),
             });
         }
 
-        let leader_id = group_ref.leader_id.clone().unwrap_or_default();
+        // Drop the lock before waiting to allow other members to join
         let generation_id = group_ref.generation_id;
         let protocol_name = group_ref.protocol_name.clone();
+        drop(group_ref);
+
+        // Wait briefly for other members to join before responding
+        // This allows the coordinator to collect all members before sending JoinGroup responses
+        // In production, this should be based on rebalance_timeout_ms, but for simplicity we use a short delay
+        let wait_time_ms = std::cmp::min(100, rebalance_timeout_ms / 10);
+        tokio::time::sleep(std::time::Duration::from_millis(wait_time_ms as u64)).await;
+
+        // Re-acquire the group to get the latest member list
+        let group_ref = self
+            .groups
+            .get(&group_id)
+            .ok_or(error_codes::UNKNOWN_GROUP_ID)?;
+
+        let leader_id = group_ref.leader_id.clone().unwrap_or_default();
         let members: Vec<ConsumerGroupMember> = group_ref.members.values().cloned().collect();
 
         debug!(
-            "JoinGroup returning: group={}, protocol_name={}, generation={}",
-            group_id, protocol_name, generation_id
+            "JoinGroup returning: group={}, protocol_name={}, generation={}, member_id={}, members_count={}",
+            group_id, protocol_name, generation_id, actual_consumer_id, members.len()
         );
 
-        Ok((generation_id, protocol_name, leader_id, members))
+        // Return tuple includes the actual_consumer_id that was assigned to this member
+        Ok((
+            generation_id,
+            protocol_name,
+            leader_id,
+            actual_consumer_id,
+            members,
+        ))
     }
 
     async fn sync_group_internal(
@@ -703,26 +755,31 @@ impl ConsumerGroupCoordinator {
         // Update member's last heartbeat
         member.last_heartbeat = SystemTime::now();
 
-        // If this is the leader, apply assignments to all members
-        if member.is_leader {
-            // If no assignments provided, generate them automatically
-            let final_assignments = if group_assignments.is_empty() {
-                self.generate_partition_assignments(&group_id, &*group_ref)
-                    .await?
-            } else {
-                group_assignments
-            };
+        // If this request contains assignments (from the leader), apply them to all members
+        // Note: In Kafka protocol, only the leader sends non-empty assignments in SyncGroup
+        if !group_assignments.is_empty() {
+            info!(
+                "📝 SyncGroup from consumer '{}': applying {} member assignments to group '{}'",
+                consumer_id,
+                group_assignments.len(),
+                group_id
+            );
 
             // Apply assignments to all members
-            for (member_id, assignment) in final_assignments.iter() {
+            for (member_id, assignment) in group_assignments.iter() {
                 if let Some(target_member) = group_ref.members.get_mut(member_id) {
                     target_member.assigned_partitions = assignment.clone();
-                    debug!(
-                        "Assigned {} partitions to consumer {} in group {}: {:?}",
+                    info!(
+                        "📝 Assigned {} partitions to consumer '{}' in group '{}': {:?}",
                         assignment.len(),
                         member_id,
                         group_id,
                         assignment
+                    );
+                } else {
+                    info!(
+                        "📝 Warning: member '{}' not found in group '{}', skipping assignment",
+                        member_id, group_id
                     );
                 }
             }
@@ -732,24 +789,71 @@ impl ConsumerGroupCoordinator {
             group_ref.state_timestamp = SystemTime::now();
 
             info!(
-                "Group {} transitioned to stable state with {} members",
+                "📝 Group '{}' transitioned to stable state with {} members",
                 group_id,
                 group_ref.members.len()
             );
-
-            // Return this consumer's assignment
-            let assignment = final_assignments
-                .get(&consumer_id)
-                .cloned()
-                .unwrap_or_default();
-
-            Ok(assignment)
-        } else {
-            // Non-leader members wait for assignments from the leader
-            // Return the assignment that was set by the leader during a previous SyncGroup call
-            let assignment = member.assigned_partitions.clone();
-            Ok(assignment)
         }
+
+        // Return this consumer's assignment (from the just-applied assignments or previously stored)
+        // Re-borrow member after assignments are applied
+        let member = group_ref
+            .members
+            .get(&consumer_id)
+            .ok_or(error_codes::UNKNOWN_CONSUMER_ID)?;
+
+        let mut assignment = member.assigned_partitions.clone();
+        let mut is_stable = group_ref.state == ConsumerGroupState::Stable;
+
+        // Drop the lock before potentially waiting
+        drop(group_ref);
+
+        // If the group is not in Stable state and the consumer has no assignment,
+        // wait a bit for the leader's SyncGroup to be processed
+        if !is_stable && assignment.is_empty() {
+            info!(
+                "📝 SyncGroup for consumer '{}': group '{}' not stable yet, waiting for leader's assignment...",
+                consumer_id, group_id
+            );
+
+            // Wait up to 100ms for the leader to apply assignments
+            for _ in 0..10 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+                // Re-check group state
+                if let Some(group_ref) = self.groups.get(&group_id) {
+                    if group_ref.state == ConsumerGroupState::Stable {
+                        // Group became stable, get the assignment
+                        if let Some(member) = group_ref.members.get(&consumer_id) {
+                            assignment = member.assigned_partitions.clone();
+                            is_stable = true;
+                            info!(
+                                "📝 SyncGroup for consumer '{}': group became stable, got {} partitions",
+                                consumer_id, assignment.len()
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // After waiting, if still no assignment, return REBALANCE_IN_PROGRESS
+        if !is_stable && assignment.is_empty() {
+            info!(
+                "📝 SyncGroup response for consumer '{}': group '{}' still not stable after waiting, returning REBALANCE_IN_PROGRESS",
+                consumer_id, group_id
+            );
+            return Err(error_codes::REBALANCE_IN_PROGRESS);
+        }
+
+        info!(
+            "📝 SyncGroup response for consumer '{}': returning {} partitions",
+            consumer_id,
+            assignment.len()
+        );
+
+        Ok(assignment)
     }
 
     async fn heartbeat_internal(
@@ -1048,6 +1152,7 @@ impl ConsumerGroupCoordinator {
     }
 
     /// Generate partition assignments automatically based on group's subscribed topics
+    #[allow(dead_code)]
     async fn generate_partition_assignments(
         &self,
         group_id: &ConsumerGroupId,

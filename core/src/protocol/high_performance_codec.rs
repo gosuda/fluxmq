@@ -83,7 +83,7 @@ impl HighPerformanceKafkaCodec {
 
         // 2. ApiKeys (standard array) - NOT compact array
         // Standard array: length as SIGNED int32, not unsigned
-        buf.put_i32(20); // Number of API entries as SIGNED int32 (Kafka protocol requirement)
+        buf.put_i32(35); // Number of API entries as SIGNED int32 (Kafka protocol requirement)
 
         // Add supported API versions - use conservative versions for compatibility
         let apis = [
@@ -91,22 +91,41 @@ impl HighPerformanceKafkaCodec {
             (1, 0, 11),         // Fetch (conservative v11)
             (2, 0, 5),          // ListOffsets (conservative v5)
             (3, 0, 8),          // Metadata (v8 - Java 4.1 compatibility)
-            (8, 0, 6),          // OffsetCommit (conservative v6)
-            (9, 0, 5),          // OffsetFetch (conservative v5)
-            (10, 0, 3),         // FindCoordinator (conservative v3)
-            (11, 0, 5),         // JoinGroup (conservative v5)
-            (12, 0, 4),         // Heartbeat (Java SDK supports v0-4)
-            (13, 0, 2),         // LeaveGroup (conservative v2)
-            (14, 0, 3),         // SyncGroup (conservative v3)
-            (15, 0, 4),         // DescribeGroups (conservative v4)
-            (16, 0, 3),         // ListGroups (conservative v3)
-            (17, 0, 1),         // SaslHandshake
-            (18, 0, 3),         // ApiVersions (v3 max for compatibility)
-            (19, 0, 4),         // CreateTopics (conservative v4)
-            (20, 0, 3),         // DeleteTopics (conservative v3)
-            (32, 0, 3),         // DescribeConfigs (conservative v3)
-            (33, 0, 2),         // AlterConfigs (conservative v2)
-            (36, 0, 2),         // SaslAuthenticate (required for Java)
+            // Cluster Coordination APIs (Inter-broker communication)
+            (4, 0, 7),  // LeaderAndIsr (v0-v7)
+            (5, 0, 4),  // StopReplica (v0-v4)
+            (6, 0, 8),  // UpdateMetadata (v0-v8)
+            (7, 0, 3),  // ControlledShutdown (v0-v3)
+            (8, 0, 3),  // OffsetCommit (v3 - last version with retention_time_ms)
+            (9, 0, 5),  // OffsetFetch (conservative v5)
+            (10, 0, 2), // FindCoordinator (v2 - non-flexible for Java compatibility)
+            (11, 0, 5), // JoinGroup (conservative v5)
+            (12, 0, 3), // Heartbeat (v4 is flexible, downgrade to v3 for compatibility)
+            (13, 0, 2), // LeaveGroup (conservative v2)
+            (14, 0, 3), // SyncGroup (conservative v3)
+            (15, 0, 4), // DescribeGroups (conservative v4)
+            (16, 0, 3), // ListGroups (conservative v3)
+            (17, 0, 1), // SaslHandshake
+            (18, 0, 3), // ApiVersions (v3 max for compatibility)
+            (19, 0, 4), // CreateTopics (conservative v4)
+            (20, 0, 3), // DeleteTopics (conservative v3)
+            // Additional Admin APIs
+            (21, 0, 2), // DeleteRecords (v0-v2)
+            // Transaction APIs (exactly-once semantics) - supports latest versions
+            (22, 0, 4), // InitProducerId (v0-v4, v2+ uses flexible encoding with tagged fields)
+            (24, 0, 3), // AddPartitionsToTxn (v0-v3, v2+ uses flexible encoding)
+            (25, 0, 3), // AddOffsetsToTxn (v0-v3, v2+ uses flexible encoding)
+            (26, 0, 3), // EndTxn (v0-v3, v2+ uses flexible encoding)
+            (27, 0, 1), // WriteTxnMarkers (v0-v1)
+            (28, 0, 3), // TxnOffsetCommit (v0-v3)
+            (32, 0, 3), // DescribeConfigs (conservative v3)
+            (33, 0, 2), // AlterConfigs (conservative v2)
+            (36, 0, 2), // SaslAuthenticate (required for Java)
+            // Additional Admin APIs
+            (37, 0, 3), // CreatePartitions (v0-v3)
+            (42, 0, 2), // DeleteGroups (v0-v2)
+            (44, 0, 1), // IncrementalAlterConfigs (v0-v1)
+            (45, 0, 0), // AlterPartitionReassignments (v0)
         ];
 
         for (api_key, min_version, max_version) in apis {
@@ -128,11 +147,20 @@ impl HighPerformanceKafkaCodec {
 
     /// Build ApiVersions response v3+ using flexible format (KIP-482)
     /// This is required for rdkafka and other strict Kafka clients
+    ///
+    /// CRITICAL: ApiVersions response header is SPECIAL - it uses ResponseHeaderV0
+    /// (just correlation_id, no tagged fields) for ALL versions including v3+.
+    /// This is because ApiVersions is the version negotiation API itself.
+    /// See KIP-482 for details.
     fn build_api_versions_response_v3(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(200);
 
-        // Response header: correlation_id (will be patched at runtime)
+        // CRITICAL FIX: ApiVersions response ALWAYS uses ResponseHeaderV0
+        // (correlation_id only, NO tagged fields) even for v3+ responses.
+        // This is a special case in Kafka protocol - ApiVersions negotiates versions,
+        // so its own response header format must be known without version negotiation.
         buf.put_i32(0); // Correlation ID placeholder
+                        // NO tagged fields for ApiVersions response header!
 
         // FLEXIBLE FORMAT (KIP-482):
         // 1. ErrorCode (int16)
@@ -140,8 +168,9 @@ impl HighPerformanceKafkaCodec {
 
         // 2. ApiKeys - COMPACT ARRAY (varint length + 1)
         // Compact array: length is encoded as unsigned varint, value is length + 1
-        let num_apis = 20u32;
-        self.put_unsigned_varint(&mut buf, num_apis + 1); // 20 + 1 = 21
+        // 34 APIs: 0-22 (skip 23), 24-28, 32-33, 36, 37, 42, 44
+        let num_apis = 34u32;
+        self.put_unsigned_varint(&mut buf, num_apis + 1); // 34 + 1 = 35
 
         // Add supported API versions
         let apis = [
@@ -149,22 +178,40 @@ impl HighPerformanceKafkaCodec {
             (1, 0, 11),         // Fetch
             (2, 0, 5),          // ListOffsets
             (3, 0, 8),          // Metadata
-            (8, 0, 6),          // OffsetCommit
-            (9, 0, 5),          // OffsetFetch
-            (10, 0, 3),         // FindCoordinator
-            (11, 0, 5),         // JoinGroup
-            (12, 0, 4),         // Heartbeat
-            (13, 0, 2),         // LeaveGroup
-            (14, 0, 3),         // SyncGroup
-            (15, 0, 4),         // DescribeGroups
-            (16, 0, 3),         // ListGroups
-            (17, 0, 1),         // SaslHandshake
-            (18, 0, 3),         // ApiVersions
-            (19, 0, 4),         // CreateTopics
-            (20, 0, 3),         // DeleteTopics
-            (32, 0, 3),         // DescribeConfigs
-            (33, 0, 2),         // AlterConfigs
-            (36, 0, 2),         // SaslAuthenticate
+            // Cluster Coordination APIs (Inter-broker communication)
+            (4, 0, 7),  // LeaderAndIsr (v0-v7)
+            (5, 0, 4),  // StopReplica (v0-v4)
+            (6, 0, 8),  // UpdateMetadata (v0-v8)
+            (7, 0, 3),  // ControlledShutdown (v0-v3)
+            (8, 0, 3),  // OffsetCommit (v3 - last version with retention_time_ms)
+            (9, 0, 5),  // OffsetFetch
+            (10, 0, 2), // FindCoordinator (v2 - non-flexible)
+            (11, 0, 5), // JoinGroup
+            (12, 0, 3), // Heartbeat (v4 is flexible, use v3)
+            (13, 0, 2), // LeaveGroup
+            (14, 0, 3), // SyncGroup
+            (15, 0, 4), // DescribeGroups
+            (16, 0, 3), // ListGroups
+            (17, 0, 1), // SaslHandshake
+            (18, 0, 4), // ApiVersions (v4 adds ZkMigrationReady field)
+            (19, 0, 4), // CreateTopics
+            (20, 0, 3), // DeleteTopics
+            // Additional Admin APIs
+            (21, 0, 2), // DeleteRecords (v0-v2)
+            // Transaction APIs (exactly-once semantics) - supports latest versions
+            (22, 0, 4), // InitProducerId (v0-v4, v2+ uses flexible encoding with tagged fields)
+            (24, 0, 3), // AddPartitionsToTxn (v0-v3, v2+ uses flexible encoding)
+            (25, 0, 3), // AddOffsetsToTxn (v0-v3, v2+ uses flexible encoding)
+            (26, 0, 3), // EndTxn (v0-v3, v2+ uses flexible encoding)
+            (27, 0, 1), // WriteTxnMarkers (v0-v1)
+            (28, 0, 3), // TxnOffsetCommit (v0-v3)
+            (32, 0, 3), // DescribeConfigs
+            (33, 0, 2), // AlterConfigs
+            (36, 0, 2), // SaslAuthenticate
+            // Additional Admin APIs
+            (37, 0, 3), // CreatePartitions (v0-v3)
+            (42, 0, 2), // DeleteGroups (v0-v2)
+            (44, 0, 1), // IncrementalAlterConfigs (v0-v1)
         ];
 
         for (api_key, min_version, max_version) in apis {
@@ -178,7 +225,23 @@ impl HighPerformanceKafkaCodec {
         // 3. ThrottleTimeMs (int32)
         buf.put_i32(0);
 
-        // 4. Tagged fields section (required in flexible versions)
+        // 4. SupportedFeatures (compact array) - v3+ required
+        // Empty array: compact array length of 1 means 0 elements (length + 1 encoding)
+        self.put_unsigned_varint(&mut buf, 1); // 0 + 1 = 1 means empty array
+
+        // 5. FinalizedFeaturesEpoch (int64) - v3+ required
+        // -1 means no epoch set
+        buf.put_i64(-1);
+
+        // 6. FinalizedFeatures (compact array) - v3+ required
+        // Empty array
+        self.put_unsigned_varint(&mut buf, 1); // 0 + 1 = 1 means empty array
+
+        // 7. ZkMigrationReady (boolean) - v4+ required
+        // false = 0
+        buf.put_u8(0);
+
+        // 8. Tagged fields section (required in flexible versions)
         buf.put_u8(0); // Empty tagged fields (TAG_BUFFER with 0 tags)
 
         buf.freeze()
@@ -205,18 +268,19 @@ impl HighPerformanceKafkaCodec {
     }
 
     /// Ultra-fast ApiVersions response using pre-compiled template
-    /// Automatically selects flexible (v3+) or non-flexible (v0-v2) format
+    /// ALWAYS uses non-flexible (v0-v2) format for maximum Java client compatibility
     pub fn encode_api_versions_fast(&self, correlation_id: i32, api_version: i16) -> Bytes {
         self.fast_path_hits
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // Select appropriate template based on API version
-        // v3+ requires flexible format with compact arrays and tagged fields
-        let template = if api_version >= 3 {
-            &self.api_versions_response_v3
-        } else {
-            &self.api_versions_response
-        };
+        // CRITICAL FIX: ALWAYS use non-flexible (v2) format for ApiVersions response
+        // regardless of request version. This ensures Java client compatibility.
+        // The Java Kafka client has parsing issues with flexible format compact arrays
+        // in ApiVersions responses. Using v2 format works reliably.
+        //
+        // Note: api_version parameter is kept for logging/debugging but ignored for format selection
+        let _ = api_version; // Suppress unused warning
+        let template = &self.api_versions_response; // Always use v2 non-flexible format
 
         // SAFETY: Clone the template to avoid bounds issues
         let template_len = template.len();

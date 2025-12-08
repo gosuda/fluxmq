@@ -44,8 +44,10 @@ use tracing::{debug, error, info, trace, warn};
 use crate::protocol::{Message, Offset, PartitionId, TopicName};
 use crate::{FluxmqError, Result};
 use crossbeam::channel;
+use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -106,16 +108,42 @@ pub struct MessageNotification {
     pub message_count: usize,
 }
 
+/// High-performance in-memory storage using DashMap for fine-grained locking
+///
+/// Key optimization: Uses (topic, partition) composite key with DashMap
+/// for lock-free concurrent access to different partitions.
 #[derive(Debug)]
 pub struct InMemoryStorage {
-    topics: Arc<RwLock<HashMap<TopicName, Topic>>>,
+    /// Partition data indexed by (topic, partition) - enables concurrent access
+    partitions: Arc<DashMap<(TopicName, PartitionId), PartitionData>>,
+    /// Topic metadata for listing topics/partitions
+    topic_partitions: Arc<DashMap<TopicName, Vec<PartitionId>>>,
 }
 
+/// Partition data with atomic offset counter for lock-free updates
+#[derive(Debug)]
+pub struct PartitionData {
+    messages: parking_lot::RwLock<Vec<(Offset, Message)>>,
+    next_offset: AtomicU64,
+}
+
+impl PartitionData {
+    fn new() -> Self {
+        Self {
+            messages: parking_lot::RwLock::new(Vec::new()),
+            next_offset: AtomicU64::new(0),
+        }
+    }
+}
+
+// Legacy types for backward compatibility (used by HybridStorage internals)
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct Topic {
     partitions: HashMap<PartitionId, Partition>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct Partition {
     messages: Vec<(Offset, Message)>,
@@ -125,10 +153,15 @@ pub struct Partition {
 impl InMemoryStorage {
     pub fn new() -> Self {
         Self {
-            topics: Arc::new(RwLock::new(HashMap::new())),
+            partitions: Arc::new(DashMap::new()),
+            topic_partitions: Arc::new(DashMap::new()),
         }
     }
 
+    /// High-performance append using DashMap's fine-grained locking
+    ///
+    /// Optimization: Each partition has its own lock, allowing concurrent
+    /// writes to different partitions without contention.
     pub fn append_messages(
         &self,
         topic: &str,
@@ -140,29 +173,30 @@ impl InMemoryStorage {
             return Ok(0);
         }
 
-        let mut topics = self.topics.write();
-        let topic_data = topics
-            .entry(topic.to_string())
-            .or_insert_with(|| Topic::new());
+        let key = (topic.to_string(), partition);
 
-        let partition_data = topic_data
+        // Get or create partition data - DashMap handles concurrent access
+        let partition_data = self
             .partitions
-            .entry(partition)
-            .or_insert_with(|| Partition::new());
+            .entry(key)
+            .or_insert_with(PartitionData::new);
 
-        let base_offset = partition_data.next_offset;
+        // Optimization: Relaxed ordering sufficient for single counter
+        let base_offset = partition_data
+            .next_offset
+            .fetch_add(message_count as u64, Ordering::Relaxed);
 
-        // Pre-allocate capacity for batch processing
-        partition_data.messages.reserve(message_count);
+        // Only lock the messages vec for the actual append
+        {
+            let mut msgs = partition_data.messages.write();
+            msgs.reserve(message_count);
 
-        // Batch process messages for better performance
-        let mut current_offset = base_offset;
-        for message in messages {
-            partition_data.messages.push((current_offset, message));
-            current_offset += 1;
+            let mut current_offset = base_offset;
+            for message in messages {
+                msgs.push((current_offset, message));
+                current_offset += 1;
+            }
         }
-
-        partition_data.next_offset = current_offset;
 
         Ok(base_offset)
     }
@@ -174,37 +208,33 @@ impl InMemoryStorage {
         offset: Offset,
         max_bytes: u32,
     ) -> Result<Vec<(Offset, Message)>> {
-        let topics = self.topics.read();
-        let topic_data = match topics.get(topic) {
-            Some(t) => t,
-            None => return Ok(vec![]),
+        let key = (topic.to_string(), partition);
+
+        let partition_data = match self.partitions.get(&key) {
+            Some(p) => p,
+            None => {
+                return Ok(vec![]);
+            }
         };
 
-        let partition_data = match topic_data.partitions.get(&partition) {
-            Some(p) => p,
-            None => return Ok(vec![]),
-        };
+        let msgs = partition_data.messages.read();
 
         // Optimized binary search for offset positioning
-        let start_idx = partition_data
-            .messages
+        let start_idx = msgs
             .binary_search_by_key(&offset, |(msg_offset, _)| *msg_offset)
             .unwrap_or_else(|idx| idx);
 
-        if start_idx >= partition_data.messages.len() {
+        if start_idx >= msgs.len() {
             return Ok(vec![]);
         }
 
         // Pre-allocate result vector with estimated capacity
-        let mut result = Vec::with_capacity(std::cmp::min(
-            1024,
-            partition_data.messages.len() - start_idx,
-        ));
+        let mut result = Vec::with_capacity(std::cmp::min(1024, msgs.len() - start_idx));
         let mut total_bytes = 0usize;
         let max_bytes = max_bytes as usize;
 
         // Efficient batch collection with size limiting
-        for (msg_offset, message) in &partition_data.messages[start_idx..] {
+        for (msg_offset, message) in &msgs[start_idx..] {
             let message_size =
                 message.value.len() + message.key.as_ref().map(|k| k.len()).unwrap_or(0);
 
@@ -225,25 +255,25 @@ impl InMemoryStorage {
     }
 
     pub fn get_topics(&self) -> Vec<TopicName> {
-        let topics = self.topics.read();
-        topics.keys().cloned().collect()
+        self.topic_partitions
+            .iter()
+            .map(|r| r.key().clone())
+            .collect()
     }
 
     pub fn get_partitions(&self, topic: &str) -> Vec<PartitionId> {
-        let topics = self.topics.read();
-        match topics.get(topic) {
-            Some(topic_data) => topic_data.partitions.keys().cloned().collect(),
-            None => vec![],
-        }
+        self.topic_partitions
+            .get(topic)
+            .map(|r| r.value().clone())
+            .unwrap_or_default()
     }
 
     pub fn get_latest_offset(&self, topic: &str, partition: PartitionId) -> Option<Offset> {
-        let topics = self.topics.read();
-        topics
-            .get(topic)?
-            .partitions
-            .get(&partition)
-            .map(|p| p.next_offset)
+        let key = (topic.to_string(), partition);
+        // Relaxed is sufficient - we only need to read a monotonically increasing counter
+        self.partitions
+            .get(&key)
+            .map(|p| p.next_offset.load(Ordering::Relaxed))
     }
 
     /// Find offset for a given timestamp
@@ -253,34 +283,34 @@ impl InMemoryStorage {
         partition: PartitionId,
         timestamp: u64,
     ) -> Option<Offset> {
-        let topics = self.topics.read();
-        let partition_data = topics.get(topic)?.partitions.get(&partition)?;
+        let key = (topic.to_string(), partition);
+        let partition_data = self.partitions.get(&key)?;
+        let msgs = partition_data.messages.read();
 
         // Find the first message with timestamp >= target timestamp
-        for (offset, message) in &partition_data.messages {
+        for (offset, message) in msgs.iter() {
             if message.timestamp >= timestamp {
                 return Some(*offset);
             }
         }
 
         // If no message found with timestamp >= target, return latest offset
-        Some(partition_data.next_offset)
+        // Relaxed is sufficient for reading monotonically increasing counter
+        Some(partition_data.next_offset.load(Ordering::Relaxed))
     }
 
     /// Get earliest offset (first available offset)
     pub fn get_earliest_offset(&self, topic: &str, partition: PartitionId) -> Option<Offset> {
-        let topics = self.topics.read();
-        let partition_data = topics.get(topic)?.partitions.get(&partition)?;
+        let key = (topic.to_string(), partition);
+        let partition_data = self.partitions.get(&key)?;
+        let msgs = partition_data.messages.read();
 
         // Return the offset of the first message, or 0 if no messages
-        partition_data
-            .messages
-            .first()
-            .map(|(offset, _)| *offset)
-            .or(Some(0))
+        msgs.first().map(|(offset, _)| *offset).or(Some(0))
     }
 }
 
+#[allow(dead_code)]
 impl Topic {
     fn new() -> Self {
         Self {
@@ -289,6 +319,7 @@ impl Topic {
     }
 }
 
+#[allow(dead_code)]
 impl Partition {
     fn new() -> Self {
         Self {
@@ -632,6 +663,11 @@ impl HybridStorage {
         let memory_result = self
             .memory
             .fetch_messages(topic, partition, offset, max_bytes)?;
+
+        tracing::info!(
+            "🔍 FETCH DEBUG: topic={}, partition={}, offset={}, max_bytes={}, memory_result_count={}",
+            topic, partition, offset, max_bytes, memory_result.len()
+        );
 
         if !memory_result.is_empty() {
             return self.decompress_messages(memory_result);

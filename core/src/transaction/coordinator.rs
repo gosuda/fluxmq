@@ -165,6 +165,7 @@ impl TransactionCoordinator {
             producer_id,
             producer_epoch,
             throttle_time_ms: 0,
+            api_version: request.header.api_version,
         })
     }
 
@@ -235,6 +236,7 @@ impl TransactionCoordinator {
 
         Ok(AddPartitionsToTxnResponse {
             correlation_id: request.header.correlation_id,
+            api_version: request.header.api_version,
             throttle_time_ms: 0,
             results,
         })
@@ -370,6 +372,7 @@ impl TransactionCoordinator {
 
         Ok(EndTxnResponse {
             correlation_id: request.header.correlation_id,
+            api_version: request.header.api_version,
             throttle_time_ms: 0,
             error_code,
         })

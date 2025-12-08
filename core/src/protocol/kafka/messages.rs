@@ -69,6 +69,7 @@ pub struct KafkaPartitionProduceData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaProduceResponse {
     pub header: KafkaResponseHeader,
+    pub api_version: i16, // Needed for flexible versions encoding
     pub responses: Vec<KafkaTopicProduceResponse>,
     pub throttle_time_ms: i32,
 }
@@ -189,6 +190,7 @@ pub struct KafkaListOffsetsPartition {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaListOffsetsResponse {
     pub header: KafkaResponseHeader,
+    pub api_version: i16, // Needed for flexible versions encoding
     pub throttle_time_ms: i32,
     pub topics: Vec<KafkaListOffsetsTopicResponse>,
 }
@@ -286,6 +288,7 @@ pub struct KafkaJoinGroupProtocol {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaJoinGroupResponse {
     pub header: KafkaResponseHeader,
+    pub api_version: i16,
     pub throttle_time_ms: i32,
     pub error_code: i16,
     pub generation_id: i32,
@@ -311,9 +314,10 @@ pub struct KafkaJoinGroupMember {
 pub struct KafkaOffsetCommitRequest {
     pub header: KafkaRequestHeader,
     pub group_id: String,
-    pub generation_id: i32,
-    pub consumer_id: String,
-    pub retention_time_ms: i64,
+    pub generation_id: i32,  // v1+: generation ID (member epoch in v9+)
+    pub consumer_id: String, // v1+: member ID
+    pub group_instance_id: Option<String>, // v7+: static member instance ID
+    pub retention_time_ms: i64, // v2-v4 only
     pub topics: Vec<KafkaOffsetCommitTopic>,
 }
 
@@ -327,13 +331,15 @@ pub struct KafkaOffsetCommitTopic {
 pub struct KafkaOffsetCommitPartition {
     pub partition: i32,
     pub offset: i64,
-    pub timestamp: i64,
+    pub committed_leader_epoch: i32, // v6+: leader epoch for fencing (-1 if unknown)
+    pub timestamp: i64,              // v1 only (deprecated)
     pub metadata: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaOffsetCommitResponse {
     pub header: KafkaResponseHeader,
+    pub api_version: i16, // Needed for flexible versions encoding
     pub throttle_time_ms: i32,
     pub topics: Vec<KafkaOffsetCommitTopicResponse>,
 }
@@ -370,6 +376,7 @@ pub struct KafkaOffsetFetchTopic {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaOffsetFetchResponse {
     pub header: KafkaResponseHeader,
+    pub api_version: i16, // Needed for flexible versions encoding
     pub throttle_time_ms: i32,
     pub topics: Vec<KafkaOffsetFetchTopicResponse>,
     pub error_code: i16,
@@ -404,6 +411,7 @@ pub struct KafkaFindCoordinatorRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaFindCoordinatorResponse {
     pub header: KafkaResponseHeader,
+    pub api_version: i16, // Added for flexible version encoding
     pub throttle_time_ms: i32,
     pub error_code: i16,
     pub error_message: Option<String>,
@@ -425,6 +433,7 @@ pub struct KafkaListGroupsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaListGroupsResponse {
     pub header: KafkaResponseHeader,
+    pub api_version: i16, // Needed for flexible versions encoding
     pub throttle_time_ms: i32,
     pub error_code: i16,
     pub groups: Vec<KafkaListedGroup>,
@@ -453,6 +462,7 @@ pub struct KafkaHeartbeatRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaHeartbeatResponse {
     pub header: KafkaResponseHeader,
+    pub api_version: i16, // Needed for flexible versions encoding
     pub throttle_time_ms: i32,
     pub error_code: i16,
 }
@@ -472,6 +482,7 @@ pub struct KafkaLeaveGroupRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaLeaveGroupResponse {
     pub header: KafkaResponseHeader,
+    pub api_version: i16, // Needed for flexible versions encoding
     pub throttle_time_ms: i32,
     pub error_code: i16,
 }
@@ -523,6 +534,7 @@ pub struct KafkaDescribeGroupsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaDescribeGroupsResponse {
     pub header: KafkaResponseHeader,
+    pub api_version: i16, // Needed for flexible versions encoding
     pub throttle_time_ms: i32,
     pub groups: Vec<KafkaDescribedGroup>,
 }
@@ -604,6 +616,7 @@ pub enum KafkaRequest {
     DeleteTopics(KafkaDeleteTopicsRequest),
     DescribeConfigs(KafkaDescribeConfigsRequest),
     AlterConfigs(KafkaAlterConfigsRequest),
+    IncrementalAlterConfigs(KafkaIncrementalAlterConfigsRequest),
     SaslHandshake(KafkaSaslHandshakeRequest),
     SaslAuthenticate(KafkaSaslAuthenticateRequest),
     GetTelemetrySubscriptions(KafkaGetTelemetrySubscriptionsRequest),
@@ -614,6 +627,11 @@ pub enum KafkaRequest {
     EndTxn(KafkaEndTxnRequest),
     WriteTxnMarkers(KafkaWriteTxnMarkersRequest),
     TxnOffsetCommit(KafkaTxnOffsetCommitRequest),
+    // Admin APIs
+    DeleteRecords(KafkaDeleteRecordsRequest),
+    CreatePartitions(KafkaCreatePartitionsRequest),
+    DeleteGroups(KafkaDeleteGroupsRequest),
+    AlterPartitionReassignments(KafkaAlterPartitionReassignmentsRequest),
 }
 
 /// Unified Kafka response enum
@@ -641,6 +659,7 @@ pub enum KafkaResponse {
     DeleteTopics(KafkaDeleteTopicsResponse),
     DescribeConfigs(KafkaDescribeConfigsResponse),
     AlterConfigs(KafkaAlterConfigsResponse),
+    IncrementalAlterConfigs(KafkaIncrementalAlterConfigsResponse),
     SaslHandshake(KafkaSaslHandshakeResponse),
     SaslAuthenticate(KafkaSaslAuthenticateResponse),
     GetTelemetrySubscriptions(KafkaGetTelemetrySubscriptionsResponse),
@@ -651,6 +670,11 @@ pub enum KafkaResponse {
     EndTxn(KafkaEndTxnResponse),
     WriteTxnMarkers(KafkaWriteTxnMarkersResponse),
     TxnOffsetCommit(KafkaTxnOffsetCommitResponse),
+    // Admin APIs
+    DeleteRecords(KafkaDeleteRecordsResponse),
+    CreatePartitions(KafkaCreatePartitionsResponse),
+    DeleteGroups(KafkaDeleteGroupsResponse),
+    AlterPartitionReassignments(KafkaAlterPartitionReassignmentsResponse),
 }
 
 impl KafkaRequest {
@@ -679,6 +703,7 @@ impl KafkaRequest {
             KafkaRequest::DeleteTopics(_) => 20,
             KafkaRequest::DescribeConfigs(_) => 32,
             KafkaRequest::AlterConfigs(_) => 33,
+            KafkaRequest::IncrementalAlterConfigs(_) => 44,
             KafkaRequest::SaslHandshake(_) => 17,
             KafkaRequest::SaslAuthenticate(_) => 36,
             KafkaRequest::GetTelemetrySubscriptions(_) => 71,
@@ -688,6 +713,10 @@ impl KafkaRequest {
             KafkaRequest::EndTxn(_) => 26,
             KafkaRequest::WriteTxnMarkers(_) => 27,
             KafkaRequest::TxnOffsetCommit(_) => 28,
+            KafkaRequest::DeleteRecords(_) => 21,
+            KafkaRequest::CreatePartitions(_) => 37,
+            KafkaRequest::DeleteGroups(_) => 42,
+            KafkaRequest::AlterPartitionReassignments(_) => 45,
         }
     }
 
@@ -716,6 +745,7 @@ impl KafkaRequest {
             KafkaRequest::DeleteTopics(req) => req.correlation_id,
             KafkaRequest::DescribeConfigs(req) => req.correlation_id,
             KafkaRequest::AlterConfigs(req) => req.correlation_id,
+            KafkaRequest::IncrementalAlterConfigs(req) => req.correlation_id,
             KafkaRequest::SaslHandshake(req) => req.correlation_id,
             KafkaRequest::SaslAuthenticate(req) => req.correlation_id,
             KafkaRequest::GetTelemetrySubscriptions(req) => req.header.correlation_id,
@@ -725,6 +755,10 @@ impl KafkaRequest {
             KafkaRequest::EndTxn(req) => req.header.correlation_id,
             KafkaRequest::WriteTxnMarkers(req) => req.header.correlation_id,
             KafkaRequest::TxnOffsetCommit(req) => req.header.correlation_id,
+            KafkaRequest::DeleteRecords(req) => req.header.correlation_id,
+            KafkaRequest::CreatePartitions(req) => req.header.correlation_id,
+            KafkaRequest::DeleteGroups(req) => req.header.correlation_id,
+            KafkaRequest::AlterPartitionReassignments(req) => req.header.correlation_id,
         }
     }
 
@@ -753,6 +787,7 @@ impl KafkaRequest {
             KafkaRequest::DeleteTopics(_) => 0, // No header in DeleteTopics, use default
             KafkaRequest::DescribeConfigs(req) => req.api_version,
             KafkaRequest::AlterConfigs(req) => req.api_version,
+            KafkaRequest::IncrementalAlterConfigs(req) => req.api_version,
             KafkaRequest::SaslHandshake(_) => 0, // No header in SASL, use default
             KafkaRequest::SaslAuthenticate(_) => 0, // No header in SASL, use default
             KafkaRequest::GetTelemetrySubscriptions(req) => req.header.api_version,
@@ -762,6 +797,10 @@ impl KafkaRequest {
             KafkaRequest::EndTxn(req) => req.header.api_version,
             KafkaRequest::WriteTxnMarkers(req) => req.header.api_version,
             KafkaRequest::TxnOffsetCommit(req) => req.header.api_version,
+            KafkaRequest::DeleteRecords(req) => req.header.api_version,
+            KafkaRequest::CreatePartitions(req) => req.header.api_version,
+            KafkaRequest::DeleteGroups(req) => req.header.api_version,
+            KafkaRequest::AlterPartitionReassignments(req) => req.header.api_version,
         }
     }
 }
@@ -788,6 +827,7 @@ impl KafkaResponse {
             KafkaResponse::DeleteTopics(resp) => resp.correlation_id,
             KafkaResponse::DescribeConfigs(resp) => resp.correlation_id,
             KafkaResponse::AlterConfigs(resp) => resp.correlation_id,
+            KafkaResponse::IncrementalAlterConfigs(resp) => resp.correlation_id,
             KafkaResponse::SaslHandshake(resp) => resp.correlation_id,
             KafkaResponse::SaslAuthenticate(resp) => resp.correlation_id,
             KafkaResponse::LeaderAndIsr(resp) => resp.header.correlation_id,
@@ -801,6 +841,10 @@ impl KafkaResponse {
             KafkaResponse::EndTxn(resp) => resp.correlation_id,
             KafkaResponse::WriteTxnMarkers(resp) => resp.correlation_id,
             KafkaResponse::TxnOffsetCommit(resp) => resp.correlation_id,
+            KafkaResponse::DeleteRecords(resp) => resp.header.correlation_id,
+            KafkaResponse::CreatePartitions(resp) => resp.header.correlation_id,
+            KafkaResponse::DeleteGroups(resp) => resp.header.correlation_id,
+            KafkaResponse::AlterPartitionReassignments(resp) => resp.header.correlation_id,
         }
     }
 }
@@ -844,6 +888,7 @@ pub struct KafkaCreatableTopicConfigs {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaCreateTopicsResponse {
     pub header: KafkaResponseHeader,
+    pub api_version: i16, // Needed for flexible versions encoding (v5+)
     pub throttle_time_ms: i32,
     pub topics: Vec<KafkaCreatableTopicResult>,
 }
@@ -868,6 +913,7 @@ pub struct KafkaCreatableTopicResult {
 pub struct KafkaDeleteTopicsRequest {
     pub correlation_id: i32,
     pub client_id: Option<String>,
+    pub api_version: i16,
     pub topic_names: Vec<String>,
     pub timeout_ms: i32,
 }
@@ -875,6 +921,7 @@ pub struct KafkaDeleteTopicsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaDeleteTopicsResponse {
     pub correlation_id: i32,
+    pub api_version: i16, // Needed for flexible versions encoding (v4+)
     pub throttle_time_ms: i32,
     pub responses: Vec<DeletableTopicResult>,
 }
@@ -943,6 +990,7 @@ pub struct KafkaConfigResource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaDescribeConfigsResponse {
     pub correlation_id: i32,
+    pub api_version: i16, // Needed for flexible versions encoding (v4+)
     pub throttle_time_ms: i32,
     pub results: Vec<KafkaConfigResourceResult>,
 }
@@ -1005,12 +1053,56 @@ pub struct KafkaAlterableConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaAlterConfigsResponse {
     pub correlation_id: i32,
+    pub api_version: i16, // Needed for flexible versions encoding (v2+)
     pub throttle_time_ms: i32,
     pub responses: Vec<KafkaAlterConfigsResourceResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaAlterConfigsResourceResponse {
+    pub error_code: i16,
+    pub error_message: Option<String>,
+    pub resource_type: i8,
+    pub resource_name: String,
+}
+
+// ============================================================================
+// INCREMENTAL_ALTER_CONFIGS API (ApiKey = 44)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaIncrementalAlterConfigsRequest {
+    pub correlation_id: i32,
+    pub client_id: Option<String>,
+    pub api_version: i16,
+    pub resources: Vec<KafkaIncrementalAlterConfigsResource>,
+    pub validate_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaIncrementalAlterConfigsResource {
+    pub resource_type: i8, // 2 = Topic, 4 = Broker
+    pub resource_name: String,
+    pub configs: Vec<KafkaIncrementalAlterableConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaIncrementalAlterableConfig {
+    pub name: String,
+    pub config_operation: i8, // 0 = SET, 1 = DELETE, 2 = APPEND, 3 = SUBTRACT
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaIncrementalAlterConfigsResponse {
+    pub correlation_id: i32,
+    pub api_version: i16,
+    pub throttle_time_ms: i32,
+    pub responses: Vec<KafkaIncrementalAlterConfigsResourceResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaIncrementalAlterConfigsResourceResponse {
     pub error_code: i16,
     pub error_message: Option<String>,
     pub resource_type: i8,
@@ -1251,8 +1343,10 @@ pub use crate::transaction::messages::InitProducerIdRequest as KafkaInitProducer
 pub use crate::transaction::messages::InitProducerIdResponse as KafkaInitProducerIdResponse;
 
 // AddPartitionsToTxn API (24)
+pub use crate::transaction::messages::AddPartitionsToTxnPartitionResult as KafkaAddPartitionsToTxnPartitionResult;
 pub use crate::transaction::messages::AddPartitionsToTxnRequest as KafkaAddPartitionsToTxnRequest;
 pub use crate::transaction::messages::AddPartitionsToTxnResponse as KafkaAddPartitionsToTxnResponse;
+pub use crate::transaction::messages::AddPartitionsToTxnTopicResult as KafkaAddPartitionsToTxnTopicResult;
 
 // AddOffsetsToTxn API (25)
 pub use crate::transaction::messages::AddOffsetsToTxnRequest as KafkaAddOffsetsToTxnRequest;
@@ -1263,9 +1357,162 @@ pub use crate::transaction::messages::EndTxnRequest as KafkaEndTxnRequest;
 pub use crate::transaction::messages::EndTxnResponse as KafkaEndTxnResponse;
 
 // WriteTxnMarkers API (27)
+pub use crate::transaction::messages::WritableTxnMarkerPartitionResult as KafkaWritableTxnMarkerPartitionResult;
+pub use crate::transaction::messages::WritableTxnMarkerResult as KafkaWritableTxnMarkerResult;
+pub use crate::transaction::messages::WritableTxnMarkerTopicResult as KafkaWritableTxnMarkerTopicResult;
 pub use crate::transaction::messages::WriteTxnMarkersRequest as KafkaWriteTxnMarkersRequest;
 pub use crate::transaction::messages::WriteTxnMarkersResponse as KafkaWriteTxnMarkersResponse;
 
 // TxnOffsetCommit API (28)
 pub use crate::transaction::messages::TxnOffsetCommitRequest as KafkaTxnOffsetCommitRequest;
 pub use crate::transaction::messages::TxnOffsetCommitResponse as KafkaTxnOffsetCommitResponse;
+pub use crate::transaction::messages::TxnOffsetCommitResponsePartition as KafkaTxnOffsetCommitResponsePartition;
+pub use crate::transaction::messages::TxnOffsetCommitResponseTopic as KafkaTxnOffsetCommitResponseTopic;
+
+// ============================================================================
+// DELETE RECORDS API (ApiKey = 21)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDeleteRecordsRequest {
+    pub header: KafkaRequestHeader,
+    pub topics: Vec<KafkaDeleteRecordsTopic>,
+    pub timeout_ms: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDeleteRecordsTopic {
+    pub name: String,
+    pub partitions: Vec<KafkaDeleteRecordsPartition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDeleteRecordsPartition {
+    pub partition: i32,
+    pub offset: i64, // Records before this offset will be deleted
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDeleteRecordsResponse {
+    pub header: KafkaResponseHeader,
+    pub api_version: i16,
+    pub throttle_time_ms: i32,
+    pub topics: Vec<KafkaDeleteRecordsTopicResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDeleteRecordsTopicResult {
+    pub name: String,
+    pub partitions: Vec<KafkaDeleteRecordsPartitionResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDeleteRecordsPartitionResult {
+    pub partition_index: i32,
+    pub low_watermark: i64,
+    pub error_code: i16,
+}
+
+// ============================================================================
+// CREATE PARTITIONS API (ApiKey = 37)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaCreatePartitionsRequest {
+    pub header: KafkaRequestHeader,
+    pub topics: Vec<KafkaCreatePartitionsTopic>,
+    pub timeout_ms: i32,
+    pub validate_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaCreatePartitionsTopic {
+    pub name: String,
+    pub count: i32,                         // Total partition count after creation
+    pub assignments: Option<Vec<Vec<i32>>>, // Each inner Vec is a list of broker IDs for a partition
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaCreatePartitionsResponse {
+    pub header: KafkaResponseHeader,
+    pub api_version: i16,
+    pub throttle_time_ms: i32,
+    pub results: Vec<KafkaCreatePartitionsTopicResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaCreatePartitionsTopicResult {
+    pub name: String,
+    pub error_code: i16,
+    pub error_message: Option<String>,
+}
+
+// ============================================================================
+// DELETE GROUPS API (ApiKey = 42)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDeleteGroupsRequest {
+    pub header: KafkaRequestHeader,
+    pub groups: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDeleteGroupsResponse {
+    pub header: KafkaResponseHeader,
+    pub api_version: i16,
+    pub throttle_time_ms: i32,
+    pub results: Vec<KafkaDeletableGroupResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDeletableGroupResult {
+    pub group_id: String,
+    pub error_code: i16,
+}
+
+// ============================================================================
+// ALTER PARTITION REASSIGNMENTS API (ApiKey = 45)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaAlterPartitionReassignmentsRequest {
+    pub header: KafkaRequestHeader,
+    pub timeout_ms: i32,
+    pub topics: Vec<KafkaReassignableTopic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaReassignableTopic {
+    pub name: String,
+    pub partitions: Vec<KafkaReassignablePartition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaReassignablePartition {
+    pub partition_index: i32,
+    pub replicas: Option<Vec<i32>>, // None to cancel reassignment
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaAlterPartitionReassignmentsResponse {
+    pub header: KafkaResponseHeader,
+    pub api_version: i16,
+    pub throttle_time_ms: i32,
+    pub error_code: i16,
+    pub error_message: Option<String>,
+    pub responses: Vec<KafkaReassignableTopicResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaReassignableTopicResponse {
+    pub name: String,
+    pub partitions: Vec<KafkaReassignablePartitionResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaReassignablePartitionResponse {
+    pub partition_index: i32,
+    pub error_code: i16,
+    pub error_message: Option<String>,
+}

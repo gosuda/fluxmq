@@ -37,6 +37,9 @@ pub struct InitProducerIdResponse {
     pub producer_epoch: i16,
     /// Response throttle time in milliseconds
     pub throttle_time_ms: i32,
+    /// API version (for flexible encoding: v2+ uses flexible format)
+    #[serde(default)]
+    pub api_version: i16,
 }
 
 // ============================================================================
@@ -68,6 +71,8 @@ pub struct AddPartitionsToTxnTopic {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddPartitionsToTxnResponse {
     pub correlation_id: i32,
+    /// API version (needed for flexible encoding in v3+)
+    pub api_version: i16,
     /// Response throttle time in milliseconds
     pub throttle_time_ms: i32,
     /// Results for each topic
@@ -138,6 +143,8 @@ pub struct EndTxnRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndTxnResponse {
     pub correlation_id: i32,
+    /// API version (needed for flexible encoding in v3+)
+    pub api_version: i16,
     /// Response throttle time in milliseconds
     pub throttle_time_ms: i32,
     /// Error code (0 = success)

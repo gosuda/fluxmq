@@ -53,7 +53,7 @@ impl ApiVersionRegistry {
         registry.register(3, 0, 9); // Metadata: v0-v9 (v9 is latest as of Kafka 2.8)
 
         // Consumer group APIs
-        registry.register(10, 0, 3); // FindCoordinator: v0-v3
+        registry.register(10, 0, 2); // FindCoordinator: v0-v2 (non-flexible for Java compatibility)
         registry.register(11, 0, 5); // JoinGroup: v0-v5
         registry.register(12, 0, 3); // Heartbeat: v0-v3
         registry.register(13, 0, 2); // LeaveGroup: v0-v2
@@ -86,6 +86,18 @@ impl ApiVersionRegistry {
         registry.register(26, 0, 3); // EndTxn: v0-v3
         registry.register(27, 0, 1); // WriteTxnMarkers: v0-v1
         registry.register(28, 0, 3); // TxnOffsetCommit: v0-v3
+
+        // Additional Admin APIs
+        registry.register(21, 0, 2); // DeleteRecords: v0-v2
+        registry.register(37, 0, 3); // CreatePartitions: v0-v3
+        registry.register(42, 0, 2); // DeleteGroups: v0-v2
+        registry.register(45, 0, 0); // AlterPartitionReassignments: v0
+
+        // Cluster Coordination APIs (Inter-broker communication)
+        registry.register(4, 0, 7); // LeaderAndIsr: v0-v7
+        registry.register(5, 0, 4); // StopReplica: v0-v4
+        registry.register(6, 0, 8); // UpdateMetadata: v0-v8
+        registry.register(7, 0, 3); // ControlledShutdown: v0-v3
 
         registry
     }

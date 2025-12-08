@@ -55,6 +55,7 @@ bincode = "1.3"
 bytes = { workspace = true }
 memmap2.workspace = true
 crc32fast.workspace = true
+crc32c.workspace = true
 
 # Concurrency
 crossbeam = { workspace = true }

@@ -5,21 +5,21 @@
 //! while maintaining FluxMQ's optimized internal structures.
 
 use bytes::Bytes;
-use crc32fast::Hasher;
 use std::collections::HashMap;
 use std::io::Read;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::debug;
+use tracing::{debug, info};
 
 use super::errors::KafkaErrorCode;
 use super::messages::*;
-use crate::consumer::ConsumerGroupMessage;
+use crate::consumer::{ConsumerGroupMessage, TopicPartition};
 use crate::protocol::{
     DeleteTopicsRequest, DeleteTopicsResponse, FetchRequest, FetchResponse, ListOffsetsRequest,
     ListOffsetsResponse, Message, MetadataRequest, MetadataResponse, MultiFetchRequest,
     MultiFetchResponse, ProduceRequest, ProduceResponse, Request, Response,
     SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse,
 };
+use bytes::BufMut;
 
 /// Protocol adapter for converting between Kafka and FluxMQ message formats
 pub struct ProtocolAdapter;
@@ -185,6 +185,27 @@ impl ProtocolAdapter {
                 // TxnOffsetCommit: Transaction coordinator API
                 Err(AdapterError::UnsupportedApi(28, 0))
             }
+            // Admin APIs
+            KafkaRequest::DeleteRecords(_req) => {
+                // DeleteRecords: Admin API handled separately
+                Err(AdapterError::UnsupportedApi(21, 0))
+            }
+            KafkaRequest::CreatePartitions(_req) => {
+                // CreatePartitions: Admin API handled separately
+                Err(AdapterError::UnsupportedApi(37, 0))
+            }
+            KafkaRequest::DeleteGroups(_req) => {
+                // DeleteGroups: Admin API handled separately
+                Err(AdapterError::UnsupportedApi(42, 0))
+            }
+            KafkaRequest::AlterPartitionReassignments(_req) => {
+                // AlterPartitionReassignments: Admin API handled separately
+                Err(AdapterError::UnsupportedApi(45, 0))
+            }
+            KafkaRequest::IncrementalAlterConfigs(_req) => {
+                // IncrementalAlterConfigs: Admin API handled separately
+                Err(AdapterError::UnsupportedApi(44, 0))
+            }
         }
     }
 
@@ -195,15 +216,15 @@ impl ProtocolAdapter {
     ) -> Result<KafkaResponse> {
         match fluxmq_response {
             Response::Produce(resp) => {
-                let kafka_resp = Self::convert_produce_response(resp, correlation_id)?;
+                let kafka_resp = Self::convert_produce_response(resp, correlation_id, 0)?; // v0 for legacy adapter path
                 Ok(KafkaResponse::Produce(kafka_resp))
             }
             Response::Fetch(resp) => {
-                let kafka_resp = Self::convert_fetch_response(resp, correlation_id, 10)?; // Default to v10
+                let kafka_resp = Self::convert_fetch_response(resp, correlation_id, 11)?; // v11 for preferred_read_replica
                 Ok(KafkaResponse::Fetch(kafka_resp))
             }
             Response::MultiFetch(resp) => {
-                let kafka_resp = Self::convert_multi_fetch_response(resp, correlation_id, 10)?; // Default to v10
+                let kafka_resp = Self::convert_multi_fetch_response(resp, correlation_id, 11)?; // v11 for preferred_read_replica
                 Ok(KafkaResponse::Fetch(kafka_resp))
             }
             Response::ListOffsets(resp) => {
@@ -215,19 +236,19 @@ impl ProtocolAdapter {
                 Ok(KafkaResponse::Metadata(kafka_resp))
             }
             Response::CreateTopics(resp) => {
-                let kafka_resp = Self::convert_create_topics_response(resp, correlation_id)?;
+                let kafka_resp = Self::convert_create_topics_response(resp, correlation_id, 0)?; // v0 for legacy adapter path
                 Ok(KafkaResponse::CreateTopics(kafka_resp))
             }
             Response::DeleteTopics(resp) => {
-                let kafka_resp = Self::convert_delete_topics_response(resp, correlation_id)?;
+                let kafka_resp = Self::convert_delete_topics_response(resp, correlation_id, 0)?; // v0 for legacy adapter path
                 Ok(KafkaResponse::DeleteTopics(kafka_resp))
             }
             Response::DescribeConfigs(resp) => {
-                let kafka_resp = Self::convert_describe_configs_response(resp, correlation_id)?;
+                let kafka_resp = Self::convert_describe_configs_response(resp, correlation_id, 0)?; // v0 for legacy adapter path
                 Ok(KafkaResponse::DescribeConfigs(kafka_resp))
             }
             Response::AlterConfigs(resp) => {
-                let kafka_resp = Self::convert_alter_configs_response(resp, correlation_id)?;
+                let kafka_resp = Self::convert_alter_configs_response(resp, correlation_id, 0)?; // v0 for legacy adapter path
                 Ok(KafkaResponse::AlterConfigs(kafka_resp))
             }
             Response::SaslHandshake(resp) => {
@@ -238,6 +259,287 @@ impl ProtocolAdapter {
                 let kafka_resp = Self::convert_sasl_authenticate_response(resp, correlation_id)?;
                 Ok(KafkaResponse::SaslAuthenticate(kafka_resp))
             }
+            // Consumer Group APIs - Direct conversion since structures match
+            Response::FindCoordinator(resp) => {
+                let kafka_resp = KafkaFindCoordinatorResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: resp.correlation_id,
+                    },
+                    api_version: 0, // Default to non-flexible, will be overridden if needed
+                    throttle_time_ms: resp.throttle_time_ms,
+                    error_code: resp.error_code,
+                    error_message: resp.error_message.clone(),
+                    node_id: resp.node_id,
+                    host: resp.host.clone(),
+                    port: resp.port,
+                };
+                Ok(KafkaResponse::FindCoordinator(kafka_resp))
+            }
+            Response::JoinGroup(resp) => {
+                let kafka_resp = KafkaJoinGroupResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: resp.correlation_id,
+                    },
+                    api_version: 5, // Default to v5 (protocol_type not included)
+                    throttle_time_ms: resp.throttle_time_ms,
+                    error_code: resp.error_code,
+                    generation_id: resp.generation_id,
+                    protocol_type: resp.protocol_type.clone().unwrap_or_default(),
+                    protocol_name: resp.protocol_name.clone(),
+                    leader: resp.leader.clone(),
+                    member_id: resp.member_id.clone(),
+                    members: resp
+                        .members
+                        .iter()
+                        .map(|m| KafkaJoinGroupMember {
+                            member_id: m.member_id.clone(),
+                            group_instance_id: m.group_instance_id.clone(),
+                            metadata: m.metadata.clone(),
+                        })
+                        .collect(),
+                };
+                Ok(KafkaResponse::JoinGroup(kafka_resp))
+            }
+            Response::SyncGroup(resp) => {
+                let kafka_resp = KafkaSyncGroupResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: resp.correlation_id,
+                    },
+                    api_version: 0, // Default to v0 for compatibility
+                    throttle_time_ms: resp.throttle_time_ms,
+                    error_code: resp.error_code,
+                    protocol_type: resp.protocol_type.clone().unwrap_or_default(),
+                    protocol_name: resp.protocol_name.clone().unwrap_or_default(),
+                    assignment: resp.assignment.clone(),
+                };
+                Ok(KafkaResponse::SyncGroup(kafka_resp))
+            }
+            Response::Heartbeat(resp) => {
+                let kafka_resp = KafkaHeartbeatResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: resp.correlation_id,
+                    },
+                    api_version: resp.api_version,
+                    throttle_time_ms: resp.throttle_time_ms,
+                    error_code: resp.error_code,
+                };
+                Ok(KafkaResponse::Heartbeat(kafka_resp))
+            }
+            Response::LeaveGroup(resp) => {
+                // KafkaLeaveGroupResponse doesn't have members field in v0-v2
+                // Only return error code (stub implementation returns error anyway)
+                let kafka_resp = KafkaLeaveGroupResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: resp.correlation_id,
+                    },
+                    api_version: resp.api_version,
+                    throttle_time_ms: resp.throttle_time_ms,
+                    error_code: resp.error_code,
+                };
+                Ok(KafkaResponse::LeaveGroup(kafka_resp))
+            }
+            Response::OffsetCommit(resp) => {
+                let kafka_resp = KafkaOffsetCommitResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: resp.correlation_id,
+                    },
+                    api_version: resp.api_version,
+                    throttle_time_ms: resp.throttle_time_ms,
+                    topics: resp
+                        .topics
+                        .iter()
+                        .map(|t| KafkaOffsetCommitTopicResponse {
+                            topic: t.name.clone(),
+                            partitions: t
+                                .partitions
+                                .iter()
+                                .map(|p| KafkaOffsetCommitPartitionResponse {
+                                    partition: p.partition_index,
+                                    error_code: p.error_code,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                };
+                Ok(KafkaResponse::OffsetCommit(kafka_resp))
+            }
+            Response::OffsetFetch(resp) => {
+                let kafka_resp = KafkaOffsetFetchResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: resp.correlation_id,
+                    },
+                    api_version: resp.api_version,
+                    throttle_time_ms: resp.throttle_time_ms,
+                    topics: resp
+                        .topics
+                        .iter()
+                        .map(|t| KafkaOffsetFetchTopicResponse {
+                            topic: t.name.clone(),
+                            partitions: t
+                                .partitions
+                                .iter()
+                                .map(|p| KafkaOffsetFetchPartitionResponse {
+                                    partition: p.partition_index,
+                                    offset: p.committed_offset,
+                                    leader_epoch: p.committed_leader_epoch,
+                                    metadata: p.metadata.clone(),
+                                    error_code: p.error_code,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                    error_code: resp.error_code,
+                };
+                Ok(KafkaResponse::OffsetFetch(kafka_resp))
+            }
+            Response::DescribeGroups(resp) => {
+                let kafka_resp = KafkaDescribeGroupsResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: resp.correlation_id,
+                    },
+                    api_version: resp.api_version,
+                    throttle_time_ms: resp.throttle_time_ms,
+                    groups: resp
+                        .groups
+                        .iter()
+                        .map(|g| KafkaDescribedGroup {
+                            error_code: g.error_code,
+                            group_id: g.group_id.clone(),
+                            group_state: g.group_state.clone(),
+                            protocol_type: g.protocol_type.clone(),
+                            protocol_data: g.protocol_data.clone(),
+                            members: g
+                                .members
+                                .iter()
+                                .map(|m| KafkaDescribedGroupMember {
+                                    member_id: m.member_id.clone(),
+                                    group_instance_id: m.group_instance_id.clone(),
+                                    client_id: m.client_id.clone(),
+                                    client_host: m.client_host.clone(),
+                                    member_metadata: m.member_metadata.clone(),
+                                    member_assignment: m.member_assignment.clone(),
+                                })
+                                .collect(),
+                            authorized_operations: g.authorized_operations,
+                        })
+                        .collect(),
+                };
+                Ok(KafkaResponse::DescribeGroups(kafka_resp))
+            }
+            Response::ListGroups(resp) => {
+                let kafka_resp = KafkaListGroupsResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: resp.correlation_id,
+                    },
+                    api_version: resp.api_version,
+                    throttle_time_ms: resp.throttle_time_ms,
+                    error_code: resp.error_code,
+                    groups: resp
+                        .groups
+                        .iter()
+                        .map(|g| KafkaListedGroup {
+                            group_id: g.group_id.clone(),
+                            protocol_type: g.protocol_type.clone(),
+                            group_state: g.group_state.clone(),
+                        })
+                        .collect(),
+                };
+                Ok(KafkaResponse::ListGroups(kafka_resp))
+            }
+            // Transaction APIs - Direct pass-through since handler returns Kafka format
+            Response::InitProducerId(resp) => {
+                Ok(KafkaResponse::InitProducerId(KafkaInitProducerIdResponse {
+                    correlation_id: resp.correlation_id,
+                    error_code: resp.error_code,
+                    producer_id: resp.producer_id,
+                    producer_epoch: resp.producer_epoch,
+                    throttle_time_ms: resp.throttle_time_ms,
+                    api_version: resp.api_version,
+                }))
+            }
+            Response::AddPartitionsToTxn(resp) => Ok(KafkaResponse::AddPartitionsToTxn(
+                KafkaAddPartitionsToTxnResponse {
+                    correlation_id: resp.correlation_id,
+                    api_version: resp.api_version,
+                    throttle_time_ms: resp.throttle_time_ms,
+                    results: resp
+                        .results
+                        .iter()
+                        .map(|t| KafkaAddPartitionsToTxnTopicResult {
+                            name: t.name.clone(),
+                            results: t
+                                .results
+                                .iter()
+                                .map(|p| KafkaAddPartitionsToTxnPartitionResult {
+                                    partition_index: p.partition_index,
+                                    error_code: p.error_code,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                },
+            )),
+            Response::AddOffsetsToTxn(resp) => Ok(KafkaResponse::AddOffsetsToTxn(
+                KafkaAddOffsetsToTxnResponse {
+                    correlation_id: resp.correlation_id,
+                    throttle_time_ms: resp.throttle_time_ms,
+                    error_code: resp.error_code,
+                },
+            )),
+            Response::EndTxn(resp) => Ok(KafkaResponse::EndTxn(KafkaEndTxnResponse {
+                correlation_id: resp.correlation_id,
+                api_version: resp.api_version,
+                throttle_time_ms: resp.throttle_time_ms,
+                error_code: resp.error_code,
+            })),
+            Response::WriteTxnMarkers(resp) => Ok(KafkaResponse::WriteTxnMarkers(
+                KafkaWriteTxnMarkersResponse {
+                    correlation_id: resp.correlation_id,
+                    markers: resp
+                        .markers
+                        .iter()
+                        .map(|m| KafkaWritableTxnMarkerResult {
+                            producer_id: m.producer_id,
+                            topics: m
+                                .topics
+                                .iter()
+                                .map(|t| KafkaWritableTxnMarkerTopicResult {
+                                    name: t.name.clone(),
+                                    partitions: t
+                                        .partitions
+                                        .iter()
+                                        .map(|p| KafkaWritableTxnMarkerPartitionResult {
+                                            partition_index: p.partition_index,
+                                            error_code: p.error_code,
+                                        })
+                                        .collect(),
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                },
+            )),
+            Response::TxnOffsetCommit(resp) => Ok(KafkaResponse::TxnOffsetCommit(
+                KafkaTxnOffsetCommitResponse {
+                    correlation_id: resp.correlation_id,
+                    throttle_time_ms: resp.throttle_time_ms,
+                    topics: resp
+                        .topics
+                        .iter()
+                        .map(|t| KafkaTxnOffsetCommitResponseTopic {
+                            name: t.name.clone(),
+                            partitions: t
+                                .partitions
+                                .iter()
+                                .map(|p| KafkaTxnOffsetCommitResponsePartition {
+                                    partition_index: p.partition_index,
+                                    error_code: p.error_code,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                },
+            )),
             Response::NoResponse => {
                 // For fire-and-forget requests (acks=0), return error to signal no response
                 Err(AdapterError::FluxMq(
@@ -331,6 +633,7 @@ impl ProtocolAdapter {
 
                 let resp = KafkaJoinGroupResponse {
                     header: KafkaResponseHeader { correlation_id },
+                    api_version: 5, // Default to v5 (protocol_type not included)
                     throttle_time_ms: 0,
                     error_code: Self::map_error_code(error_code),
                     generation_id,
@@ -352,6 +655,7 @@ impl ProtocolAdapter {
                     error_code,
                     topic_partition_errors,
                     correlation_id,
+                    api_version,
                 )?;
                 Ok(KafkaResponse::OffsetCommit(resp))
             }
@@ -359,19 +663,24 @@ impl ProtocolAdapter {
                 error_code,
                 offsets,
             } => {
-                let resp =
-                    Self::convert_offset_fetch_response(error_code, offsets, correlation_id)?;
+                let resp = Self::convert_offset_fetch_response(
+                    error_code,
+                    offsets,
+                    correlation_id,
+                    api_version,
+                )?;
                 Ok(KafkaResponse::OffsetFetch(resp))
             }
             ConsumerGroupMessage::ListGroupsResponse { .. } => {
-                Self::convert_list_groups_response(fluxmq_response, correlation_id)
+                Self::convert_list_groups_response(fluxmq_response, correlation_id, api_version)
             }
             ConsumerGroupMessage::DescribeGroupsResponse { .. } => {
-                Self::convert_describe_groups_response(fluxmq_response, correlation_id)
+                Self::convert_describe_groups_response(fluxmq_response, correlation_id, api_version)
             }
             ConsumerGroupMessage::HeartbeatResponse { error_code } => {
                 let resp = KafkaHeartbeatResponse {
                     header: KafkaResponseHeader { correlation_id },
+                    api_version,
                     throttle_time_ms: 0,
                     error_code,
                 };
@@ -380,13 +689,26 @@ impl ProtocolAdapter {
             ConsumerGroupMessage::LeaveGroupResponse { error_code } => {
                 let resp = KafkaLeaveGroupResponse {
                     header: KafkaResponseHeader { correlation_id },
+                    api_version,
                     throttle_time_ms: 0,
                     error_code,
                 };
                 Ok(KafkaResponse::LeaveGroup(resp))
             }
-            ConsumerGroupMessage::SyncGroupResponse { error_code, .. } => {
-                // TODO: Implement proper sync group response conversion
+            ConsumerGroupMessage::SyncGroupResponse {
+                error_code,
+                assignment,
+            } => {
+                // Serialize TopicPartitions to Kafka MemberAssignment format
+                // MemberAssignment format:
+                //   Version (int16): 0
+                //   PartitionAssignment[] (array):
+                //     topic (string)
+                //     partitions (int32 array)
+                //   UserData (bytes): null/empty
+
+                let assignment_bytes = Self::serialize_member_assignment(&assignment);
+
                 let resp = KafkaSyncGroupResponse {
                     header: KafkaResponseHeader { correlation_id },
                     api_version,
@@ -394,7 +716,7 @@ impl ProtocolAdapter {
                     error_code,
                     protocol_type: "consumer".to_string(),
                     protocol_name: "range".to_string(),
-                    assignment: bytes::Bytes::new(),
+                    assignment: assignment_bytes,
                 };
                 Ok(KafkaResponse::SyncGroup(resp))
             }
@@ -407,6 +729,184 @@ impl ProtocolAdapter {
     // ========================================================================
     // PRIVATE CONVERSION METHODS
     // ========================================================================
+
+    /// Deserialize Kafka MemberAssignment bytes to Vec<TopicPartition>
+    /// MemberAssignment format (ConsumerProtocol):
+    ///   Version (int16): 0
+    ///   PartitionAssignment[] (array):
+    ///     topic (string)
+    ///     partitions (int32 array)
+    ///   UserData (bytes): can be null (-1 length)
+    pub fn deserialize_member_assignment(data: &Bytes) -> Vec<TopicPartition> {
+        use bytes::Buf;
+
+        info!(
+            "📦 DESERIALIZE: Received assignment bytes: {:?} ({} bytes)",
+            data.as_ref(),
+            data.len()
+        );
+
+        if data.is_empty() {
+            info!("📦 DESERIALIZE: Empty assignment data");
+            return Vec::new();
+        }
+
+        let mut cursor = std::io::Cursor::new(data.as_ref());
+
+        // Check minimum size (version + array length = 6 bytes)
+        if cursor.remaining() < 6 {
+            info!(
+                "📦 DESERIALIZE: Assignment data too small: {} bytes",
+                cursor.remaining()
+            );
+            return Vec::new();
+        }
+
+        // Version (int16) - ConsumerProtocol versions 0-3 have same format
+        let version = cursor.get_i16();
+        info!("📦 DESERIALIZE: Assignment version: {}", version);
+
+        // Topics array length
+        let topics_count = cursor.get_i32();
+        info!("📦 DESERIALIZE: Topics count: {}", topics_count);
+        if topics_count <= 0 {
+            info!("📦 DESERIALIZE: No topics in assignment");
+            return Vec::new();
+        }
+
+        let mut result = Vec::new();
+
+        for i in 0..topics_count {
+            // Topic string (i16 length prefix + bytes)
+            if cursor.remaining() < 2 {
+                info!("📦 DESERIALIZE: Not enough data for topic {} length", i);
+                break;
+            }
+            let topic_len = cursor.get_i16() as usize;
+            info!(
+                "📦 DESERIALIZE: Topic {} name length: {}, remaining: {}",
+                i,
+                topic_len,
+                cursor.remaining()
+            );
+            if cursor.remaining() < topic_len {
+                info!("📦 DESERIALIZE: Not enough data for topic {} name", i);
+                break;
+            }
+            let mut topic_bytes = vec![0u8; topic_len];
+            cursor.copy_to_slice(&mut topic_bytes);
+            let topic = String::from_utf8_lossy(&topic_bytes).to_string();
+            info!("📦 DESERIALIZE: Topic {}: '{}'", i, topic);
+
+            // Partitions array
+            if cursor.remaining() < 4 {
+                info!("📦 DESERIALIZE: Not enough data for partitions array length");
+                break;
+            }
+            let partitions_count = cursor.get_i32();
+            info!(
+                "📦 DESERIALIZE: Topic '{}' has {} partitions",
+                topic, partitions_count
+            );
+
+            for p in 0..partitions_count {
+                if cursor.remaining() < 4 {
+                    info!(
+                        "📦 DESERIALIZE: Not enough data for partition {} of topic '{}'",
+                        p, topic
+                    );
+                    break;
+                }
+                let partition = cursor.get_i32();
+                info!("📦 DESERIALIZE: Topic '{}' partition {}", topic, partition);
+                result.push(TopicPartition {
+                    topic: topic.clone(),
+                    partition: partition as u32,
+                });
+            }
+        }
+
+        info!(
+            "📦 DESERIALIZE: Final result: {} partitions from {} bytes",
+            result.len(),
+            data.len()
+        );
+
+        result
+    }
+
+    /// Serialize TopicPartitions to Kafka MemberAssignment format
+    /// MemberAssignment format (ConsumerProtocol):
+    ///   Version (int16): 0
+    ///   PartitionAssignment[] (array):
+    ///     topic (string)
+    ///     partitions (int32 array)
+    ///   UserData (bytes): null (-1 length)
+    pub fn serialize_member_assignment(assignment: &[TopicPartition]) -> Bytes {
+        use std::collections::HashMap;
+
+        // If no assignment, return empty bytes (which is valid - consumer has no partitions)
+        if assignment.is_empty() {
+            // Return a minimal valid assignment: version=0, empty array, no userdata
+            let mut buf = bytes::BytesMut::with_capacity(10);
+            buf.put_i16(0); // Version
+            buf.put_i32(0); // Empty topics array
+            buf.put_i32(-1); // Null user data
+            return buf.freeze();
+        }
+
+        // Group partitions by topic
+        let mut topic_partitions: HashMap<&str, Vec<i32>> = HashMap::new();
+        for tp in assignment {
+            topic_partitions
+                .entry(tp.topic.as_str())
+                .or_default()
+                .push(tp.partition as i32);
+        }
+
+        // Calculate buffer size:
+        // - Version (2 bytes)
+        // - Array length (4 bytes)
+        // - Per topic: topic string (2 + len bytes) + partition array (4 + n*4 bytes)
+        // - UserData (4 bytes for null marker)
+        let mut size = 2 + 4 + 4; // version + array_len + userdata_null
+        for (topic, partitions) in &topic_partitions {
+            size += 2 + topic.len(); // topic string: length prefix + string bytes
+            size += 4 + (partitions.len() * 4); // partitions array: length + n * 4
+        }
+
+        let mut buf = bytes::BytesMut::with_capacity(size);
+
+        // Version
+        buf.put_i16(0);
+
+        // Topics array
+        buf.put_i32(topic_partitions.len() as i32);
+
+        for (topic, partitions) in &topic_partitions {
+            // Topic string (Kafka standard string: i16 length prefix + bytes)
+            buf.put_i16(topic.len() as i16);
+            buf.put_slice(topic.as_bytes());
+
+            // Partitions array
+            buf.put_i32(partitions.len() as i32);
+            for &partition in partitions {
+                buf.put_i32(partition);
+            }
+        }
+
+        // UserData (null = -1)
+        buf.put_i32(-1);
+
+        debug!(
+            "Serialized member assignment: {} topics, {} partitions, {} bytes",
+            topic_partitions.len(),
+            assignment.len(),
+            buf.len()
+        );
+
+        buf.freeze()
+    }
 
     fn convert_produce_request(kafka_req: KafkaProduceRequest) -> Result<ProduceRequest> {
         // For simplicity, handle only the first topic/partition
@@ -525,6 +1025,7 @@ impl ProtocolAdapter {
     fn convert_produce_response(
         fluxmq_resp: ProduceResponse,
         correlation_id: i32,
+        api_version: i16,
     ) -> Result<KafkaProduceResponse> {
         let partition_response = KafkaPartitionProduceResponse {
             partition: fluxmq_resp.partition as i32,
@@ -544,6 +1045,7 @@ impl ProtocolAdapter {
 
         Ok(KafkaProduceResponse {
             header: KafkaResponseHeader { correlation_id },
+            api_version,
             responses: vec![topic_response],
             throttle_time_ms: 0,
         })
@@ -613,6 +1115,7 @@ impl ProtocolAdapter {
 
         Ok(KafkaListOffsetsResponse {
             header: KafkaResponseHeader { correlation_id },
+            api_version: 0, // Default to non-flexible for legacy adapter path
             throttle_time_ms: 0,
             topics: vec![topic_response],
         })
@@ -787,13 +1290,34 @@ impl ProtocolAdapter {
     fn convert_sync_group_request(
         kafka_req: KafkaSyncGroupRequest,
     ) -> Result<ConsumerGroupMessage> {
-        // TODO: Parse assignments from Kafka format
-        // For now, return empty assignments
+        // Parse assignments from leader's SyncGroup request
+        // The leader sends assignments for all members in the group
+        let mut group_assignments = std::collections::HashMap::new();
+
+        for assignment in kafka_req.assignments {
+            let partitions = Self::deserialize_member_assignment(&assignment.assignment);
+            debug!(
+                "SyncGroup assignment for consumer '{}': {} partitions, {} raw bytes",
+                assignment.consumer_id,
+                partitions.len(),
+                assignment.assignment.len()
+            );
+            group_assignments.insert(assignment.consumer_id, partitions);
+        }
+
+        debug!(
+            "Converted SyncGroup request: group_id='{}', consumer_id='{}', generation={}, {} member assignments",
+            kafka_req.group_id,
+            kafka_req.consumer_id,
+            kafka_req.generation_id,
+            group_assignments.len()
+        );
+
         Ok(ConsumerGroupMessage::SyncGroup {
             group_id: kafka_req.group_id,
             consumer_id: kafka_req.consumer_id,
             generation_id: kafka_req.generation_id,
-            group_assignments: std::collections::HashMap::new(),
+            group_assignments,
         })
     }
 
@@ -801,6 +1325,7 @@ impl ProtocolAdapter {
         _error_code: i16,
         topic_partition_errors: Vec<crate::consumer::TopicPartitionError>,
         correlation_id: i32,
+        api_version: i16,
     ) -> Result<KafkaOffsetCommitResponse> {
         let mut topic_responses = std::collections::HashMap::new();
 
@@ -822,6 +1347,7 @@ impl ProtocolAdapter {
 
         Ok(KafkaOffsetCommitResponse {
             header: KafkaResponseHeader { correlation_id },
+            api_version,
             throttle_time_ms: 0,
             topics: topic_responses.into_values().collect(),
         })
@@ -831,6 +1357,7 @@ impl ProtocolAdapter {
         global_error_code: i16,
         offsets: Vec<crate::consumer::TopicPartitionOffsetResult>,
         correlation_id: i32,
+        api_version: i16,
     ) -> Result<KafkaOffsetFetchResponse> {
         let mut topic_responses = std::collections::HashMap::new();
 
@@ -855,6 +1382,7 @@ impl ProtocolAdapter {
 
         Ok(KafkaOffsetFetchResponse {
             header: KafkaResponseHeader { correlation_id },
+            api_version,
             throttle_time_ms: 0,
             topics: topic_responses.into_values().collect(),
             error_code: global_error_code,
@@ -864,6 +1392,7 @@ impl ProtocolAdapter {
     fn convert_create_topics_response(
         fluxmq_resp: crate::protocol::CreateTopicsResponse,
         correlation_id: i32,
+        api_version: i16,
     ) -> Result<KafkaCreateTopicsResponse> {
         let kafka_topics = fluxmq_resp
             .topics
@@ -896,6 +1425,7 @@ impl ProtocolAdapter {
 
         Ok(KafkaCreateTopicsResponse {
             header: KafkaResponseHeader { correlation_id },
+            api_version,
             throttle_time_ms: fluxmq_resp.throttle_time_ms,
             topics: kafka_topics,
         })
@@ -914,6 +1444,7 @@ impl ProtocolAdapter {
     fn convert_delete_topics_response(
         resp: DeleteTopicsResponse,
         correlation_id: i32,
+        api_version: i16,
     ) -> Result<KafkaDeleteTopicsResponse> {
         let kafka_topics = resp
             .responses
@@ -928,6 +1459,7 @@ impl ProtocolAdapter {
 
         Ok(KafkaDeleteTopicsResponse {
             correlation_id,
+            api_version,
             throttle_time_ms: resp.throttle_time_ms,
             responses: kafka_topics,
         })
@@ -1906,6 +2438,7 @@ impl ProtocolAdapter {
     pub fn convert_list_groups_response(
         response: ConsumerGroupMessage,
         correlation_id: i32,
+        api_version: i16,
     ) -> Result<KafkaResponse> {
         match response {
             ConsumerGroupMessage::ListGroupsResponse { error_code, groups } => {
@@ -1920,6 +2453,7 @@ impl ProtocolAdapter {
 
                 Ok(KafkaResponse::ListGroups(KafkaListGroupsResponse {
                     header: KafkaResponseHeader { correlation_id },
+                    api_version,
                     throttle_time_ms: 0,
                     error_code: Self::map_error_code(error_code),
                     groups: kafka_groups,
@@ -1935,6 +2469,7 @@ impl ProtocolAdapter {
     pub fn convert_describe_groups_response(
         response: ConsumerGroupMessage,
         correlation_id: i32,
+        api_version: i16,
     ) -> Result<KafkaResponse> {
         match response {
             ConsumerGroupMessage::DescribeGroupsResponse { groups } => {
@@ -1968,6 +2503,7 @@ impl ProtocolAdapter {
 
                 Ok(KafkaResponse::DescribeGroups(KafkaDescribeGroupsResponse {
                     header: KafkaResponseHeader { correlation_id },
+                    api_version,
                     throttle_time_ms: 0,
                     groups: kafka_groups,
                 }))
@@ -2118,15 +2654,17 @@ impl ProtocolAdapter {
                         let records =
                             Self::encode_messages_as_record_batch(&partition_resp.messages);
 
+                        let high_watermark = partition_resp
+                            .messages
+                            .last()
+                            .map(|(offset, _)| *offset as i64 + 1)
+                            .unwrap_or(0);
+
                         KafkaPartitionFetchResponse {
                             partition: partition_resp.partition as i32,
                             error_code: partition_resp.error_code,
-                            high_watermark: partition_resp
-                                .messages
-                                .last()
-                                .map(|(offset, _)| *offset as i64 + 1)
-                                .unwrap_or(0),
-                            last_stable_offset: -1,
+                            high_watermark,
+                            last_stable_offset: high_watermark, // Must match high_watermark for read_uncommitted
                             log_start_offset: 0,
                             aborted_transactions: vec![],
                             preferred_read_replica: -1,
@@ -2152,83 +2690,150 @@ impl ProtocolAdapter {
         })
     }
 
-    /// Encode FluxMQ messages as proper Kafka record batch format (KIP-98)
-    /// Using a simplified approach that focuses on compatibility with optional compression
+    /// Encode FluxMQ messages as proper Kafka RecordBatch format (KIP-98)
+    /// Uses magic byte 2 (RecordBatch v2) format for Java Kafka client 4.x compatibility
     fn encode_messages_as_record_batch(messages: &[(u64, Message)]) -> Bytes {
         if messages.is_empty() {
             return Bytes::new();
         }
 
-        // Try the simplest possible legacy format that kafka-python should understand
-        let mut records = Vec::new();
+        // Get base offset and last offset
+        let base_offset = messages.first().map(|(o, _)| *o as i64).unwrap_or(0);
+        let last_offset_delta = (messages.len() - 1) as i32;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
 
-        for (offset, message) in messages {
-            let value_bytes = &message.value;
+        // First, encode all records
+        let mut records_buffer = Vec::new();
+        for (idx, (_, message)) in messages.iter().enumerate() {
+            // Record format (varint encoded):
+            // length (varint) + attributes (1 byte) + timestampDelta (varint) + offsetDelta (varint)
+            // + keyLength (varint) + key + valueLength (varint) + value + headers (varint array)
 
-            // Determine optimal compression based on message size
-            use crate::compression::{compress_fast, CompressionType};
-            let compression_type = if value_bytes.len() > 1024 {
-                // Use LZ4 compression for messages > 1KB
-                CompressionType::Lz4
-            } else {
-                // No compression for small messages
-                CompressionType::None
-            };
+            let mut record = Vec::new();
 
-            // Apply compression if needed
-            let (final_value_bytes, attributes) = match compression_type {
-                CompressionType::None => (value_bytes.clone(), 0u8), // No compression
-                CompressionType::Lz4 => {
-                    match compress_fast(value_bytes, CompressionType::Lz4) {
-                        Ok(compressed) => (compressed, 3u8), // LZ4 = 0x03 in attributes
-                        Err(e) => {
-                            tracing::warn!("Compression failed: {}, using uncompressed", e);
-                            (value_bytes.clone(), 0u8)
-                        }
-                    }
-                }
-                _ => (value_bytes.clone(), 0u8), // Fallback to no compression
-            };
+            // Attributes (1 byte) - no control records, no transactional
+            record.push(0u8);
 
-            // Message format for magic byte 0/1 (legacy format):
-            // offset (8 bytes) + message_size (4 bytes) + crc (4 bytes) + magic (1 byte) + attributes (1 byte) + key_length (4 bytes) + value_length (4 bytes) + value
-            records.extend_from_slice(&(*offset as i64).to_be_bytes());
+            // Timestamp delta (varint) - 0 for simplicity
+            Self::write_varint(&mut record, 0);
 
-            // Message size = 4 (crc) + 1 (magic) + 1 (attributes) + 4 (key_length) + 4 (value_length) + final_value.len()
-            let message_size = 4 + 1 + 1 + 4 + 4 + final_value_bytes.len();
-            records.extend_from_slice(&(message_size as i32).to_be_bytes());
+            // Offset delta (varint)
+            Self::write_varint(&mut record, idx as i64);
 
-            // Calculate CRC32 for the message payload (magic + attributes + key_length + value_length + value)
-            let mut crc_hasher = Hasher::new();
-            crc_hasher.update(&[0]); // magic byte
-            crc_hasher.update(&[attributes]); // compression attributes
-            crc_hasher.update(&(-1i32).to_be_bytes()); // key length (-1 for null)
-            crc_hasher.update(&(final_value_bytes.len() as i32).to_be_bytes()); // compressed value length
-            crc_hasher.update(&final_value_bytes); // compressed value data
-            let crc = crc_hasher.finalize();
-            records.extend_from_slice(&crc.to_be_bytes());
+            // Key length (varint) - -1 for null key
+            Self::write_varint(&mut record, -1);
 
-            // Magic byte = 0 (oldest format for maximum compatibility)
-            records.push(0);
+            // No key bytes (null key)
 
-            // Attributes with compression info: lower 3 bits = compression type
-            records.push(attributes);
+            // Value length (varint)
+            Self::write_varint(&mut record, message.value.len() as i64);
 
-            // Key length = -1 (null key)
-            records.extend_from_slice(&(-1i32).to_be_bytes());
+            // Value bytes
+            record.extend_from_slice(&message.value);
 
-            // Compressed value length and value
-            records.extend_from_slice(&(final_value_bytes.len() as i32).to_be_bytes());
-            records.extend_from_slice(&final_value_bytes);
+            // Headers count (varint) - 0 headers
+            Self::write_varint(&mut record, 0);
+
+            // Write record length (varint) followed by record data
+            Self::write_varint(&mut records_buffer, record.len() as i64);
+            records_buffer.extend_from_slice(&record);
         }
 
+        // Calculate CRC32C for the batch (from partition leader epoch to end of records)
+        // RecordBatch header (after baseOffset and batchLength):
+        // partitionLeaderEpoch(4) + magic(1) + crc(4) + attributes(2) + lastOffsetDelta(4)
+        // + firstTimestamp(8) + maxTimestamp(8) + producerId(8) + producerEpoch(2)
+        // + baseSequence(4) + recordCount(4) + records...
+
+        let batch_length = 4 + 1 + 4 + 2 + 4 + 8 + 8 + 8 + 2 + 4 + 4 + records_buffer.len();
+
+        // Build the batch
+        let mut batch = Vec::with_capacity(8 + 4 + batch_length);
+
+        // Base offset (8 bytes)
+        batch.extend_from_slice(&base_offset.to_be_bytes());
+
+        // Batch length (4 bytes) - everything after this field
+        batch.extend_from_slice(&(batch_length as i32).to_be_bytes());
+
+        // Partition leader epoch (4 bytes)
+        batch.extend_from_slice(&0i32.to_be_bytes());
+
+        // Magic byte (1 byte) - 2 for RecordBatch v2
+        batch.push(2u8);
+
+        // CRC placeholder - we'll calculate this later (4 bytes)
+        let crc_position = batch.len();
+        batch.extend_from_slice(&0u32.to_be_bytes());
+
+        // Attributes (2 bytes) - no compression, no timestamp type, no transactional, no control
+        batch.extend_from_slice(&0i16.to_be_bytes());
+
+        // Last offset delta (4 bytes)
+        batch.extend_from_slice(&last_offset_delta.to_be_bytes());
+
+        // First timestamp (8 bytes)
+        batch.extend_from_slice(&timestamp.to_be_bytes());
+
+        // Max timestamp (8 bytes) - same as first for simplicity
+        batch.extend_from_slice(&timestamp.to_be_bytes());
+
+        // Producer ID (8 bytes) - -1 for non-transactional
+        batch.extend_from_slice(&(-1i64).to_be_bytes());
+
+        // Producer epoch (2 bytes) - -1 for non-transactional
+        batch.extend_from_slice(&(-1i16).to_be_bytes());
+
+        // Base sequence (4 bytes) - -1 for non-idempotent
+        batch.extend_from_slice(&(-1i32).to_be_bytes());
+
+        // Record count (4 bytes)
+        batch.extend_from_slice(&(messages.len() as i32).to_be_bytes());
+
+        // Records
+        batch.extend_from_slice(&records_buffer);
+
+        // Calculate CRC32C over everything from attributes to end of records
+        // CRC32C covers bytes from attributes (after magic byte and crc field) to end
+        let crc_data = &batch[(crc_position + 4)..]; // Skip the CRC placeholder
+        let crc = crc32c::crc32c(crc_data);
+
+        // Update CRC in the batch
+        batch[crc_position..crc_position + 4].copy_from_slice(&crc.to_be_bytes());
+
         tracing::debug!(
-            "Created Kafka records with {} bytes for {} messages (with compression support)",
-            records.len(),
-            messages.len()
+            "Created Kafka RecordBatch v2 with {} bytes for {} messages (base_offset={}, crc=0x{:08x})",
+            batch.len(),
+            messages.len(),
+            base_offset,
+            crc
         );
 
-        Bytes::from(records)
+        Bytes::from(batch)
+    }
+
+    /// Write a signed varint (zigzag encoded) to a buffer
+    fn write_varint(buf: &mut Vec<u8>, value: i64) {
+        // Zigzag encode: (value << 1) ^ (value >> 63)
+        let zigzag = ((value << 1) ^ (value >> 63)) as u64;
+        Self::write_unsigned_varint(buf, zigzag);
+    }
+
+    /// Write an unsigned varint to a buffer
+    fn write_unsigned_varint(buf: &mut Vec<u8>, mut value: u64) {
+        loop {
+            let byte = (value & 0x7F) as u8;
+            value >>= 7;
+            if value == 0 {
+                buf.push(byte);
+                break;
+            } else {
+                buf.push(byte | 0x80);
+            }
+        }
     }
 
     // ========================================================================
@@ -2263,6 +2868,7 @@ impl ProtocolAdapter {
     fn convert_describe_configs_response(
         fluxmq_resp: crate::protocol::DescribeConfigsResponse,
         correlation_id: i32,
+        api_version: i16,
     ) -> Result<KafkaDescribeConfigsResponse> {
         let kafka_results: Vec<KafkaConfigResourceResult> = fluxmq_resp
             .results
@@ -2304,6 +2910,7 @@ impl ProtocolAdapter {
 
         Ok(KafkaDescribeConfigsResponse {
             correlation_id,
+            api_version,
             throttle_time_ms: fluxmq_resp.throttle_time_ms,
             results: kafka_results,
         })
@@ -2351,6 +2958,7 @@ impl ProtocolAdapter {
     fn convert_alter_configs_response(
         fluxmq_resp: crate::protocol::AlterConfigsResponse,
         correlation_id: i32,
+        api_version: i16,
     ) -> Result<KafkaAlterConfigsResponse> {
         let kafka_responses: Vec<KafkaAlterConfigsResourceResponse> = fluxmq_resp
             .responses
@@ -2365,6 +2973,7 @@ impl ProtocolAdapter {
 
         Ok(KafkaAlterConfigsResponse {
             correlation_id,
+            api_version,
             throttle_time_ms: fluxmq_resp.throttle_time_ms,
             responses: kafka_responses,
         })

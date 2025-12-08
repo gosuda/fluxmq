@@ -2,6 +2,14 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+// Transaction API types
+pub use crate::transaction::messages::{
+    AddOffsetsToTxnRequest, AddOffsetsToTxnResponse, AddPartitionsToTxnRequest,
+    AddPartitionsToTxnResponse, EndTxnRequest, EndTxnResponse, InitProducerIdRequest,
+    InitProducerIdResponse, TxnOffsetCommitRequest, TxnOffsetCommitResponse,
+    WriteTxnMarkersRequest, WriteTxnMarkersResponse,
+};
+
 pub type TopicName = String;
 pub type PartitionId = u32;
 pub type Offset = u64;
@@ -351,6 +359,297 @@ pub struct AlterConfigsResourceResponse {
     pub resource_name: String,
 }
 
+// ==================== Consumer Group APIs ====================
+
+// API 10: FindCoordinator
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindCoordinatorRequest {
+    pub correlation_id: CorrelationId,
+    pub key: String,  // Group ID or Transaction ID
+    pub key_type: i8, // 0 = Group, 1 = Transaction
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindCoordinatorResponse {
+    pub correlation_id: CorrelationId,
+    pub throttle_time_ms: i32,
+    pub error_code: i16,
+    pub error_message: Option<String>,
+    pub node_id: i32,
+    pub host: String,
+    pub port: i32,
+}
+
+// API 11: JoinGroup
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinGroupRequest {
+    pub correlation_id: CorrelationId,
+    pub group_id: String,
+    pub session_timeout_ms: i32,
+    pub rebalance_timeout_ms: i32,
+    pub member_id: String,
+    pub group_instance_id: Option<String>,
+    pub protocol_type: String,
+    pub protocols: Vec<GroupProtocol>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupProtocol {
+    pub name: String,    // "range", "roundrobin", "sticky"
+    pub metadata: Bytes, // Serialized protocol metadata
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinGroupResponse {
+    pub correlation_id: CorrelationId,
+    pub throttle_time_ms: i32,
+    pub error_code: i16,
+    pub generation_id: i32,
+    pub protocol_type: Option<String>,
+    pub protocol_name: String,
+    pub leader: String, // Leader member ID
+    pub member_id: String,
+    pub members: Vec<JoinGroupResponseMember>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinGroupResponseMember {
+    pub member_id: String,
+    pub group_instance_id: Option<String>,
+    pub metadata: Bytes,
+}
+
+// API 14: SyncGroup
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncGroupRequest {
+    pub correlation_id: CorrelationId,
+    pub group_id: String,
+    pub generation_id: i32,
+    pub member_id: String,
+    pub group_instance_id: Option<String>,
+    pub protocol_type: Option<String>,
+    pub protocol_name: Option<String>,
+    pub assignments: Vec<SyncGroupRequestAssignment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncGroupRequestAssignment {
+    pub member_id: String,
+    pub assignment: Bytes,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncGroupResponse {
+    pub correlation_id: CorrelationId,
+    pub throttle_time_ms: i32,
+    pub error_code: i16,
+    pub protocol_type: Option<String>,
+    pub protocol_name: Option<String>,
+    pub assignment: Bytes,
+}
+
+// API 12: Heartbeat
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeartbeatRequest {
+    pub correlation_id: CorrelationId,
+    pub api_version: i16, // Needed for flexible versions response encoding
+    pub group_id: String,
+    pub generation_id: i32,
+    pub member_id: String,
+    pub group_instance_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeartbeatResponse {
+    pub correlation_id: CorrelationId,
+    pub api_version: i16, // Needed for flexible versions encoding
+    pub throttle_time_ms: i32,
+    pub error_code: i16,
+}
+
+// API 13: LeaveGroup
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaveGroupRequest {
+    pub correlation_id: CorrelationId,
+    pub api_version: i16, // Needed for flexible versions response encoding
+    pub group_id: String,
+    pub member_id: String,
+    pub members: Vec<MemberIdentity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemberIdentity {
+    pub member_id: String,
+    pub group_instance_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaveGroupResponse {
+    pub correlation_id: CorrelationId,
+    pub api_version: i16, // Needed for flexible versions encoding
+    pub throttle_time_ms: i32,
+    pub error_code: i16,
+    pub members: Vec<MemberResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemberResponse {
+    pub member_id: String,
+    pub group_instance_id: Option<String>,
+    pub error_code: i16,
+}
+
+// API 8: OffsetCommit
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OffsetCommitRequest {
+    pub correlation_id: CorrelationId,
+    pub api_version: i16, // Needed for flexible versions response encoding
+    pub group_id: String,
+    pub generation_id: i32,
+    pub member_id: String,
+    pub group_instance_id: Option<String>,
+    pub retention_time_ms: i64,
+    pub topics: Vec<OffsetCommitRequestTopic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OffsetCommitRequestTopic {
+    pub name: String,
+    pub partitions: Vec<OffsetCommitRequestPartition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OffsetCommitRequestPartition {
+    pub partition_index: i32,
+    pub committed_offset: i64,
+    pub committed_leader_epoch: i32,
+    pub committed_metadata: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OffsetCommitResponse {
+    pub correlation_id: CorrelationId,
+    pub api_version: i16, // Needed for flexible versions encoding
+    pub throttle_time_ms: i32,
+    pub topics: Vec<OffsetCommitResponseTopic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OffsetCommitResponseTopic {
+    pub name: String,
+    pub partitions: Vec<OffsetCommitResponsePartition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OffsetCommitResponsePartition {
+    pub partition_index: i32,
+    pub error_code: i16,
+}
+
+// API 9: OffsetFetch
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OffsetFetchRequest {
+    pub correlation_id: CorrelationId,
+    pub api_version: i16, // Needed for flexible versions response encoding
+    pub group_id: String,
+    pub topics: Option<Vec<OffsetFetchRequestTopic>>,
+    pub require_stable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OffsetFetchRequestTopic {
+    pub name: String,
+    pub partition_indexes: Vec<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OffsetFetchResponse {
+    pub correlation_id: CorrelationId,
+    pub api_version: i16, // Needed for flexible versions encoding
+    pub throttle_time_ms: i32,
+    pub topics: Vec<OffsetFetchResponseTopic>,
+    pub error_code: i16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OffsetFetchResponseTopic {
+    pub name: String,
+    pub partitions: Vec<OffsetFetchResponsePartition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OffsetFetchResponsePartition {
+    pub partition_index: i32,
+    pub committed_offset: i64,
+    pub committed_leader_epoch: i32,
+    pub metadata: Option<String>,
+    pub error_code: i16,
+}
+
+// API 15: DescribeGroups
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DescribeGroupsRequest {
+    pub correlation_id: CorrelationId,
+    pub api_version: i16,
+    pub groups: Vec<String>,
+    pub include_authorized_operations: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DescribeGroupsResponse {
+    pub correlation_id: CorrelationId,
+    pub api_version: i16,
+    pub throttle_time_ms: i32,
+    pub groups: Vec<DescribedGroup>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DescribedGroup {
+    pub error_code: i16,
+    pub group_id: String,
+    pub group_state: String,
+    pub protocol_type: String,
+    pub protocol_data: String,
+    pub members: Vec<DescribedGroupMember>,
+    pub authorized_operations: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DescribedGroupMember {
+    pub member_id: String,
+    pub group_instance_id: Option<String>,
+    pub client_id: String,
+    pub client_host: String,
+    pub member_metadata: Bytes,
+    pub member_assignment: Bytes,
+}
+
+// API 16: ListGroups
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListGroupsRequest {
+    pub correlation_id: CorrelationId,
+    pub api_version: i16,
+    pub states_filter: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListGroupsResponse {
+    pub correlation_id: CorrelationId,
+    pub api_version: i16,
+    pub throttle_time_ms: i32,
+    pub error_code: i16,
+    pub groups: Vec<ListedGroup>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListedGroup {
+    pub group_id: String,
+    pub protocol_type: String,
+    pub group_state: String,
+}
+
+// ==================== End of Consumer Group APIs ====================
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     Produce(ProduceRequest),
@@ -366,6 +665,23 @@ pub enum Request {
     // SASL APIs
     SaslHandshake(SaslHandshakeRequest),
     SaslAuthenticate(SaslAuthenticateRequest),
+    // Consumer Group APIs
+    FindCoordinator(FindCoordinatorRequest),
+    JoinGroup(JoinGroupRequest),
+    SyncGroup(SyncGroupRequest),
+    Heartbeat(HeartbeatRequest),
+    LeaveGroup(LeaveGroupRequest),
+    OffsetCommit(OffsetCommitRequest),
+    OffsetFetch(OffsetFetchRequest),
+    DescribeGroups(DescribeGroupsRequest),
+    ListGroups(ListGroupsRequest),
+    // Transaction APIs
+    InitProducerId(InitProducerIdRequest),
+    AddPartitionsToTxn(AddPartitionsToTxnRequest),
+    AddOffsetsToTxn(AddOffsetsToTxnRequest),
+    EndTxn(EndTxnRequest),
+    WriteTxnMarkers(WriteTxnMarkersRequest),
+    TxnOffsetCommit(TxnOffsetCommitRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -383,6 +699,23 @@ pub enum Response {
     // SASL APIs
     SaslHandshake(SaslHandshakeResponse),
     SaslAuthenticate(SaslAuthenticateResponse),
+    // Consumer Group APIs
+    FindCoordinator(FindCoordinatorResponse),
+    JoinGroup(JoinGroupResponse),
+    SyncGroup(SyncGroupResponse),
+    Heartbeat(HeartbeatResponse),
+    LeaveGroup(LeaveGroupResponse),
+    OffsetCommit(OffsetCommitResponse),
+    OffsetFetch(OffsetFetchResponse),
+    DescribeGroups(DescribeGroupsResponse),
+    ListGroups(ListGroupsResponse),
+    // Transaction APIs
+    InitProducerId(InitProducerIdResponse),
+    AddPartitionsToTxn(AddPartitionsToTxnResponse),
+    AddOffsetsToTxn(AddOffsetsToTxnResponse),
+    EndTxn(EndTxnResponse),
+    WriteTxnMarkers(WriteTxnMarkersResponse),
+    TxnOffsetCommit(TxnOffsetCommitResponse),
     // Special response for acks=0 fire-and-forget requests
     NoResponse,
 }

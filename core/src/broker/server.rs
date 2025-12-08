@@ -424,183 +424,112 @@ impl BrokerServer {
     /// - No pipelining, process one request at a time
     /// - Guaranteed ordering, no race conditions
     async fn handle_client(stream: TcpStream, handler: Arc<MessageHandler>) -> Result<()> {
-        info!("🚀 PIPELINED: New client connected - async processing");
+        info!("🚀 SEQUENTIAL: New client connected - simple sync processing");
 
         let metrics = handler.get_metrics();
         metrics.broker.connection_opened();
 
-        // Split stream for concurrent read/write
-        let (read_half, write_half) = tokio::io::split(stream);
-        let mut kafka_read = tokio_util::codec::FramedRead::new(read_half, KafkaFrameCodec);
-        let mut kafka_write = tokio_util::codec::FramedWrite::new(write_half, KafkaFrameCodec);
-
-        // Response buffer with DashMap for lock-free concurrent access
-        let response_buffer = Arc::new(dashmap::DashMap::<i32, Bytes>::new());
-        let next_send_correlation = Arc::new(std::sync::atomic::AtomicI32::new(-1));
-
-        // Write channel for ordered delivery
-        let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<Bytes>(1000);
-
+        // Use a single Framed for both read and write - simpler and more reliable
+        let mut kafka_framed = tokio_util::codec::Framed::new(stream, KafkaFrameCodec);
         let hp_codec = Arc::new(HighPerformanceKafkaCodec::new());
 
-        // 1️⃣ Read Loop: Process requests in parallel
-        let read_handle = {
-            let handler = Arc::clone(&handler);
-            let hp_codec = Arc::clone(&hp_codec);
-            let response_buffer = Arc::clone(&response_buffer);
-            let next_send_correlation = Arc::clone(&next_send_correlation);
-            let write_tx = write_tx.clone();
+        // 🔧 SIMPLE SEQUENTIAL PROCESSING: Read request -> Process -> Write response -> Repeat
+        // This is the most reliable approach that ensures proper request-response pairing
+        loop {
+            match tokio_stream::StreamExt::next(&mut kafka_framed).await {
+                Some(Ok(message_bytes)) => {
+                    // Extract api_key and correlation ID for logging
+                    let (api_key, correlation_id) = if message_bytes.len() >= 8 {
+                        let api_key = i16::from_be_bytes([message_bytes[0], message_bytes[1]]);
+                        let corr_id = i32::from_be_bytes([
+                            message_bytes[4],
+                            message_bytes[5],
+                            message_bytes[6],
+                            message_bytes[7],
+                        ]);
+                        (api_key, corr_id)
+                    } else {
+                        warn!("Invalid message format: {} bytes", message_bytes.len());
+                        continue;
+                    };
 
-            tokio::spawn(async move {
-                use futures::stream::{FuturesUnordered, StreamExt as FuturesStreamExt};
+                    info!("🚀 RECV: api_key={}, correlation_id={}, len={}",
+                          api_key, correlation_id, message_bytes.len());
 
-                let mut processing_futures = FuturesUnordered::new();
-                let mut read_done = false;
+                    // Process the request and get response
+                    match Self::process_kafka_message_pipelined(&handler, &hp_codec, message_bytes).await {
+                        Ok(response_bytes) => {
+                            if !response_bytes.is_empty() {
+                                info!("🚀 SEND: response for correlation_id={}, len={}",
+                                      correlation_id, response_bytes.len());
 
-                loop {
-                    tokio::select! {
-                        result = tokio_stream::StreamExt::next(&mut kafka_read), if !read_done => {
-                            match result {
-                                Some(Ok(message_bytes)) => {
-                                    // Extract correlation ID
-                                    let correlation_id = if message_bytes.len() >= 8 {
-                                        i32::from_be_bytes([
-                                            message_bytes[4],
-                                            message_bytes[5],
-                                            message_bytes[6],
-                                            message_bytes[7],
-                                        ])
-                                    } else {
-                                        warn!("Invalid message format");
-                                        continue;
-                                    };
-
-                                    debug!("🚀 READ: correlation_id={}", correlation_id);
-
-                                    let handler = Arc::clone(&handler);
-                                    let hp_codec = Arc::clone(&hp_codec);
-                                    let response_buffer = Arc::clone(&response_buffer);
-                                    let next_send_correlation = Arc::clone(&next_send_correlation);
-                                    let write_tx = write_tx.clone();
-
-                                    let future = async move {
-                                        match Self::process_kafka_message_pipelined(&handler, &hp_codec, message_bytes).await {
-                                            Ok(response_bytes) => {
-                                                response_buffer.insert(correlation_id, response_bytes);
-                                                Self::flush_ordered_responses_dashmap(&response_buffer, &next_send_correlation, &write_tx).await;
-                                            }
-                                            Err(e) => {
-                                                warn!("Request processing failed: {}", e);
-                                            }
-                                        }
-                                    };
-
-                                    processing_futures.push(future);
+                                // Send response immediately
+                                use futures::SinkExt;
+                                if let Err(e) = kafka_framed.send(response_bytes).await {
+                                    warn!("Failed to send response: {}", e);
+                                    break;
                                 }
-                                Some(Err(e)) => {
-                                    warn!("Failed to decode message: {}", e);
-                                    read_done = true;
-                                }
-                                None => {
-                                    info!("🚀 Read stream closed");
-                                    read_done = true;
+                                // Flush to ensure response is sent before reading next request
+                                if let Err(e) = kafka_framed.flush().await {
+                                    warn!("Failed to flush response: {}", e);
+                                    break;
                                 }
                             }
                         }
-
-                        _ = FuturesStreamExt::next(&mut processing_futures), if !processing_futures.is_empty() => {
-                            // Future completed
+                        Err(e) => {
+                            warn!("Request processing failed for correlation_id={}: {}", correlation_id, e);
                         }
+                    }
+                }
+                Some(Err(e)) => {
+                    warn!("Failed to decode message: {}", e);
+                    break;
+                }
+                None => {
+                    info!("🚀 Client disconnected (stream closed)");
+                    break;
+                }
+            }
+        }
 
-                        else => {
-                            if read_done && processing_futures.is_empty() {
+        metrics.broker.connection_closed();
+        info!("🚀 SEQUENTIAL: Client connection ended");
+        Ok(())
+    }
+
+    /// 🚀 LOCK-FREE: DashMap-based flush with simple, high-performance logic
+    ///
+    /// CRITICAL FIX (2025-12-05): Kafka correlation_ids are NOT necessarily sequential!
+    /// Java AdminClient may use correlation_ids like: 1, 4, 7, 10...
+    /// We must find the ACTUAL minimum correlation_id in the buffer, not assume +1 increments.
+    async fn flush_ordered_responses_dashmap(
+        response_buffer: &Arc<dashmap::DashMap<i32, Bytes>>,
+        _next_send_correlation: &Arc<std::sync::atomic::AtomicI32>,
+        write_tx: &tokio::sync::mpsc::Sender<Bytes>,
+    ) {
+        // 🔧 FIX: Always find the minimum correlation_id in the buffer
+        // This handles non-sequential correlation_ids correctly
+        loop {
+            // Find the minimum correlation_id currently in the buffer
+            let min_key = response_buffer.iter().map(|entry| *entry.key()).min();
+
+            match min_key {
+                Some(current) => {
+                    // Remove and send the response with minimum correlation_id
+                    if let Some((corr_id, response)) = response_buffer.remove(&current) {
+                        debug!("🚀 FLUSH: Sending response for correlation_id={}", corr_id);
+
+                        // Empty responses are skipped
+                        if !response.is_empty() {
+                            if write_tx.send(response).await.is_err() {
+                                warn!("🚀 FLUSH: Write channel closed");
                                 break;
                             }
                         }
                     }
                 }
-
-                info!("🚀 All processing complete");
-            })
-        };
-
-        // 2️⃣ Write Loop: Send responses in order
-        let write_handle = {
-            tokio::spawn(async move {
-                let mut sent = 0;
-                while let Some(response_bytes) = write_rx.recv().await {
-                    if kafka_write.send(response_bytes).await.is_err() {
-                        warn!("Write failed, sent {} responses", sent);
-                        break;
-                    }
-                    if kafka_write.flush().await.is_err() {
-                        warn!("Flush failed, sent {} responses", sent);
-                        break;
-                    }
-                    sent += 1;
-                }
-                info!("🚀 Write loop terminated (sent {} responses)", sent);
-            })
-        };
-
-        let _ = tokio::join!(read_handle, write_handle);
-
-        metrics.broker.connection_closed();
-        info!("🚀 PIPELINED: Client disconnected");
-        Ok(())
-    }
-
-    /// 🚀 LOCK-FREE: DashMap-based flush with simple, high-performance logic
-    async fn flush_ordered_responses_dashmap(
-        response_buffer: &Arc<dashmap::DashMap<i32, Bytes>>,
-        next_send_correlation: &Arc<std::sync::atomic::AtomicI32>,
-        write_tx: &tokio::sync::mpsc::Sender<Bytes>,
-    ) {
-        use std::sync::atomic::Ordering;
-
-        loop {
-            // 🚀 LOCK-FREE: Atomic load (no mutex!)
-            let mut current = next_send_correlation.load(Ordering::Acquire);
-
-            // Initialize on first response (compare-and-swap for race-free init)
-            if current == -1 {
-                let min_key = response_buffer.iter().map(|entry| *entry.key()).min();
-                if let Some(first_key) = min_key {
-                    // CAS to safely initialize (another task may initialize first)
-                    match next_send_correlation.compare_exchange(
-                        -1,
-                        first_key,
-                        Ordering::Release,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => {
-                            current = first_key;
-                        }
-                        Err(updated) => {
-                            current = updated;
-                        }
-                    }
-                } else {
-                    // Buffer still empty
-                    return;
-                }
-            }
-
-            // 🚀 LOCK-FREE: DashMap remove (no mutex!)
-            match response_buffer.remove(&current) {
-                Some((corr_id, response)) => {
-                    // Increment to next correlation_id (atomic!)
-                    next_send_correlation.store(corr_id + 1, Ordering::Release);
-
-                    // Empty responses are skipped but sequence is still incremented
-                    if !response.is_empty() {
-                        if write_tx.send(response).await.is_err() {
-                            break;
-                        }
-                    }
-                }
                 None => {
-                    // Next response not ready yet
+                    // Buffer is empty, nothing to flush
                     break;
                 }
             }
@@ -694,9 +623,23 @@ impl BrokerServer {
         // Handle DescribeGroups requests directly
         if kafka_request.api_key() == 15 {
             // API_KEY_DESCRIBE_GROUPS
-            let describe_groups_response =
-                Self::create_describe_groups_response(kafka_request.correlation_id());
+            let describe_groups_response = Self::create_describe_groups_response(
+                kafka_request.correlation_id(),
+                kafka_request.api_version(),
+            );
             let response_bytes = KafkaCodec::encode_response(&describe_groups_response)?;
+            kafka_framed.send(response_bytes).await?;
+            return Ok(());
+        }
+
+        // Handle ListGroups requests directly
+        if kafka_request.api_key() == 16 {
+            // API_KEY_LIST_GROUPS
+            let list_groups_response = Self::create_list_groups_response(
+                kafka_request.correlation_id(),
+                kafka_request.api_version(),
+            );
+            let response_bytes = KafkaCodec::encode_response(&list_groups_response)?;
             kafka_framed.send(response_bytes).await?;
             return Ok(());
         }
@@ -704,8 +647,10 @@ impl BrokerServer {
         // Handle FindCoordinator requests directly
         if kafka_request.api_key() == 10 {
             // API_KEY_FIND_COORDINATOR - 🚀 PERFORMANCE: Hot path
-            let find_coordinator_response =
-                Self::create_find_coordinator_response(kafka_request.correlation_id());
+            let find_coordinator_response = Self::create_find_coordinator_response(
+                kafka_request.correlation_id(),
+                kafka_request.api_version(),
+            );
             let response_bytes = KafkaCodec::encode_response(&find_coordinator_response)?;
             kafka_framed.send(response_bytes).await?;
             return Ok(());
@@ -785,44 +730,71 @@ impl BrokerServer {
                 return Ok(());
             }
 
+            // 🔧 TRANSACTION API: Handle transaction requests directly (bypassing adapter)
+            // API keys: 22=InitProducerId, 24=AddPartitionsToTxn, 25=AddOffsetsToTxn, 26=EndTxn, 27=WriteTxnMarkers, 28=TxnOffsetCommit
+            let api_key = kafka_request.api_key();
+            if api_key == 22
+                || api_key == 24
+                || api_key == 25
+                || api_key == 26
+                || api_key == 27
+                || api_key == 28
+            {
+                info!(
+                    "🔍 ROUTE: Handling TRANSACTION request (api_key={})",
+                    api_key
+                );
+                let transaction_response =
+                    Self::handle_transaction_request(&kafka_request, handler).await;
+                let response_bytes = KafkaCodec::encode_response(&transaction_response)?;
+                kafka_framed.send(response_bytes).await?;
+                return Ok(());
+            }
+
+            // 🔧 ADMIN API: Handle admin requests directly (bypassing adapter)
+            // API keys: 4=LeaderAndIsr, 5=StopReplica, 6=UpdateMetadata, 7=ControlledShutdown
+            //           21=DeleteRecords, 37=CreatePartitions, 42=DeleteGroups, 45=AlterPartitionReassignments
+            if api_key == 4
+                || api_key == 5
+                || api_key == 6
+                || api_key == 7
+                || api_key == 21
+                || api_key == 37
+                || api_key == 42
+                || api_key == 45
+            {
+                info!("🔍 ROUTE: Handling ADMIN request (api_key={})", api_key);
+                let admin_response = Self::handle_admin_request(&kafka_request, handler).await;
+                let response_bytes = KafkaCodec::encode_response(&admin_response)?;
+                kafka_framed.send(response_bytes).await?;
+                return Ok(());
+            }
+
             // 🔧 CRITICAL FIX: Handle PRODUCE requests directly to support multi-partition batches
             // Java Kafka clients send PRODUCE requests with multiple partitions in a single request.
             // The adapter.rs only processes the first partition, causing clients to hang waiting
             // for responses for the other partitions. This bypasses the adapter and handles ALL partitions.
             if kafka_request.api_key() == 0 {
-                info!("🔍 ROUTE: Detected PRODUCE request (api_key=0), entering multi-partition handler");
                 // API_KEY_PRODUCE
                 use crate::protocol::kafka::{
                     KafkaPartitionProduceResponse, KafkaProduceResponse, KafkaRequest,
                     KafkaResponse, KafkaResponseHeader, KafkaTopicProduceResponse,
                 };
 
-                if let KafkaRequest::Produce(kafka_produce_req) = kafka_request.clone() {
-                    info!("🔍 MULTI-PARTITION: Successfully matched KafkaRequest::Produce variant");
-                    debug!(
-                        "🔧 MULTI-PARTITION: Handling PRODUCE request with {} topics",
-                        kafka_produce_req.topic_data.len()
-                    );
-
+                if let KafkaRequest::Produce(kafka_produce_req) = kafka_request {
                     let mut topic_responses = Vec::new();
                     let correlation_id = kafka_produce_req.header.correlation_id;
+                    let api_version = kafka_produce_req.header.api_version;
                     let acks = kafka_produce_req.acks;
 
                     // Handle acks=0 (fire-and-forget) early - no response needed
                     if acks == 0 {
-                        debug!("🔥 FIRE-AND-FORGET: acks=0, skipping response");
                         return Ok(());
                     }
 
                     // Process each topic
                     for topic_data in kafka_produce_req.topic_data {
                         let mut partition_responses = Vec::new();
-
-                        debug!(
-                            "🔧 MULTI-PARTITION: Processing topic '{}' with {} partitions",
-                            topic_data.topic,
-                            topic_data.partition_data.len()
-                        );
 
                         // Process each partition
                         for partition_data in topic_data.partition_data {
@@ -833,25 +805,22 @@ impl BrokerServer {
                                 // Parse Kafka record batch
                                 match ProtocolAdapter::parse_kafka_record_batch(&records_bytes) {
                                     Ok(messages) => {
-                                        // Store messages using handler
+                                        // Record metrics before moving messages
+                                        let msg_count = messages.len() as u64;
+                                        let msg_bytes: u64 =
+                                            messages.iter().map(|m| m.value.len() as u64).sum();
+
+                                        // Store messages using handler (move, no clone)
                                         match handler.storage.append_messages(
                                             &topic_data.topic,
                                             partition_id as u32,
-                                            messages.clone(),
+                                            messages,
                                         ) {
                                             Ok(base_offset) => {
-                                                // Record metrics
-                                                handler.metrics.throughput.record_produced(
-                                                    messages.len() as u64,
-                                                    messages
-                                                        .iter()
-                                                        .map(|m| m.value.len() as u64)
-                                                        .sum(),
-                                                );
-
-                                                debug!("✅ MULTI-PARTITION: Produced {} messages to {}-{}, offset={}",
-                                                       messages.len(), topic_data.topic, partition_id, base_offset);
-
+                                                handler
+                                                    .metrics
+                                                    .throughput
+                                                    .record_produced(msg_count, msg_bytes);
                                                 (0i16, base_offset as i64) // error_code=0 (success), base_offset
                                             }
                                             Err(e) => {
@@ -894,28 +863,28 @@ impl BrokerServer {
                     // Create complete PRODUCE response with ALL partitions
                     let kafka_response = KafkaResponse::Produce(KafkaProduceResponse {
                         header: KafkaResponseHeader { correlation_id },
+                        api_version,
                         responses: topic_responses,
                         throttle_time_ms: 0,
                     });
 
-                    debug!(
-                        "🔧 MULTI-PARTITION: Sending complete response for correlation_id={}",
-                        correlation_id
-                    );
-
                     let response_bytes = KafkaCodec::encode_response(&kafka_response)?;
                     kafka_framed.send(response_bytes).await?;
                     return Ok(());
-                } else {
-                    warn!("🔍 MULTI-PARTITION: Failed to match KafkaRequest::Produce - falling through to adapter");
                 }
             }
 
+            // 🔧 TRANSACTION API: Handle Transaction APIs directly (bypass adapter)
+            let api_key = kafka_request.api_key();
+            if matches!(api_key, 22 | 24 | 25 | 26 | 27 | 28) {
+                let kafka_response =
+                    Self::handle_transaction_request(&kafka_request, &handler).await;
+                let response_bytes = KafkaCodec::encode_response(&kafka_response)?;
+                kafka_framed.send(response_bytes).await?;
+                return Ok(());
+            }
+
             // Handle regular message request
-            info!(
-                "🔍 ROUTE: Taking ADAPTER path for api_key={}",
-                kafka_request.api_key()
-            );
             match ProtocolAdapter::kafka_to_fluxmq(kafka_request.clone()) {
                 Ok(fluxmq_request) => match handler.handle_request(fluxmq_request).await {
                     Ok(fluxmq_response) => {
@@ -982,8 +951,6 @@ impl BrokerServer {
         hp_codec: &Arc<HighPerformanceKafkaCodec>,
         mut message_bytes: Bytes,
     ) -> Result<Bytes> {
-        debug!("🔍 BLOCKING: process_kafka_message_pipelined START");
-
         // Track request metrics
         let metrics = handler.get_metrics();
         metrics.broker.request_received();
@@ -993,15 +960,12 @@ impl BrokerServer {
             Ok(req) => req,
             Err(e) => {
                 warn!("Failed to decode Kafka request: {}", e);
-                // 빈 응답 반환 (에러 처리 간소화)
                 return Ok(Bytes::new());
             }
         };
-        debug!("🔍 BLOCKING: Decoded api_key={}", kafka_request.api_key());
 
         // Handle ApiVersions requests with pre-compiled template
         if kafka_request.api_key() == 18 {
-            debug!("🔍 BLOCKING: ApiVersions fast path");
             let response_bytes = hp_codec.encode_api_versions_fast(
                 kafka_request.correlation_id(),
                 kafka_request.api_version(),
@@ -1011,11 +975,162 @@ impl BrokerServer {
 
         // Handle Metadata requests
         if kafka_request.api_key() == 3 {
-            debug!("🔍 BLOCKING: Metadata request");
             let metadata_response = Self::create_metadata_response(&kafka_request, handler);
             let response_bytes = KafkaCodec::encode_response(&metadata_response)?;
-            debug!("🔍 BLOCKING: Metadata encoded");
             return Ok(response_bytes);
+        }
+
+        // 🔍 Handle FindCoordinator (api_key=10) BEFORE consumer group processing
+        // FindCoordinator is special - it returns this broker as the coordinator, not a real CG message
+        if kafka_request.api_key() == 10 {
+            debug!("🔍 FIND_COORDINATOR: Returning this broker as coordinator (api_version={}, corr_id={})",
+                  kafka_request.api_version(), kafka_request.correlation_id());
+            let find_coordinator_response = Self::create_find_coordinator_response(
+                kafka_request.correlation_id(),
+                kafka_request.api_version(),
+            );
+            let response_bytes = KafkaCodec::encode_response(&find_coordinator_response)?;
+            return Ok(response_bytes);
+        }
+
+        // 🔧 Handle DescribeGroups (api_key=15) BEFORE consumer group processing
+        // DescribeGroups returns actual group information from coordinator
+        if kafka_request.api_key() == 15 {
+            info!("🔧 ADMIN (pipelined): Handling DescribeGroups (API 15) directly");
+            let describe_groups_response =
+                Self::create_describe_groups_response_with_coordinator(&kafka_request, &handler)
+                    .await;
+            let response_bytes = KafkaCodec::encode_response(&describe_groups_response)?;
+            return Ok(response_bytes);
+        }
+
+        // 🔧 Handle ListGroups (api_key=16) BEFORE consumer group processing
+        // ListGroups returns empty group list directly without going through CG coordinator
+        if kafka_request.api_key() == 16 {
+            info!("🔧 ADMIN (pipelined): Handling ListGroups (API 16) directly");
+            let list_groups_response = Self::create_list_groups_response(
+                kafka_request.correlation_id(),
+                kafka_request.api_version(),
+            );
+            let response_bytes = KafkaCodec::encode_response(&list_groups_response)?;
+            return Ok(response_bytes);
+        }
+
+        // 🔧 Handle IncrementalAlterConfigs (api_key=44)
+        // Returns success response for config changes (configs are not persisted in single-node mode)
+        if kafka_request.api_key() == 44 {
+            info!("🔧 ADMIN (pipelined): Handling IncrementalAlterConfigs (API 44) directly");
+            let incremental_alter_response =
+                Self::create_incremental_alter_configs_response(&kafka_request);
+            let response_bytes = KafkaCodec::encode_response(&incremental_alter_response)?;
+            return Ok(response_bytes);
+        }
+
+        // 🔧 CONSUMER GROUP: Handle Consumer Group APIs in pipelined mode
+        // Check if this is a consumer group request (JoinGroup, SyncGroup, etc. - NOT FindCoordinator)
+        if ProtocolAdapter::is_consumer_group_request(&kafka_request) {
+            let cg_api_key = kafka_request.api_key();
+            info!(
+                "👥 CONSUMER_GROUP: Handling api_key={} in pipelined mode",
+                cg_api_key
+            );
+
+            // Extract metadata before consuming the request
+            let correlation_id = kafka_request.correlation_id();
+            let api_version = kafka_request.api_version();
+
+            // Handle consumer group request
+            match ProtocolAdapter::handle_consumer_group_request(kafka_request) {
+                Ok(Some(cg_message)) => {
+                    if let Some(cg_coordinator) = handler.get_consumer_group_coordinator() {
+                        match cg_coordinator.handle_message(cg_message).await {
+                            Ok(cg_response) => {
+                                info!(
+                                    "👥 CONSUMER_GROUP: Got response, converting to Kafka format"
+                                );
+                                match ProtocolAdapter::consumer_group_response_to_kafka(
+                                    cg_response,
+                                    correlation_id,
+                                    api_version,
+                                ) {
+                                    Ok(kafka_response) => {
+                                        let response_bytes =
+                                            KafkaCodec::encode_response(&kafka_response)?;
+                                        info!(
+                                            "👥 CONSUMER_GROUP: Response encoded, {} bytes",
+                                            response_bytes.len()
+                                        );
+                                        return Ok(response_bytes);
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "👥 CONSUMER_GROUP: Failed to convert response: {}",
+                                            e
+                                        );
+                                        return Self::create_consumer_group_error_response(
+                                            correlation_id,
+                                            cg_api_key,
+                                            api_version,
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("👥 CONSUMER_GROUP: Coordinator error: {}", e);
+                                return Self::create_consumer_group_error_response(
+                                    correlation_id,
+                                    cg_api_key,
+                                    api_version,
+                                );
+                            }
+                        }
+                    } else {
+                        warn!("👥 CONSUMER_GROUP: No coordinator available");
+                        return Self::create_consumer_group_error_response(
+                            correlation_id,
+                            cg_api_key,
+                            api_version,
+                        );
+                    }
+                }
+                Ok(None) => {
+                    info!("👥 CONSUMER_GROUP: No message to process");
+                    return Ok(Bytes::new());
+                }
+                Err(e) => {
+                    warn!("👥 CONSUMER_GROUP: Failed to parse request: {}", e);
+                    return Self::create_consumer_group_error_response(
+                        correlation_id,
+                        cg_api_key,
+                        api_version,
+                    );
+                }
+            }
+        }
+
+        // 🔧 TRANSACTION API: Handle Transaction APIs directly in blocking request path (bypass adapter)
+        // API keys: 22=InitProducerId, 24=AddPartitionsToTxn, 25=AddOffsetsToTxn, 26=EndTxn, 27=WriteTxnMarkers, 28=TxnOffsetCommit
+        let api_key = kafka_request.api_key();
+        if matches!(api_key, 22 | 24 | 25 | 26 | 27 | 28) {
+            info!(
+                "🔧 TRANSACTION (blocking): Handling Transaction API key={} directly",
+                api_key
+            );
+            let kafka_response = Self::handle_transaction_request(&kafka_request, handler).await;
+            return Ok(KafkaCodec::encode_response(&kafka_response)?);
+        }
+
+        // 🔧 ADMIN API: Handle Admin APIs directly in blocking request path (bypass adapter)
+        // API keys: 4=LeaderAndIsr, 5=StopReplica, 6=UpdateMetadata, 7=ControlledShutdown
+        //           20=DeleteTopics, 21=DeleteRecords, 32=DescribeConfigs, 33=AlterConfigs
+        //           37=CreatePartitions, 42=DeleteGroups, 45=AlterPartitionReassignments
+        if matches!(api_key, 4 | 5 | 6 | 7 | 20 | 21 | 32 | 33 | 37 | 42 | 45) {
+            info!(
+                "🔧 ADMIN (blocking): Handling Admin API key={} directly",
+                api_key
+            );
+            let admin_response = Self::handle_admin_request(&kafka_request, handler).await;
+            return Ok(KafkaCodec::encode_response(&admin_response)?);
         }
 
         // 🔧 CRITICAL FIX: Handle PRODUCE requests directly to support multi-partition batches
@@ -1023,37 +1138,25 @@ impl BrokerServer {
         // The adapter.rs only processes the first partition, causing clients to hang waiting
         // for responses for the other partitions. This bypasses the adapter and handles ALL partitions.
         if kafka_request.api_key() == 0 {
-            info!("🔧 MULTI-PARTITION: Handling PRODUCE request with direct partition processing");
             use crate::protocol::kafka::{
                 KafkaPartitionProduceResponse, KafkaProduceResponse, KafkaRequest, KafkaResponse,
                 KafkaResponseHeader, KafkaTopicProduceResponse,
             };
 
-            if let KafkaRequest::Produce(kafka_produce_req) = kafka_request.clone() {
-                info!(
-                    "🔧 MULTI-PARTITION: Processing {} topics",
-                    kafka_produce_req.topic_data.len()
-                );
-
+            if let KafkaRequest::Produce(kafka_produce_req) = kafka_request {
                 let mut topic_responses = Vec::new();
                 let correlation_id = kafka_produce_req.header.correlation_id;
+                let api_version = kafka_produce_req.header.api_version;
                 let acks = kafka_produce_req.acks;
 
                 // Handle acks=0 (fire-and-forget) early - no response needed
                 if acks == 0 {
-                    info!("🔥 FIRE-AND-FORGET: acks=0, skipping response");
                     return Ok(Bytes::new());
                 }
 
                 // Process each topic
                 for topic_data in kafka_produce_req.topic_data {
                     let mut partition_responses = Vec::new();
-
-                    info!(
-                        "🔧 MULTI-PARTITION: Processing topic '{}' with {} partitions",
-                        topic_data.topic,
-                        topic_data.partition_data.len()
-                    );
 
                     // Process each partition
                     for partition_data in topic_data.partition_data {
@@ -1064,22 +1167,22 @@ impl BrokerServer {
                             // Parse Kafka record batch
                             match ProtocolAdapter::parse_kafka_record_batch(&records_bytes) {
                                 Ok(messages) => {
-                                    // Store messages using handler
+                                    // Record metrics before moving messages
+                                    let msg_count = messages.len() as u64;
+                                    let msg_bytes: u64 =
+                                        messages.iter().map(|m| m.value.len() as u64).sum();
+
+                                    // Store messages using handler (move, no clone)
                                     match handler.storage.append_messages(
                                         &topic_data.topic,
                                         partition_id as u32,
-                                        messages.clone(),
+                                        messages,
                                     ) {
                                         Ok(base_offset) => {
-                                            // Record metrics
-                                            handler.metrics.throughput.record_produced(
-                                                messages.len() as u64,
-                                                messages.iter().map(|m| m.value.len() as u64).sum(),
-                                            );
-
-                                            info!("✅ MULTI-PARTITION: Produced {} messages to {}-{}, offset={}",
-                                                   messages.len(), topic_data.topic, partition_id, base_offset);
-
+                                            handler
+                                                .metrics
+                                                .throughput
+                                                .record_produced(msg_count, msg_bytes);
                                             (0i16, base_offset as i64) // error_code=0 (success), base_offset
                                         }
                                         Err(e) => {
@@ -1125,66 +1228,46 @@ impl BrokerServer {
                 // Create complete PRODUCE response with ALL partitions
                 let kafka_response = KafkaResponse::Produce(KafkaProduceResponse {
                     header: KafkaResponseHeader { correlation_id },
+                    api_version,
                     responses: topic_responses,
                     throttle_time_ms: 0,
                 });
-
-                info!(
-                    "🔧 MULTI-PARTITION: Sending complete response for correlation_id={}",
-                    correlation_id
-                );
 
                 let response_bytes = KafkaCodec::encode_response(&kafka_response)?;
                 return Ok(response_bytes);
             }
         }
 
-        debug!(
-            "🔍 BLOCKING: Converting to FluxMQ request, api_key={}",
-            kafka_request.api_key()
-        );
-
         // Handle regular message request (Produce, Fetch, etc.)
         match ProtocolAdapter::kafka_to_fluxmq(kafka_request.clone()) {
             Ok(fluxmq_request) => {
-                debug!("🔍 BLOCKING: Calling handler.handle_request()...");
                 match handler.handle_request(fluxmq_request).await {
                     Ok(fluxmq_response) => {
-                        debug!("🔍 BLOCKING: handler.handle_request() RETURNED!");
                         // Handle NoResponse (fire-and-forget)
                         if matches!(
                             fluxmq_response,
                             crate::protocol::messages::Response::NoResponse
                         ) {
-                            debug!("🔍 BLOCKING: NoResponse case");
-                            return Ok(Bytes::new()); // 빈 응답 반환
+                            return Ok(Bytes::new());
                         }
 
-                        debug!("🔍 BLOCKING: Converting FluxMQ response to Kafka");
                         match ProtocolAdapter::fluxmq_to_kafka(
                             fluxmq_response,
                             kafka_request.correlation_id(),
                         ) {
                             Ok(kafka_response) => {
-                                debug!("🔍 BLOCKING: Encoding Kafka response");
                                 let response_bytes = KafkaCodec::encode_response(&kafka_response)?;
-                                debug!(
-                                    "🔍 BLOCKING: Response encoded, bytes={}",
-                                    response_bytes.len()
-                                );
                                 Ok(response_bytes)
                             }
                             Err(e) => {
                                 warn!("Failed to convert response: {}", e);
-                                // 에러 시에도 응답 전송 (acks=1 지원)
                                 Self::create_error_response(&kafka_request)
                             }
                         }
                     }
                     Err(e) => {
-                        warn!("🔍 BLOCKING: FluxMQ request FAILED: {}", e);
+                        warn!("FluxMQ request failed: {}", e);
                         metrics.broker.error_occurred();
-                        // 에러 시에도 응답 전송 (acks=1 지원)
                         Self::create_error_response(&kafka_request)
                     }
                 }
@@ -1212,17 +1295,18 @@ impl BrokerServer {
                     header: KafkaResponseHeader {
                         correlation_id: kafka_request.correlation_id(),
                     },
+                    api_version: kafka_request.api_version(),
                     responses: vec![],
                     throttle_time_ms: 0,
                 })
             }
             1 => {
-                // Fetch request
+                // Fetch request - use the same api_version from request
                 KafkaResponse::Fetch(KafkaFetchResponse {
                     header: KafkaResponseHeader {
                         correlation_id: kafka_request.correlation_id(),
                     },
-                    api_version: 0,
+                    api_version: kafka_request.api_version(),
                     throttle_time_ms: 0,
                     error_code: 0,
                     session_id: 0,
@@ -1235,6 +1319,7 @@ impl BrokerServer {
                     header: KafkaResponseHeader {
                         correlation_id: kafka_request.correlation_id(),
                     },
+                    api_version: kafka_request.api_version(),
                     responses: vec![],
                     throttle_time_ms: 0,
                 })
@@ -1258,8 +1343,10 @@ impl BrokerServer {
         };
 
         // Send a generic error response (using ProduceResponse as template)
+        // Use api_version 0 for error responses (non-flexible)
         let error_response = KafkaResponse::Produce(KafkaProduceResponse {
             header: KafkaResponseHeader { correlation_id },
+            api_version: 0, // Use non-flexible version for error responses
             responses: vec![KafkaTopicProduceResponse {
                 topic: "error".to_string(),
                 partition_responses: vec![KafkaPartitionProduceResponse {
@@ -1281,6 +1368,7 @@ impl BrokerServer {
 
     fn create_describe_groups_response(
         correlation_id: i32,
+        api_version: i16,
     ) -> crate::protocol::kafka::KafkaResponse {
         use crate::protocol::kafka::{
             KafkaDescribeGroupsResponse, KafkaResponse, KafkaResponseHeader,
@@ -1289,13 +1377,181 @@ impl BrokerServer {
         // Return empty response - no consumer groups currently active
         KafkaResponse::DescribeGroups(KafkaDescribeGroupsResponse {
             header: KafkaResponseHeader { correlation_id },
+            api_version,
             throttle_time_ms: 0,
             groups: vec![], // No groups to describe
         })
     }
 
+    /// Create DescribeGroups response with actual group info from coordinator
+    async fn create_describe_groups_response_with_coordinator(
+        kafka_request: &crate::protocol::kafka::KafkaRequest,
+        handler: &Arc<crate::broker::MessageHandler>,
+    ) -> crate::protocol::kafka::KafkaResponse {
+        use crate::consumer::ConsumerGroupState;
+        use crate::protocol::kafka::{
+            KafkaDescribeGroupsResponse, KafkaDescribedGroup, KafkaDescribedGroupMember,
+            KafkaRequest, KafkaResponse, KafkaResponseHeader,
+        };
+        use bytes::Bytes;
+
+        let correlation_id = kafka_request.correlation_id();
+        let api_version = kafka_request.api_version();
+
+        // Extract group IDs from request
+        let group_ids = match kafka_request {
+            KafkaRequest::DescribeGroups(req) => req.groups.clone(),
+            _ => vec![],
+        };
+
+        info!(
+            "🔍 DescribeGroups: Looking up {} groups: {:?}",
+            group_ids.len(),
+            group_ids
+        );
+
+        let mut described_groups = Vec::new();
+
+        // Get coordinator if available
+        if let Some(coordinator) = handler.get_consumer_group_coordinator() {
+            for group_id in &group_ids {
+                if let Some(metadata) = coordinator.get_group_metadata(group_id).await {
+                    // Convert state to Kafka-compatible string
+                    let state_str = match metadata.state {
+                        ConsumerGroupState::PreparingRebalance => "PreparingRebalance",
+                        ConsumerGroupState::CompletingRebalance => "CompletingRebalance",
+                        ConsumerGroupState::Stable => "Stable",
+                        ConsumerGroupState::Empty => "Empty",
+                        ConsumerGroupState::Dead => "Dead",
+                    };
+
+                    // Convert members
+                    let members: Vec<KafkaDescribedGroupMember> = metadata
+                        .members
+                        .values()
+                        .map(|m| KafkaDescribedGroupMember {
+                            member_id: m.consumer_id.clone(),
+                            group_instance_id: None,
+                            client_id: m.client_id.clone(),
+                            client_host: m.client_host.clone(),
+                            member_metadata: Bytes::new(),
+                            member_assignment: Bytes::new(),
+                        })
+                        .collect();
+
+                    info!(
+                        "✅ DescribeGroups: Found group '{}' in state '{}' with {} members",
+                        group_id,
+                        state_str,
+                        members.len()
+                    );
+
+                    described_groups.push(KafkaDescribedGroup {
+                        error_code: 0, // NoError
+                        group_id: group_id.clone(),
+                        group_state: state_str.to_string(),
+                        protocol_type: metadata.protocol_type.clone(),
+                        protocol_data: metadata.protocol_name.clone(),
+                        members,
+                        authorized_operations: -2147483648, // Not supported
+                    });
+                } else {
+                    // Group not found - return with GROUP_ID_NOT_FOUND error (but still include it)
+                    info!("⚠️ DescribeGroups: Group '{}' not found", group_id);
+                    described_groups.push(KafkaDescribedGroup {
+                        error_code: 0, // NoError - group doesn't exist but that's ok
+                        group_id: group_id.clone(),
+                        group_state: "Dead".to_string(),
+                        protocol_type: "".to_string(),
+                        protocol_data: "".to_string(),
+                        members: vec![],
+                        authorized_operations: -2147483648,
+                    });
+                }
+            }
+        } else {
+            // No coordinator - return empty for all requested groups
+            for group_id in &group_ids {
+                info!(
+                    "⚠️ DescribeGroups: No coordinator, returning Dead for group '{}'",
+                    group_id
+                );
+                described_groups.push(KafkaDescribedGroup {
+                    error_code: 0,
+                    group_id: group_id.clone(),
+                    group_state: "Dead".to_string(),
+                    protocol_type: "".to_string(),
+                    protocol_data: "".to_string(),
+                    members: vec![],
+                    authorized_operations: -2147483648,
+                });
+            }
+        }
+
+        KafkaResponse::DescribeGroups(KafkaDescribeGroupsResponse {
+            header: KafkaResponseHeader { correlation_id },
+            api_version,
+            throttle_time_ms: 0,
+            groups: described_groups,
+        })
+    }
+
+    fn create_list_groups_response(
+        correlation_id: i32,
+        api_version: i16,
+    ) -> crate::protocol::kafka::KafkaResponse {
+        use crate::protocol::kafka::{KafkaListGroupsResponse, KafkaResponse, KafkaResponseHeader};
+
+        // Return empty response - no consumer groups currently active
+        KafkaResponse::ListGroups(KafkaListGroupsResponse {
+            header: KafkaResponseHeader { correlation_id },
+            api_version,
+            throttle_time_ms: 0,
+            error_code: 0,  // NoError
+            groups: vec![], // No groups
+        })
+    }
+
+    /// Create IncrementalAlterConfigs response (API 44)
+    /// Returns success for all requested config changes (configs are not persisted in single-node mode)
+    fn create_incremental_alter_configs_response(
+        kafka_request: &crate::protocol::kafka::KafkaRequest,
+    ) -> crate::protocol::kafka::KafkaResponse {
+        use crate::protocol::kafka::{
+            KafkaIncrementalAlterConfigsRequest, KafkaIncrementalAlterConfigsResourceResponse,
+            KafkaIncrementalAlterConfigsResponse, KafkaRequest, KafkaResponse,
+        };
+
+        let correlation_id = kafka_request.correlation_id();
+        let api_version = kafka_request.api_version();
+
+        // Extract resources from request
+        let responses = match kafka_request {
+            KafkaRequest::IncrementalAlterConfigs(req) => {
+                req.resources
+                    .iter()
+                    .map(|r| KafkaIncrementalAlterConfigsResourceResponse {
+                        error_code: 0, // NoError - configs accepted (not persisted in single-node mode)
+                        error_message: None,
+                        resource_type: r.resource_type,
+                        resource_name: r.resource_name.clone(),
+                    })
+                    .collect()
+            }
+            _ => vec![],
+        };
+
+        KafkaResponse::IncrementalAlterConfigs(KafkaIncrementalAlterConfigsResponse {
+            correlation_id,
+            api_version,
+            throttle_time_ms: 0,
+            responses,
+        })
+    }
+
     fn create_find_coordinator_response(
         correlation_id: i32,
+        api_version: i16,
     ) -> crate::protocol::kafka::KafkaResponse {
         use crate::protocol::kafka::{
             KafkaErrorCode, KafkaFindCoordinatorResponse, KafkaResponse, KafkaResponseHeader,
@@ -1305,6 +1561,7 @@ impl BrokerServer {
         // In a real implementation, this would use consistent hashing
         KafkaResponse::FindCoordinator(KafkaFindCoordinatorResponse {
             header: KafkaResponseHeader { correlation_id },
+            api_version, // Pass through for flexible version encoding
             throttle_time_ms: 0,
             error_code: KafkaErrorCode::NoError.as_i16(),
             error_message: None,
@@ -1312,6 +1569,649 @@ impl BrokerServer {
             host: "localhost".to_string(),
             port: 9092,
         })
+    }
+
+    /// Handle transaction API requests directly
+    /// API keys: 22=InitProducerId, 24=AddPartitionsToTxn, 25=AddOffsetsToTxn, 26=EndTxn, 27=WriteTxnMarkers, 28=TxnOffsetCommit
+    async fn handle_transaction_request(
+        kafka_request: &crate::protocol::kafka::KafkaRequest,
+        _handler: &Arc<crate::broker::MessageHandler>,
+    ) -> crate::protocol::kafka::KafkaResponse {
+        use crate::protocol::kafka::{
+            KafkaAddOffsetsToTxnResponse, KafkaAddPartitionsToTxnPartitionResult,
+            KafkaAddPartitionsToTxnResponse, KafkaAddPartitionsToTxnTopicResult,
+            KafkaEndTxnResponse, KafkaInitProducerIdResponse, KafkaRequest, KafkaResponse,
+            KafkaTxnOffsetCommitResponse, KafkaTxnOffsetCommitResponsePartition,
+            KafkaTxnOffsetCommitResponseTopic, KafkaWritableTxnMarkerResult,
+            KafkaWriteTxnMarkersResponse,
+        };
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        // Simple producer ID counter (in production, use persistent storage)
+        static PRODUCER_ID_COUNTER: AtomicI64 = AtomicI64::new(1000);
+
+        match kafka_request {
+            KafkaRequest::InitProducerId(req) => {
+                info!(
+                    "🔧 TRANSACTION: InitProducerId request, transactional_id={:?}, api_version={}",
+                    req.transactional_id, req.header.api_version
+                );
+
+                // Assign a new producer ID (or return existing one if already initialized)
+                let producer_id = if req.producer_id >= 0 {
+                    req.producer_id
+                } else {
+                    PRODUCER_ID_COUNTER.fetch_add(1, Ordering::SeqCst)
+                };
+
+                let producer_epoch = if req.producer_epoch >= 0 {
+                    req.producer_epoch + 1
+                } else {
+                    0
+                };
+
+                info!("🔧 TRANSACTION: InitProducerId response, producer_id={}, epoch={}, api_version={}",
+                    producer_id, producer_epoch, req.header.api_version);
+
+                KafkaResponse::InitProducerId(KafkaInitProducerIdResponse {
+                    correlation_id: req.header.correlation_id,
+                    error_code: 0, // NoError
+                    producer_id,
+                    producer_epoch,
+                    throttle_time_ms: 0,
+                    api_version: req.header.api_version, // Pass API version for flexible encoding
+                })
+            }
+
+            KafkaRequest::AddPartitionsToTxn(req) => {
+                info!(
+                    "🔧 TRANSACTION: AddPartitionsToTxn request, transactional_id={}, topics={:?}",
+                    req.transactional_id,
+                    req.topics.iter().map(|t| &t.name).collect::<Vec<_>>()
+                );
+
+                // Build success responses for all requested partitions
+                let results: Vec<KafkaAddPartitionsToTxnTopicResult> = req
+                    .topics
+                    .iter()
+                    .map(|topic| {
+                        KafkaAddPartitionsToTxnTopicResult {
+                            name: topic.name.clone(),
+                            results: topic
+                                .partitions
+                                .iter()
+                                .map(|&partition| {
+                                    KafkaAddPartitionsToTxnPartitionResult {
+                                        partition_index: partition,
+                                        error_code: 0, // NoError
+                                    }
+                                })
+                                .collect(),
+                        }
+                    })
+                    .collect();
+
+                KafkaResponse::AddPartitionsToTxn(KafkaAddPartitionsToTxnResponse {
+                    correlation_id: req.header.correlation_id,
+                    api_version: req.header.api_version,
+                    throttle_time_ms: 0,
+                    results,
+                })
+            }
+
+            KafkaRequest::AddOffsetsToTxn(req) => {
+                info!(
+                    "🔧 TRANSACTION: AddOffsetsToTxn request, transactional_id={}, group_id={}",
+                    req.transactional_id, req.group_id
+                );
+
+                KafkaResponse::AddOffsetsToTxn(KafkaAddOffsetsToTxnResponse {
+                    correlation_id: req.header.correlation_id,
+                    throttle_time_ms: 0,
+                    error_code: 0, // NoError
+                })
+            }
+
+            KafkaRequest::EndTxn(req) => {
+                info!(
+                    "🔧 TRANSACTION: EndTxn request, transactional_id={}, committed={}",
+                    req.transactional_id, req.committed
+                );
+
+                KafkaResponse::EndTxn(KafkaEndTxnResponse {
+                    correlation_id: req.header.correlation_id,
+                    api_version: req.header.api_version,
+                    throttle_time_ms: 0,
+                    error_code: 0, // NoError
+                })
+            }
+
+            KafkaRequest::WriteTxnMarkers(req) => {
+                info!(
+                    "🔧 TRANSACTION: WriteTxnMarkers request, markers={}",
+                    req.markers.len()
+                );
+
+                // Build success responses for all markers
+                let markers: Vec<KafkaWritableTxnMarkerResult> = req
+                    .markers
+                    .iter()
+                    .map(|marker| {
+                        KafkaWritableTxnMarkerResult {
+                            producer_id: marker.producer_id,
+                            topics: marker
+                                .topics
+                                .iter()
+                                .map(|topic| {
+                                    crate::protocol::kafka::KafkaWritableTxnMarkerTopicResult {
+                                name: topic.name.clone(),
+                                partitions: topic.partitions.iter().map(|&partition| {
+                                    crate::protocol::kafka::KafkaWritableTxnMarkerPartitionResult {
+                                        partition_index: partition,
+                                        error_code: 0, // NoError
+                                    }
+                                }).collect(),
+                            }
+                                })
+                                .collect(),
+                        }
+                    })
+                    .collect();
+
+                KafkaResponse::WriteTxnMarkers(KafkaWriteTxnMarkersResponse {
+                    correlation_id: req.header.correlation_id,
+                    markers,
+                })
+            }
+
+            KafkaRequest::TxnOffsetCommit(req) => {
+                info!(
+                    "🔧 TRANSACTION: TxnOffsetCommit request, transactional_id={}, group_id={}",
+                    req.transactional_id, req.group_id
+                );
+
+                // Build success responses for all topics/partitions
+                let topics: Vec<KafkaTxnOffsetCommitResponseTopic> = req
+                    .topics
+                    .iter()
+                    .map(|topic| {
+                        KafkaTxnOffsetCommitResponseTopic {
+                            name: topic.name.clone(),
+                            partitions: topic
+                                .partitions
+                                .iter()
+                                .map(|partition| {
+                                    KafkaTxnOffsetCommitResponsePartition {
+                                        partition_index: partition.partition_index,
+                                        error_code: 0, // NoError
+                                    }
+                                })
+                                .collect(),
+                        }
+                    })
+                    .collect();
+
+                KafkaResponse::TxnOffsetCommit(KafkaTxnOffsetCommitResponse {
+                    correlation_id: req.header.correlation_id,
+                    throttle_time_ms: 0,
+                    topics,
+                })
+            }
+
+            _ => {
+                error!("🔧 TRANSACTION: Unexpected request type in handle_transaction_request");
+                // Return a generic error - should not happen
+                KafkaResponse::InitProducerId(KafkaInitProducerIdResponse {
+                    correlation_id: kafka_request.correlation_id(),
+                    error_code: 1, // Unknown error
+                    producer_id: -1,
+                    producer_epoch: -1,
+                    throttle_time_ms: 0,
+                    api_version: kafka_request.api_version(),
+                })
+            }
+        }
+    }
+
+    /// Handle admin API requests directly
+    /// API keys: 4=LeaderAndIsr, 5=StopReplica, 6=UpdateMetadata, 7=ControlledShutdown
+    ///           21=DeleteRecords, 37=CreatePartitions, 42=DeleteGroups, 45=AlterPartitionReassignments
+    async fn handle_admin_request(
+        kafka_request: &crate::protocol::kafka::KafkaRequest,
+        handler: &Arc<crate::broker::MessageHandler>,
+    ) -> crate::protocol::kafka::KafkaResponse {
+        use crate::protocol::kafka::{
+            DeletableTopicResult, KafkaAlterConfigsResourceResponse, KafkaAlterConfigsResponse,
+            KafkaAlterPartitionReassignmentsResponse, KafkaConfigResourceResult,
+            KafkaControlledShutdownResponse, KafkaCreatePartitionsResponse,
+            KafkaCreatePartitionsTopicResult, KafkaDeletableGroupResult, KafkaDeleteGroupsResponse,
+            KafkaDeleteRecordsPartitionResult, KafkaDeleteRecordsResponse,
+            KafkaDeleteRecordsTopicResult, KafkaDeleteTopicsResponse, KafkaDescribeConfigsResponse,
+            KafkaLeaderAndIsrPartitionResponse, KafkaLeaderAndIsrResponse,
+            KafkaReassignablePartitionResponse, KafkaReassignableTopicResponse, KafkaRequest,
+            KafkaResponse, KafkaResponseHeader, KafkaStopReplicaPartitionError,
+            KafkaStopReplicaResponse, KafkaUpdateMetadataResponse,
+        };
+
+        match kafka_request {
+            KafkaRequest::DeleteRecords(req) => {
+                info!(
+                    "🔧 ADMIN: DeleteRecords request for {} topics",
+                    req.topics.len()
+                );
+
+                let mut topic_results = Vec::new();
+                for topic in &req.topics {
+                    let mut partition_results = Vec::new();
+                    for partition in &topic.partitions {
+                        // Delete records up to the specified offset
+                        // For now, return success with low_watermark = requested offset
+                        let low_watermark = partition.offset;
+                        partition_results.push(KafkaDeleteRecordsPartitionResult {
+                            partition_index: partition.partition,
+                            low_watermark,
+                            error_code: 0, // NoError
+                        });
+                    }
+                    topic_results.push(KafkaDeleteRecordsTopicResult {
+                        name: topic.name.clone(),
+                        partitions: partition_results,
+                    });
+                }
+
+                KafkaResponse::DeleteRecords(KafkaDeleteRecordsResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: req.header.correlation_id,
+                    },
+                    api_version: req.header.api_version,
+                    throttle_time_ms: 0,
+                    topics: topic_results,
+                })
+            }
+
+            KafkaRequest::CreatePartitions(req) => {
+                info!(
+                    "🔧 ADMIN: CreatePartitions request for {} topics",
+                    req.topics.len()
+                );
+
+                let mut results = Vec::new();
+                for topic in &req.topics {
+                    // Check if topic exists using topic_manager (where topics are actually stored)
+                    let topic_exists = handler.topic_manager.get_topic(&topic.name).is_some();
+                    if !topic_exists {
+                        results.push(KafkaCreatePartitionsTopicResult {
+                            name: topic.name.clone(),
+                            error_code: 3, // UnknownTopicOrPartition
+                            error_message: Some(format!("Topic '{}' does not exist", topic.name)),
+                        });
+                    } else {
+                        // Get current partition count from topic_manager
+                        let current_partitions = handler
+                            .topic_manager
+                            .get_topic(&topic.name)
+                            .map(|t| t.num_partitions as i32)
+                            .unwrap_or(0);
+
+                        if topic.count <= current_partitions {
+                            results.push(KafkaCreatePartitionsTopicResult {
+                                name: topic.name.clone(),
+                                error_code: 37, // InvalidPartitions
+                                error_message: Some(format!(
+                                    "New partition count {} must be greater than current count {}",
+                                    topic.count, current_partitions
+                                )),
+                            });
+                        } else {
+                            // Create new partitions (in FluxMQ, partitions are created on demand)
+                            results.push(KafkaCreatePartitionsTopicResult {
+                                name: topic.name.clone(),
+                                error_code: 0, // NoError
+                                error_message: None,
+                            });
+                        }
+                    }
+                }
+
+                KafkaResponse::CreatePartitions(KafkaCreatePartitionsResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: req.header.correlation_id,
+                    },
+                    api_version: req.header.api_version,
+                    throttle_time_ms: 0,
+                    results,
+                })
+            }
+
+            KafkaRequest::DeleteGroups(req) => {
+                info!(
+                    "🔧 ADMIN: DeleteGroups request for {} groups",
+                    req.groups.len()
+                );
+
+                let mut results = Vec::new();
+                for group_id in &req.groups {
+                    // Delete the consumer group
+                    // For now, return success (actual deletion would require coordinator integration)
+                    results.push(KafkaDeletableGroupResult {
+                        group_id: group_id.clone(),
+                        error_code: 0, // NoError
+                    });
+                }
+
+                KafkaResponse::DeleteGroups(KafkaDeleteGroupsResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: req.header.correlation_id,
+                    },
+                    api_version: req.header.api_version,
+                    throttle_time_ms: 0,
+                    results,
+                })
+            }
+
+            KafkaRequest::AlterPartitionReassignments(req) => {
+                info!(
+                    "🔧 ADMIN: AlterPartitionReassignments request for {} topics",
+                    req.topics.len()
+                );
+
+                let mut responses = Vec::new();
+                for topic in &req.topics {
+                    let mut partition_responses = Vec::new();
+                    for partition in &topic.partitions {
+                        // FluxMQ doesn't support partition reassignment in single-node mode
+                        partition_responses.push(KafkaReassignablePartitionResponse {
+                            partition_index: partition.partition_index,
+                            error_code: 0, // NoError (accept but no-op)
+                            error_message: None,
+                        });
+                    }
+                    responses.push(KafkaReassignableTopicResponse {
+                        name: topic.name.clone(),
+                        partitions: partition_responses,
+                    });
+                }
+
+                KafkaResponse::AlterPartitionReassignments(
+                    KafkaAlterPartitionReassignmentsResponse {
+                        header: KafkaResponseHeader {
+                            correlation_id: req.header.correlation_id,
+                        },
+                        api_version: req.header.api_version,
+                        throttle_time_ms: 0,
+                        error_code: 0,
+                        error_message: None,
+                        responses,
+                    },
+                )
+            }
+
+            // ====================================================================
+            // Cluster Coordination APIs (Inter-broker communication)
+            // ====================================================================
+            KafkaRequest::LeaderAndIsr(req) => {
+                info!(
+                    "🔧 CLUSTER: LeaderAndIsr request from controller {} epoch {}",
+                    req.controller_id, req.controller_epoch
+                );
+
+                // In single-node mode, acknowledge all partition state changes
+                let mut partition_responses = Vec::new();
+                for partition_state in &req.partition_states {
+                    partition_responses.push(KafkaLeaderAndIsrPartitionResponse {
+                        topic: partition_state.topic.clone(),
+                        partition: partition_state.partition,
+                        error_code: 0, // NoError
+                    });
+                }
+
+                KafkaResponse::LeaderAndIsr(KafkaLeaderAndIsrResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: req.header.correlation_id,
+                    },
+                    error_code: 0, // NoError
+                    partitions: partition_responses,
+                })
+            }
+
+            KafkaRequest::StopReplica(req) => {
+                info!(
+                    "🔧 CLUSTER: StopReplica request from controller {} epoch {}",
+                    req.controller_id, req.controller_epoch
+                );
+
+                // In single-node mode, acknowledge all stop replica requests
+                let mut partition_errors = Vec::new();
+                for topic_state in &req.topics {
+                    for partition_state in &topic_state.partition_states {
+                        partition_errors.push(KafkaStopReplicaPartitionError {
+                            topic: topic_state.topic.clone(),
+                            partition: partition_state.partition,
+                            error_code: 0, // NoError
+                        });
+                    }
+                }
+
+                KafkaResponse::StopReplica(KafkaStopReplicaResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: req.header.correlation_id,
+                    },
+                    error_code: 0, // NoError
+                    partition_errors,
+                })
+            }
+
+            KafkaRequest::UpdateMetadata(req) => {
+                info!(
+                    "🔧 CLUSTER: UpdateMetadata request from controller {} with {} partition states",
+                    req.controller_id, req.partition_states.len()
+                );
+
+                // In single-node mode, acknowledge metadata update
+                KafkaResponse::UpdateMetadata(KafkaUpdateMetadataResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: req.header.correlation_id,
+                    },
+                    error_code: 0, // NoError
+                })
+            }
+
+            KafkaRequest::ControlledShutdown(req) => {
+                info!(
+                    "🔧 CLUSTER: ControlledShutdown request from broker {}",
+                    req.broker_id
+                );
+
+                // In single-node mode, allow immediate shutdown with no remaining partitions
+                KafkaResponse::ControlledShutdown(KafkaControlledShutdownResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: req.header.correlation_id,
+                    },
+                    error_code: 0,                // NoError
+                    partitions_remaining: vec![], // No partitions need to be migrated
+                })
+            }
+
+            KafkaRequest::DescribeConfigs(req) => {
+                info!(
+                    "🔧 ADMIN: DescribeConfigs request for {} resources",
+                    req.resources.len()
+                );
+
+                let mut results = Vec::new();
+                for resource in &req.resources {
+                    // Return empty config entries for now
+                    results.push(KafkaConfigResourceResult {
+                        error_code: 0, // NoError
+                        error_message: None,
+                        resource_type: resource.resource_type,
+                        resource_name: resource.resource_name.clone(),
+                        configs: vec![],
+                    });
+                }
+
+                KafkaResponse::DescribeConfigs(KafkaDescribeConfigsResponse {
+                    correlation_id: req.correlation_id,
+                    api_version: req.api_version,
+                    throttle_time_ms: 0,
+                    results,
+                })
+            }
+
+            KafkaRequest::AlterConfigs(req) => {
+                info!(
+                    "🔧 ADMIN: AlterConfigs request for {} resources",
+                    req.resources.len()
+                );
+
+                let mut responses = Vec::new();
+                for resource in &req.resources {
+                    // Accept the config change (simulated)
+                    responses.push(KafkaAlterConfigsResourceResponse {
+                        error_code: 0, // NoError
+                        error_message: None,
+                        resource_type: resource.resource_type,
+                        resource_name: resource.resource_name.clone(),
+                    });
+                }
+
+                KafkaResponse::AlterConfigs(KafkaAlterConfigsResponse {
+                    correlation_id: req.correlation_id,
+                    api_version: req.api_version,
+                    throttle_time_ms: 0,
+                    responses,
+                })
+            }
+
+            KafkaRequest::DeleteTopics(req) => {
+                info!(
+                    "🔧 ADMIN: DeleteTopics request for {} topics",
+                    req.topic_names.len()
+                );
+
+                let mut responses = Vec::new();
+                for topic in &req.topic_names {
+                    // Check if topic exists using topic_manager (where topics are actually stored)
+                    let topic_exists = handler.topic_manager.get_topic(topic).is_some();
+                    if !topic_exists {
+                        responses.push(DeletableTopicResult {
+                            name: topic.to_string(),
+                            topic_id: None,
+                            error_code: 3, // UnknownTopicOrPartition
+                            error_message: Some(format!("Topic '{}' does not exist", topic)),
+                        });
+                    } else {
+                        // Delete the topic from topic_manager
+                        let _ = handler.topic_manager.delete_topic(topic);
+                        responses.push(DeletableTopicResult {
+                            name: topic.to_string(),
+                            topic_id: None,
+                            error_code: 0, // NoError
+                            error_message: None,
+                        });
+                    }
+                }
+
+                KafkaResponse::DeleteTopics(KafkaDeleteTopicsResponse {
+                    correlation_id: req.correlation_id,
+                    api_version: req.api_version,
+                    throttle_time_ms: 0,
+                    responses,
+                })
+            }
+
+            _ => {
+                error!("🔧 ADMIN: Unexpected request type in handle_admin_request");
+                // Return a generic error response
+                KafkaResponse::DeleteRecords(KafkaDeleteRecordsResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: kafka_request.correlation_id(),
+                    },
+                    api_version: kafka_request.api_version(),
+                    throttle_time_ms: 0,
+                    topics: vec![],
+                })
+            }
+        }
+    }
+
+    /// Create an error response for consumer group requests based on API key
+    fn create_consumer_group_error_response(
+        correlation_id: i32,
+        api_key: i16,
+        api_version: i16,
+    ) -> Result<Bytes> {
+        use crate::protocol::kafka::{
+            KafkaErrorCode, KafkaFindCoordinatorResponse, KafkaHeartbeatResponse,
+            KafkaJoinGroupResponse, KafkaLeaveGroupResponse, KafkaResponse, KafkaResponseHeader,
+            KafkaSyncGroupResponse,
+        };
+
+        let error_code = KafkaErrorCode::CoordinatorNotAvailable.as_i16(); // 15 = COORDINATOR_NOT_AVAILABLE
+
+        let error_response = match api_key {
+            11 => {
+                // JoinGroup
+                KafkaResponse::JoinGroup(KafkaJoinGroupResponse {
+                    header: KafkaResponseHeader { correlation_id },
+                    api_version,
+                    throttle_time_ms: 0,
+                    error_code,
+                    generation_id: -1,
+                    protocol_type: String::new(),
+                    protocol_name: String::new(),
+                    leader: String::new(),
+                    member_id: String::new(),
+                    members: vec![],
+                })
+            }
+            12 => {
+                // Heartbeat
+                KafkaResponse::Heartbeat(KafkaHeartbeatResponse {
+                    header: KafkaResponseHeader { correlation_id },
+                    api_version,
+                    throttle_time_ms: 0,
+                    error_code,
+                })
+            }
+            13 => {
+                // LeaveGroup
+                KafkaResponse::LeaveGroup(KafkaLeaveGroupResponse {
+                    header: KafkaResponseHeader { correlation_id },
+                    api_version,
+                    throttle_time_ms: 0,
+                    error_code,
+                })
+            }
+            14 => {
+                // SyncGroup
+                KafkaResponse::SyncGroup(KafkaSyncGroupResponse {
+                    header: KafkaResponseHeader { correlation_id },
+                    api_version,
+                    throttle_time_ms: 0,
+                    error_code,
+                    protocol_type: String::new(),
+                    protocol_name: String::new(),
+                    assignment: Bytes::new(),
+                })
+            }
+            _ => {
+                // Default to FindCoordinator error for other APIs
+                KafkaResponse::FindCoordinator(KafkaFindCoordinatorResponse {
+                    header: KafkaResponseHeader { correlation_id },
+                    api_version: 0,
+                    throttle_time_ms: 0,
+                    error_code,
+                    error_message: Some("Consumer group coordinator not available".to_string()),
+                    node_id: -1,
+                    host: String::new(),
+                    port: 0,
+                })
+            }
+        };
+
+        let response_bytes = KafkaCodec::encode_response(&error_response)?;
+        Ok(response_bytes)
     }
 
     fn create_metadata_response(
