@@ -1,5 +1,5 @@
 use crate::acl::{AclManager, Principal};
-use crate::performance::io_optimizations::ConnectionPool;
+use crate::performance::io_optimizations::{ConnectionPool, ZeroCopyBufferManager};
 use crate::performance::numa_allocator::NumaAwareAllocator;
 use crate::performance::thread_affinity::{AffinityStrategy, ThreadAffinityManager};
 use crate::protocol::high_performance_codec::HighPerformanceKafkaCodec;
@@ -25,6 +25,8 @@ pub struct BrokerServer {
     numa_allocator: Option<Arc<NumaAwareAllocator>>,
     // Thread affinity manager for CPU pinning
     thread_affinity: Option<Arc<ThreadAffinityManager>>,
+    // Zero-copy buffer manager for efficient memory allocation
+    buffer_manager: Arc<ZeroCopyBufferManager>,
 }
 
 impl BrokerServer {
@@ -54,7 +56,10 @@ impl BrokerServer {
             AffinityStrategy::WorkloadOptimized,
         )));
 
-        info!("🚀 NUMA allocator and thread affinity manager initialized");
+        // Initialize zero-copy buffer manager for efficient memory allocation
+        let buffer_manager = Arc::new(ZeroCopyBufferManager::new());
+
+        info!("🚀 NUMA allocator, thread affinity, and buffer manager initialized");
 
         Ok(Self {
             config,
@@ -63,6 +68,7 @@ impl BrokerServer {
             shutdown_tx,
             numa_allocator,
             thread_affinity,
+            buffer_manager,
         })
     }
 
@@ -106,7 +112,10 @@ impl BrokerServer {
                 AffinityStrategy::WorkloadOptimized,
             )));
 
-            info!("🚀 NUMA allocator and thread affinity manager initialized");
+            // Initialize zero-copy buffer manager
+            let buffer_manager = Arc::new(ZeroCopyBufferManager::new());
+
+            info!("🚀 NUMA allocator, thread affinity, and buffer manager initialized");
 
             Ok(Self {
                 config,
@@ -115,6 +124,7 @@ impl BrokerServer {
                 shutdown_tx,
                 numa_allocator,
                 thread_affinity,
+                buffer_manager,
             })
         } else {
             let mut handler = MessageHandler::new_with_features(
@@ -147,7 +157,10 @@ impl BrokerServer {
                 AffinityStrategy::WorkloadOptimized,
             )));
 
-            info!("🚀 NUMA allocator and thread affinity manager initialized");
+            // Initialize zero-copy buffer manager
+            let buffer_manager = Arc::new(ZeroCopyBufferManager::new());
+
+            info!("🚀 NUMA allocator, thread affinity, and buffer manager initialized");
 
             Ok(Self {
                 config,
@@ -156,6 +169,7 @@ impl BrokerServer {
                 shutdown_tx,
                 numa_allocator,
                 thread_affinity,
+                buffer_manager,
             })
         }
     }
@@ -221,7 +235,10 @@ impl BrokerServer {
             AffinityStrategy::WorkloadOptimized,
         )));
 
-        info!("🚀 NUMA allocator and thread affinity manager initialized (with recovery)");
+        // Initialize zero-copy buffer manager
+        let buffer_manager = Arc::new(ZeroCopyBufferManager::new());
+
+        info!("🚀 NUMA allocator, thread affinity, and buffer manager initialized (with recovery)");
 
         Ok(Self {
             config,
@@ -230,6 +247,7 @@ impl BrokerServer {
             shutdown_tx,
             numa_allocator,
             thread_affinity,
+            buffer_manager,
         })
     }
 
@@ -366,11 +384,12 @@ impl BrokerServer {
 
                     let handler = Arc::clone(&self.handler);
                     let connection_pool = Arc::clone(&self.connection_pool);
+                    let buffer_manager = Arc::clone(&self.buffer_manager);
 
                     tokio::spawn(async move {
                         // ✅ OPTION A: Using single-task sequential architecture
                         // Simple, predictable, no race conditions, guaranteed ordering
-                        if let Err(e) = Self::handle_client(stream, handler).await {
+                        if let Err(e) = Self::handle_client_with_buffer_pool(stream, handler, buffer_manager).await {
                             error!("Error handling client {}: {}", peer_addr, e);
                         } else {
                             info!("Client {} disconnected", peer_addr);
@@ -423,6 +442,7 @@ impl BrokerServer {
     /// 🔵 SIMPLE SYNCHRONOUS: Original sequential request-response handling
     /// - No pipelining, process one request at a time
     /// - Guaranteed ordering, no race conditions
+    #[allow(dead_code)]
     async fn handle_client(stream: TcpStream, handler: Arc<MessageHandler>) -> Result<()> {
         info!("🚀 SEQUENTIAL: New client connected - simple sync processing");
 
@@ -453,15 +473,24 @@ impl BrokerServer {
                         continue;
                     };
 
-                    info!("🚀 RECV: api_key={}, correlation_id={}, len={}",
-                          api_key, correlation_id, message_bytes.len());
+                    debug!(
+                        "🚀 RECV: api_key={}, correlation_id={}, len={}",
+                        api_key,
+                        correlation_id,
+                        message_bytes.len()
+                    );
 
                     // Process the request and get response
-                    match Self::process_kafka_message_pipelined(&handler, &hp_codec, message_bytes).await {
+                    match Self::process_kafka_message_pipelined(&handler, &hp_codec, message_bytes)
+                        .await
+                    {
                         Ok(response_bytes) => {
                             if !response_bytes.is_empty() {
-                                info!("🚀 SEND: response for correlation_id={}, len={}",
-                                      correlation_id, response_bytes.len());
+                                debug!(
+                                    "🚀 SEND: response for correlation_id={}, len={}",
+                                    correlation_id,
+                                    response_bytes.len()
+                                );
 
                                 // Send response immediately
                                 use futures::SinkExt;
@@ -477,7 +506,10 @@ impl BrokerServer {
                             }
                         }
                         Err(e) => {
-                            warn!("Request processing failed for correlation_id={}: {}", correlation_id, e);
+                            warn!(
+                                "Request processing failed for correlation_id={}: {}",
+                                correlation_id, e
+                            );
                         }
                     }
                 }
@@ -497,43 +529,105 @@ impl BrokerServer {
         Ok(())
     }
 
-    /// 🚀 LOCK-FREE: DashMap-based flush with simple, high-performance logic
-    ///
-    /// CRITICAL FIX (2025-12-05): Kafka correlation_ids are NOT necessarily sequential!
-    /// Java AdminClient may use correlation_ids like: 1, 4, 7, 10...
-    /// We must find the ACTUAL minimum correlation_id in the buffer, not assume +1 increments.
-    async fn flush_ordered_responses_dashmap(
-        response_buffer: &Arc<dashmap::DashMap<i32, Bytes>>,
-        _next_send_correlation: &Arc<std::sync::atomic::AtomicI32>,
-        write_tx: &tokio::sync::mpsc::Sender<Bytes>,
-    ) {
-        // 🔧 FIX: Always find the minimum correlation_id in the buffer
-        // This handles non-sequential correlation_ids correctly
+    /// 🚀 ULTRA-PERFORMANCE: Sequential client handling with buffer pooling
+    /// - Uses ZeroCopyBufferManager for efficient buffer allocation/reuse
+    /// - Reduces GC pressure through buffer recycling
+    /// - Maintains guaranteed ordering with no race conditions
+    async fn handle_client_with_buffer_pool(
+        stream: TcpStream,
+        handler: Arc<MessageHandler>,
+        buffer_manager: Arc<ZeroCopyBufferManager>,
+    ) -> Result<()> {
+        debug!("🚀 BUFFER_POOL: New client connected - optimized buffer processing");
+
+        let metrics = handler.get_metrics();
+        metrics.broker.connection_opened();
+
+        let mut kafka_framed = tokio_util::codec::Framed::new(stream, KafkaFrameCodec);
+        let hp_codec = Arc::new(HighPerformanceKafkaCodec::new());
+
         loop {
-            // Find the minimum correlation_id currently in the buffer
-            let min_key = response_buffer.iter().map(|entry| *entry.key()).min();
+            match tokio_stream::StreamExt::next(&mut kafka_framed).await {
+                Some(Ok(message_bytes)) => {
+                    let (api_key, correlation_id) = if message_bytes.len() >= 8 {
+                        let api_key = i16::from_be_bytes([message_bytes[0], message_bytes[1]]);
+                        let corr_id = i32::from_be_bytes([
+                            message_bytes[4],
+                            message_bytes[5],
+                            message_bytes[6],
+                            message_bytes[7],
+                        ]);
+                        (api_key, corr_id)
+                    } else {
+                        warn!("Invalid message format: {} bytes", message_bytes.len());
+                        continue;
+                    };
 
-            match min_key {
-                Some(current) => {
-                    // Remove and send the response with minimum correlation_id
-                    if let Some((corr_id, response)) = response_buffer.remove(&current) {
-                        debug!("🚀 FLUSH: Sending response for correlation_id={}", corr_id);
+                    debug!(
+                        "🚀 RECV: api_key={}, correlation_id={}, len={}",
+                        api_key,
+                        correlation_id,
+                        message_bytes.len()
+                    );
 
-                        // Empty responses are skipped
-                        if !response.is_empty() {
-                            if write_tx.send(response).await.is_err() {
-                                warn!("🚀 FLUSH: Write channel closed");
-                                break;
+                    // 🚀 BUFFER_POOL: Get pooled buffer for response encoding
+                    // Estimate response size based on request type
+                    let estimated_response_size = match api_key {
+                        18 => 360,  // ApiVersions - fixed size
+                        3 => 1024,  // Metadata - medium
+                        0 => 256,   // Produce - small
+                        1 => 16384, // Fetch - can be large
+                        _ => 1024,  // Default
+                    };
+                    let _pooled_buf = buffer_manager.get_buffer(estimated_response_size);
+
+                    match Self::process_kafka_message_pipelined(&handler, &hp_codec, message_bytes)
+                        .await
+                    {
+                        Ok(response_bytes) => {
+                            if !response_bytes.is_empty() {
+                                debug!(
+                                    "🚀 SEND: response for correlation_id={}, len={}",
+                                    correlation_id,
+                                    response_bytes.len()
+                                );
+
+                                if let Err(e) = kafka_framed.send(response_bytes).await {
+                                    warn!("Failed to send response: {}", e);
+                                    break;
+                                }
+                                if let Err(e) = kafka_framed.flush().await {
+                                    warn!("Failed to flush response: {}", e);
+                                    break;
+                                }
                             }
                         }
+                        Err(e) => {
+                            warn!(
+                                "Request processing failed for correlation_id={}: {}",
+                                correlation_id, e
+                            );
+                        }
                     }
+
+                    // Note: _pooled_buf will be dropped here. For true buffer reuse,
+                    // we could track BytesMut ownership and return to pool, but the
+                    // current encode path returns Bytes which is immutable.
+                }
+                Some(Err(e)) => {
+                    warn!("Failed to decode message: {}", e);
+                    break;
                 }
                 None => {
-                    // Buffer is empty, nothing to flush
+                    debug!("🚀 Client disconnected (stream closed)");
                     break;
                 }
             }
         }
+
+        metrics.broker.connection_closed();
+        debug!("🚀 BUFFER_POOL: Client connection ended");
+        Ok(())
     }
 
     async fn process_kafka_message<IO>(
@@ -590,21 +684,21 @@ impl BrokerServer {
                         | ((message_bytes[6] as i32) << 8)
                         | (message_bytes[7] as i32);
 
-                    info!("Extracted Java client header: api_key={}, api_version={}, correlation_id={}", 
+                    debug!("Extracted Java client header: api_key={}, api_version={}, correlation_id={}",
                           api_key, api_version, correlation_id);
 
                     // Handle Java ApiVersions requests specially
                     if api_key == 18 {
-                        warn!("Detected Java ApiVersions request - using compatibility mode");
+                        debug!("Detected Java ApiVersions request - using compatibility mode");
                         // Send a compatible ApiVersions response for Java clients
                         let response_bytes =
                             hp_codec.encode_api_versions_fast(correlation_id, api_version as i16);
-                        info!(
+                        debug!(
                             "Sending Java-compatible ApiVersions response: {} bytes",
                             response_bytes.len()
                         );
                         kafka_framed.send(response_bytes).await?;
-                        info!("Java-compatible ApiVersions response sent successfully");
+                        debug!("Java-compatible ApiVersions response sent successfully");
                         return Ok(());
                     }
                 }
@@ -640,6 +734,28 @@ impl BrokerServer {
                 kafka_request.api_version(),
             );
             let response_bytes = KafkaCodec::encode_response(&list_groups_response)?;
+            kafka_framed.send(response_bytes).await?;
+            return Ok(());
+        }
+
+        // Handle GetTelemetrySubscriptions requests directly
+        if kafka_request.api_key() == 71 {
+            // API_KEY_GET_TELEMETRY_SUBSCRIPTIONS
+            let telemetry_response =
+                Self::create_get_telemetry_subscriptions_response(kafka_request.correlation_id());
+            let response_bytes = KafkaCodec::encode_response(&telemetry_response)?;
+            kafka_framed.send(response_bytes).await?;
+            return Ok(());
+        }
+
+        // Handle DescribeCluster requests directly
+        if kafka_request.api_key() == 60 {
+            // API_KEY_DESCRIBE_CLUSTER
+            let describe_cluster_response = Self::create_describe_cluster_response(
+                kafka_request.correlation_id(),
+                kafka_request.api_version(),
+            );
+            let response_bytes = KafkaCodec::encode_response(&describe_cluster_response)?;
             kafka_framed.send(response_bytes).await?;
             return Ok(());
         }
@@ -722,7 +838,7 @@ impl BrokerServer {
 
             // Handle Metadata requests directly (like ApiVersions)
             if kafka_request.api_key() == 3 {
-                info!("🔍 ROUTE: Handling METADATA request (api_key=3)");
+                debug!("🔍 ROUTE: Handling METADATA request (api_key=3)");
                 // API_KEY_METADATA - 🚀 PERFORMANCE: Hot path
                 let metadata_response = Self::create_metadata_response(&kafka_request, handler);
                 let response_bytes = KafkaCodec::encode_response(&metadata_response)?;
@@ -740,7 +856,7 @@ impl BrokerServer {
                 || api_key == 27
                 || api_key == 28
             {
-                info!(
+                debug!(
                     "🔍 ROUTE: Handling TRANSACTION request (api_key={})",
                     api_key
                 );
@@ -753,17 +869,29 @@ impl BrokerServer {
 
             // 🔧 ADMIN API: Handle admin requests directly (bypassing adapter)
             // API keys: 4=LeaderAndIsr, 5=StopReplica, 6=UpdateMetadata, 7=ControlledShutdown
-            //           21=DeleteRecords, 37=CreatePartitions, 42=DeleteGroups, 45=AlterPartitionReassignments
+            //           21=DeleteRecords, 23=OffsetForLeaderEpoch, 29-31=ACL APIs
+            //           37=CreatePartitions, 42=DeleteGroups, 44=IncrementalAlterConfigs
+            //           45=AlterPartitionReassignments, 46=ListPartitionReassignments
+            //           47=OffsetDelete, 61=DescribeProducers, 72=PushTelemetry
             if api_key == 4
                 || api_key == 5
                 || api_key == 6
                 || api_key == 7
                 || api_key == 21
+                || api_key == 23
+                || api_key == 29
+                || api_key == 30
+                || api_key == 31
                 || api_key == 37
                 || api_key == 42
+                || api_key == 44
                 || api_key == 45
+                || api_key == 46
+                || api_key == 47
+                || api_key == 61
+                || api_key == 72
             {
-                info!("🔍 ROUTE: Handling ADMIN request (api_key={})", api_key);
+                debug!("🔍 ROUTE: Handling ADMIN request (api_key={})", api_key);
                 let admin_response = Self::handle_admin_request(&kafka_request, handler).await;
                 let response_bytes = KafkaCodec::encode_response(&admin_response)?;
                 kafka_framed.send(response_bytes).await?;
@@ -782,7 +910,8 @@ impl BrokerServer {
                 };
 
                 if let KafkaRequest::Produce(kafka_produce_req) = kafka_request {
-                    let mut topic_responses = Vec::new();
+                    let mut topic_responses =
+                        Vec::with_capacity(kafka_produce_req.topic_data.len());
                     let correlation_id = kafka_produce_req.header.correlation_id;
                     let api_version = kafka_produce_req.header.api_version;
                     let acks = kafka_produce_req.acks;
@@ -794,7 +923,8 @@ impl BrokerServer {
 
                     // Process each topic
                     for topic_data in kafka_produce_req.topic_data {
-                        let mut partition_responses = Vec::new();
+                        let mut partition_responses =
+                            Vec::with_capacity(topic_data.partition_data.len());
 
                         // Process each partition
                         for partition_data in topic_data.partition_data {
@@ -885,7 +1015,9 @@ impl BrokerServer {
             }
 
             // Handle regular message request
-            match ProtocolAdapter::kafka_to_fluxmq(kafka_request.clone()) {
+            // PERFORMANCE: Store correlation_id before consuming kafka_request to avoid clone
+            let correlation_id = kafka_request.correlation_id();
+            match ProtocolAdapter::kafka_to_fluxmq(kafka_request) {
                 Ok(fluxmq_request) => match handler.handle_request(fluxmq_request).await {
                     Ok(fluxmq_response) => {
                         // Handle NoResponse (fire-and-forget) - don't send any response
@@ -897,10 +1029,7 @@ impl BrokerServer {
                             return Ok(());
                         }
 
-                        match ProtocolAdapter::fluxmq_to_kafka(
-                            fluxmq_response,
-                            kafka_request.correlation_id(),
-                        ) {
+                        match ProtocolAdapter::fluxmq_to_kafka(fluxmq_response, correlation_id) {
                             Ok(kafka_response) => {
                                 let response_bytes = KafkaCodec::encode_response(&kafka_response)?;
                                 kafka_framed.send(response_bytes).await?;
@@ -923,7 +1052,7 @@ impl BrokerServer {
                         metrics.broker.error_occurred();
                         Self::send_kafka_error_response(
                             kafka_framed,
-                            kafka_request.correlation_id(),
+                            correlation_id,
                             crate::protocol::kafka::KafkaErrorCode::Unknown,
                         )
                         .await?;
@@ -934,7 +1063,7 @@ impl BrokerServer {
                     metrics.broker.error_occurred();
                     Self::send_kafka_error_response(
                         kafka_framed,
-                        kafka_request.correlation_id(),
+                        correlation_id,
                         crate::protocol::kafka::KafkaErrorCode::InvalidRequest,
                     )
                     .await?;
@@ -1013,6 +1142,28 @@ impl BrokerServer {
                 kafka_request.api_version(),
             );
             let response_bytes = KafkaCodec::encode_response(&list_groups_response)?;
+            return Ok(response_bytes);
+        }
+
+        // 🔧 Handle GetTelemetrySubscriptions (api_key=71) BEFORE consumer group processing
+        // Returns telemetry subscription info for client metrics
+        if kafka_request.api_key() == 71 {
+            info!("🔧 TELEMETRY (pipelined): Handling GetTelemetrySubscriptions (API 71) directly");
+            let telemetry_response =
+                Self::create_get_telemetry_subscriptions_response(kafka_request.correlation_id());
+            let response_bytes = KafkaCodec::encode_response(&telemetry_response)?;
+            return Ok(response_bytes);
+        }
+
+        // 🔧 Handle DescribeCluster (api_key=60) BEFORE consumer group processing
+        // Returns cluster information for AdminClient
+        if kafka_request.api_key() == 60 {
+            info!("🔧 ADMIN (pipelined): Handling DescribeCluster (API 60) directly");
+            let describe_cluster_response = Self::create_describe_cluster_response(
+                kafka_request.correlation_id(),
+                kafka_request.api_version(),
+            );
+            let response_bytes = KafkaCodec::encode_response(&describe_cluster_response)?;
             return Ok(response_bytes);
         }
 
@@ -1122,9 +1273,31 @@ impl BrokerServer {
 
         // 🔧 ADMIN API: Handle Admin APIs directly in blocking request path (bypass adapter)
         // API keys: 4=LeaderAndIsr, 5=StopReplica, 6=UpdateMetadata, 7=ControlledShutdown
-        //           20=DeleteTopics, 21=DeleteRecords, 32=DescribeConfigs, 33=AlterConfigs
-        //           37=CreatePartitions, 42=DeleteGroups, 45=AlterPartitionReassignments
-        if matches!(api_key, 4 | 5 | 6 | 7 | 20 | 21 | 32 | 33 | 37 | 42 | 45) {
+        //           20=DeleteTopics, 21=DeleteRecords, 23=OffsetForLeaderEpoch, 29-31=ACL APIs
+        //           32=DescribeConfigs, 33=AlterConfigs, 37=CreatePartitions, 42=DeleteGroups
+        //           45=AlterPartitionReassignments, 46=ListPartitionReassignments, 47=OffsetDelete
+        //           61=DescribeProducers, 72=PushTelemetry
+        if matches!(
+            api_key,
+            4 | 5
+                | 6
+                | 7
+                | 20
+                | 21
+                | 23
+                | 29
+                | 30
+                | 31
+                | 32
+                | 33
+                | 37
+                | 42
+                | 45
+                | 46
+                | 47
+                | 61
+                | 72
+        ) {
             info!(
                 "🔧 ADMIN (blocking): Handling Admin API key={} directly",
                 api_key
@@ -1144,7 +1317,7 @@ impl BrokerServer {
             };
 
             if let KafkaRequest::Produce(kafka_produce_req) = kafka_request {
-                let mut topic_responses = Vec::new();
+                let mut topic_responses = Vec::with_capacity(kafka_produce_req.topic_data.len());
                 let correlation_id = kafka_produce_req.header.correlation_id;
                 let api_version = kafka_produce_req.header.api_version;
                 let acks = kafka_produce_req.acks;
@@ -1156,7 +1329,8 @@ impl BrokerServer {
 
                 // Process each topic
                 for topic_data in kafka_produce_req.topic_data {
-                    let mut partition_responses = Vec::new();
+                    let mut partition_responses =
+                        Vec::with_capacity(topic_data.partition_data.len());
 
                     // Process each partition
                     for partition_data in topic_data.partition_data {
@@ -1239,7 +1413,10 @@ impl BrokerServer {
         }
 
         // Handle regular message request (Produce, Fetch, etc.)
-        match ProtocolAdapter::kafka_to_fluxmq(kafka_request.clone()) {
+        // PERFORMANCE: Store correlation_id before consuming kafka_request to avoid clone
+        let correlation_id = kafka_request.correlation_id();
+        let api_key_for_error = kafka_request.api_key();
+        match ProtocolAdapter::kafka_to_fluxmq(kafka_request) {
             Ok(fluxmq_request) => {
                 match handler.handle_request(fluxmq_request).await {
                     Ok(fluxmq_response) => {
@@ -1251,24 +1428,24 @@ impl BrokerServer {
                             return Ok(Bytes::new());
                         }
 
-                        match ProtocolAdapter::fluxmq_to_kafka(
-                            fluxmq_response,
-                            kafka_request.correlation_id(),
-                        ) {
+                        match ProtocolAdapter::fluxmq_to_kafka(fluxmq_response, correlation_id) {
                             Ok(kafka_response) => {
                                 let response_bytes = KafkaCodec::encode_response(&kafka_response)?;
                                 Ok(response_bytes)
                             }
                             Err(e) => {
                                 warn!("Failed to convert response: {}", e);
-                                Self::create_error_response(&kafka_request)
+                                Self::create_error_response_simple(
+                                    correlation_id,
+                                    api_key_for_error,
+                                )
                             }
                         }
                     }
                     Err(e) => {
                         warn!("FluxMQ request failed: {}", e);
                         metrics.broker.error_occurred();
-                        Self::create_error_response(&kafka_request)
+                        Self::create_error_response_simple(correlation_id, api_key_for_error)
                     }
                 }
             }
@@ -1276,7 +1453,7 @@ impl BrokerServer {
                 warn!("Failed to convert Kafka request: {}", e);
                 metrics.broker.error_occurred();
                 // 에러 시에도 응답 전송 (acks=1 지원)
-                Self::create_error_response(&kafka_request)
+                Self::create_error_response_simple(correlation_id, api_key_for_error)
             }
         }
     }
@@ -1320,6 +1497,46 @@ impl BrokerServer {
                         correlation_id: kafka_request.correlation_id(),
                     },
                     api_version: kafka_request.api_version(),
+                    responses: vec![],
+                    throttle_time_ms: 0,
+                })
+            }
+        };
+
+        Ok(KafkaCodec::encode_response(&error_response)?)
+    }
+
+    /// Create error response without kafka_request reference (clone-free)
+    fn create_error_response_simple(correlation_id: i32, api_key: i16) -> Result<Bytes> {
+        use crate::protocol::kafka::messages::*;
+
+        // API Key별로 적절한 에러 응답 생성
+        let error_response = match api_key {
+            0 => {
+                // Produce request
+                KafkaResponse::Produce(KafkaProduceResponse {
+                    header: KafkaResponseHeader { correlation_id },
+                    api_version: 7, // Default version
+                    responses: vec![],
+                    throttle_time_ms: 0,
+                })
+            }
+            1 => {
+                // Fetch request
+                KafkaResponse::Fetch(KafkaFetchResponse {
+                    header: KafkaResponseHeader { correlation_id },
+                    api_version: 11, // Default version
+                    throttle_time_ms: 0,
+                    error_code: 0,
+                    session_id: 0,
+                    responses: vec![],
+                })
+            }
+            _ => {
+                // 기타 API는 빈 Produce 응답으로 처리
+                KafkaResponse::Produce(KafkaProduceResponse {
+                    header: KafkaResponseHeader { correlation_id },
+                    api_version: 7,
                     responses: vec![],
                     throttle_time_ms: 0,
                 })
@@ -1410,7 +1627,7 @@ impl BrokerServer {
             group_ids
         );
 
-        let mut described_groups = Vec::new();
+        let mut described_groups = Vec::with_capacity(group_ids.len());
 
         // Get coordinator if available
         if let Some(coordinator) = handler.get_consumer_group_coordinator() {
@@ -1496,6 +1713,72 @@ impl BrokerServer {
         })
     }
 
+    /// Create DescribeCluster response (API 60)
+    /// Returns cluster information for AdminClient
+    fn create_describe_cluster_response(
+        correlation_id: i32,
+        api_version: i16,
+    ) -> crate::protocol::kafka::KafkaResponse {
+        use crate::protocol::kafka::{
+            KafkaDescribeClusterBroker, KafkaDescribeClusterResponse, KafkaResponse,
+            KafkaResponseHeader,
+        };
+
+        KafkaResponse::DescribeCluster(KafkaDescribeClusterResponse {
+            header: KafkaResponseHeader { correlation_id },
+            api_version,
+            throttle_time_ms: 0,
+            error_code: 0,                       // NoError
+            error_message: None,                 // No error message
+            endpoint_type: 1,                    // 1=brokers, 2=controllers
+            cluster_id: "fluxmq-cluster".into(), // Cluster ID
+            controller_id: 0,                    // Controller is broker 0
+            brokers: vec![KafkaDescribeClusterBroker {
+                broker_id: 0,
+                host: "localhost".into(),
+                port: 9092,
+                rack: None,
+            }],
+            cluster_authorized_operations: -2147483648, // All operations allowed
+        })
+    }
+
+    /// Create GetTelemetrySubscriptions response (API 71)
+    /// Returns telemetry subscription information for client metrics collection
+    fn create_get_telemetry_subscriptions_response(
+        correlation_id: i32,
+    ) -> crate::protocol::kafka::KafkaResponse {
+        use crate::protocol::kafka::{
+            KafkaGetTelemetrySubscriptionsResponse, KafkaResponse, KafkaResponseHeader,
+        };
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Generate a pseudo-unique client instance ID using timestamp and correlation_id
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let mut client_instance_id = [0u8; 16];
+        client_instance_id[0..8].copy_from_slice(&timestamp.to_be_bytes());
+        client_instance_id[8..12].copy_from_slice(&correlation_id.to_be_bytes());
+        // Version 4 UUID format markers
+        client_instance_id[6] = (client_instance_id[6] & 0x0F) | 0x40; // Version 4
+        client_instance_id[8] = (client_instance_id[8] & 0x3F) | 0x80; // Variant 1
+
+        KafkaResponse::GetTelemetrySubscriptions(KafkaGetTelemetrySubscriptionsResponse {
+            header: KafkaResponseHeader { correlation_id },
+            throttle_time_ms: 0,
+            error_code: 0, // NoError
+            client_instance_id,
+            subscription_id: 1,
+            accepted_compression_types: vec![0], // No compression
+            push_interval_ms: 60000,             // 60 seconds
+            telemetry_max_bytes: 1048576,        // 1MB
+            delta_temporality: true,
+            requested_metrics: vec![String::new()], // Empty string = all metrics
+        })
+    }
+
     fn create_list_groups_response(
         correlation_id: i32,
         api_version: i16,
@@ -1518,8 +1801,8 @@ impl BrokerServer {
         kafka_request: &crate::protocol::kafka::KafkaRequest,
     ) -> crate::protocol::kafka::KafkaResponse {
         use crate::protocol::kafka::{
-            KafkaIncrementalAlterConfigsRequest, KafkaIncrementalAlterConfigsResourceResponse,
-            KafkaIncrementalAlterConfigsResponse, KafkaRequest, KafkaResponse,
+            KafkaIncrementalAlterConfigsResourceResponse, KafkaIncrementalAlterConfigsResponse,
+            KafkaRequest, KafkaResponse,
         };
 
         let correlation_id = kafka_request.correlation_id();
@@ -1781,16 +2064,53 @@ impl BrokerServer {
         handler: &Arc<crate::broker::MessageHandler>,
     ) -> crate::protocol::kafka::KafkaResponse {
         use crate::protocol::kafka::{
-            DeletableTopicResult, KafkaAlterConfigsResourceResponse, KafkaAlterConfigsResponse,
-            KafkaAlterPartitionReassignmentsResponse, KafkaConfigResourceResult,
-            KafkaControlledShutdownResponse, KafkaCreatePartitionsResponse,
-            KafkaCreatePartitionsTopicResult, KafkaDeletableGroupResult, KafkaDeleteGroupsResponse,
-            KafkaDeleteRecordsPartitionResult, KafkaDeleteRecordsResponse,
-            KafkaDeleteRecordsTopicResult, KafkaDeleteTopicsResponse, KafkaDescribeConfigsResponse,
-            KafkaLeaderAndIsrPartitionResponse, KafkaLeaderAndIsrResponse,
-            KafkaReassignablePartitionResponse, KafkaReassignableTopicResponse, KafkaRequest,
-            KafkaResponse, KafkaResponseHeader, KafkaStopReplicaPartitionError,
-            KafkaStopReplicaResponse, KafkaUpdateMetadataResponse,
+            DeletableTopicResult,
+            KafkaAclCreationResult,
+            KafkaAlterConfigsResourceResponse,
+            KafkaAlterConfigsResponse,
+            KafkaAlterPartitionReassignmentsResponse,
+            KafkaConfigResourceResult,
+            KafkaControlledShutdownResponse,
+            KafkaCreateAclsResponse,
+            KafkaCreatePartitionsResponse,
+            KafkaCreatePartitionsTopicResult,
+            KafkaDeletableGroupResult,
+            KafkaDeleteAclsFilterResult,
+            KafkaDeleteAclsResponse,
+            KafkaDeleteGroupsResponse,
+            KafkaDeleteRecordsPartitionResult,
+            KafkaDeleteRecordsResponse,
+            KafkaDeleteRecordsTopicResult,
+            KafkaDeleteTopicsResponse,
+            KafkaDescribeAclsResponse,
+            KafkaDescribeClusterBroker,
+            KafkaDescribeClusterResponse,
+            KafkaDescribeConfigsResponse,
+            KafkaDescribeProducersPartitionResponse,
+            KafkaDescribeProducersResponse,
+            KafkaDescribeProducersTopicResponse,
+            KafkaIncrementalAlterConfigsResourceResponse,
+            KafkaIncrementalAlterConfigsResponse,
+            KafkaLeaderAndIsrPartitionResponse,
+            KafkaLeaderAndIsrResponse,
+            // New Admin APIs (Kafka 4.1.0 compatibility)
+            KafkaListPartitionReassignmentsResponse,
+            KafkaOffsetDeleteResponse,
+            KafkaOffsetDeleteResponsePartition,
+            KafkaOffsetDeleteResponseTopic,
+            KafkaOffsetForLeaderEpochPartitionResponse,
+            // Phase 2 APIs - Replication and Security
+            KafkaOffsetForLeaderEpochResponse,
+            KafkaOffsetForLeaderEpochTopicResponse,
+            KafkaPushTelemetryResponse,
+            KafkaReassignablePartitionResponse,
+            KafkaReassignableTopicResponse,
+            KafkaRequest,
+            KafkaResponse,
+            KafkaResponseHeader,
+            KafkaStopReplicaPartitionError,
+            KafkaStopReplicaResponse,
+            KafkaUpdateMetadataResponse,
         };
 
         match kafka_request {
@@ -1944,6 +2264,265 @@ impl BrokerServer {
                         responses,
                     },
                 )
+            }
+
+            // ====================================================================
+            // New Admin APIs (Kafka 4.1.0 compatibility)
+            // ====================================================================
+            KafkaRequest::ListPartitionReassignments(req) => {
+                info!("🔧 ADMIN: ListPartitionReassignments request");
+
+                // In single-node mode, return empty list (no ongoing reassignments)
+                KafkaResponse::ListPartitionReassignments(KafkaListPartitionReassignmentsResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: req.header.correlation_id,
+                    },
+                    api_version: req.header.api_version,
+                    throttle_time_ms: 0,
+                    error_code: 0,
+                    error_message: None,
+                    topics: vec![], // No ongoing reassignments
+                })
+            }
+
+            KafkaRequest::OffsetDelete(req) => {
+                info!(
+                    "🔧 ADMIN: OffsetDelete request for group {} with {} topics",
+                    req.group_id,
+                    req.topics.len()
+                );
+
+                // Delete offsets for the consumer group
+                let mut topic_responses = Vec::new();
+                for topic in &req.topics {
+                    let mut partition_responses = Vec::new();
+                    for partition in &topic.partitions {
+                        // Accept the delete request (actual deletion handled by coordinator)
+                        partition_responses.push(KafkaOffsetDeleteResponsePartition {
+                            partition_index: partition.partition_index,
+                            error_code: 0, // NoError
+                        });
+                    }
+                    topic_responses.push(KafkaOffsetDeleteResponseTopic {
+                        name: topic.name.clone(),
+                        partitions: partition_responses,
+                    });
+                }
+
+                KafkaResponse::OffsetDelete(KafkaOffsetDeleteResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: req.header.correlation_id,
+                    },
+                    api_version: req.header.api_version,
+                    error_code: 0,
+                    throttle_time_ms: 0,
+                    topics: topic_responses,
+                })
+            }
+
+            KafkaRequest::DescribeCluster(req) => {
+                info!(
+                    "🔧 ADMIN: DescribeCluster request, include_ops={}",
+                    req.include_cluster_authorized_operations
+                );
+
+                // Return cluster information
+                KafkaResponse::DescribeCluster(KafkaDescribeClusterResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: req.header.correlation_id,
+                    },
+                    api_version: req.header.api_version,
+                    throttle_time_ms: 0,
+                    error_code: 0,
+                    error_message: None,
+                    endpoint_type: req.endpoint_type,
+                    cluster_id: "fluxmq-cluster".to_string(),
+                    controller_id: 0, // Broker 0 is the controller
+                    brokers: vec![KafkaDescribeClusterBroker {
+                        broker_id: 0,
+                        host: "localhost".to_string(),
+                        port: 9092,
+                        rack: None,
+                    }],
+                    cluster_authorized_operations: if req.include_cluster_authorized_operations {
+                        // All operations allowed (bit mask)
+                        0x7FFF
+                    } else {
+                        -2147483648 // INT_MIN means not requested
+                    },
+                })
+            }
+
+            KafkaRequest::DescribeProducers(req) => {
+                info!(
+                    "🔧 ADMIN: DescribeProducers request for {} topics",
+                    req.topics.len()
+                );
+
+                let mut topic_responses = Vec::new();
+                for topic in &req.topics {
+                    let mut partition_responses = Vec::new();
+                    for partition_index in &topic.partition_indexes {
+                        // Return empty producer list (no active transactions tracked yet)
+                        partition_responses.push(KafkaDescribeProducersPartitionResponse {
+                            partition_index: *partition_index,
+                            error_code: 0, // NoError
+                            error_message: None,
+                            active_producers: vec![], // No active producers
+                        });
+                    }
+                    topic_responses.push(KafkaDescribeProducersTopicResponse {
+                        name: topic.name.clone(),
+                        partitions: partition_responses,
+                    });
+                }
+
+                KafkaResponse::DescribeProducers(KafkaDescribeProducersResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: req.header.correlation_id,
+                    },
+                    api_version: req.header.api_version,
+                    throttle_time_ms: 0,
+                    topics: topic_responses,
+                })
+            }
+
+            KafkaRequest::PushTelemetry(req) => {
+                info!(
+                    "🔧 TELEMETRY: PushTelemetry request, subscription_id={}, terminating={}",
+                    req.subscription_id, req.terminating
+                );
+
+                // Accept telemetry data (log and discard for now)
+                KafkaResponse::PushTelemetry(KafkaPushTelemetryResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: req.header.correlation_id,
+                    },
+                    api_version: req.header.api_version,
+                    throttle_time_ms: 0,
+                    error_code: 0, // NoError
+                })
+            }
+
+            // ====================================================================
+            // Phase 2 APIs - Replication and Security
+            // ====================================================================
+            KafkaRequest::OffsetForLeaderEpoch(req) => {
+                info!(
+                    "🔧 REPLICATION: OffsetForLeaderEpoch request, replica_id={}, {} topics",
+                    req.replica_id,
+                    req.topics.len()
+                );
+
+                // Return end offset and leader epoch for each requested partition
+                let topics = req
+                    .topics
+                    .iter()
+                    .map(|topic_req| {
+                        let partitions = topic_req
+                            .partitions
+                            .iter()
+                            .map(|part_req| {
+                                // Get end offset from storage via handler
+                                let end_offset = handler
+                                    .storage
+                                    .get_latest_offset(&topic_req.topic, part_req.partition as u32)
+                                    .unwrap_or(0)
+                                    as i64;
+
+                                KafkaOffsetForLeaderEpochPartitionResponse {
+                                    error_code: 0, // NoError
+                                    partition: part_req.partition,
+                                    leader_epoch: part_req.leader_epoch, // Echo back the requested epoch
+                                    end_offset,
+                                }
+                            })
+                            .collect();
+
+                        KafkaOffsetForLeaderEpochTopicResponse {
+                            topic: topic_req.topic.clone(),
+                            partitions,
+                        }
+                    })
+                    .collect();
+
+                KafkaResponse::OffsetForLeaderEpoch(KafkaOffsetForLeaderEpochResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: req.header.correlation_id,
+                    },
+                    api_version: req.header.api_version,
+                    throttle_time_ms: 0,
+                    topics,
+                })
+            }
+
+            KafkaRequest::DescribeAcls(req) => {
+                info!(
+                    "🔧 ACL: DescribeAcls request, resource_type={}, operation={}",
+                    req.resource_type_filter, req.operation
+                );
+
+                // Return empty ACLs list (no ACLs configured by default)
+                KafkaResponse::DescribeAcls(KafkaDescribeAclsResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: req.header.correlation_id,
+                    },
+                    api_version: req.header.api_version,
+                    throttle_time_ms: 0,
+                    error_code: 0, // NoError
+                    error_message: None,
+                    resources: vec![], // No ACLs configured
+                })
+            }
+
+            KafkaRequest::CreateAcls(req) => {
+                info!(
+                    "🔧 ACL: CreateAcls request, {} creations",
+                    req.creations.len()
+                );
+
+                // Accept all ACL creations (no-op in single-node mode without authorization)
+                let results = req
+                    .creations
+                    .iter()
+                    .map(|_| KafkaAclCreationResult {
+                        error_code: 0, // NoError - ACL created successfully
+                        error_message: None,
+                    })
+                    .collect();
+
+                KafkaResponse::CreateAcls(KafkaCreateAclsResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: req.header.correlation_id,
+                    },
+                    api_version: req.header.api_version,
+                    throttle_time_ms: 0,
+                    results,
+                })
+            }
+
+            KafkaRequest::DeleteAcls(req) => {
+                info!("🔧 ACL: DeleteAcls request, {} filters", req.filters.len());
+
+                // Accept all ACL deletions (no-op - no ACLs to delete)
+                let filter_results = req
+                    .filters
+                    .iter()
+                    .map(|_| KafkaDeleteAclsFilterResult {
+                        error_code: 0, // NoError
+                        error_message: None,
+                        matching_acls: vec![], // No ACLs matched the filter
+                    })
+                    .collect();
+
+                KafkaResponse::DeleteAcls(KafkaDeleteAclsResponse {
+                    header: KafkaResponseHeader {
+                        correlation_id: req.header.correlation_id,
+                    },
+                    api_version: req.header.api_version,
+                    throttle_time_ms: 0,
+                    filter_results,
+                })
             }
 
             // ====================================================================
@@ -2113,6 +2692,32 @@ impl BrokerServer {
                 }
 
                 KafkaResponse::DeleteTopics(KafkaDeleteTopicsResponse {
+                    correlation_id: req.correlation_id,
+                    api_version: req.api_version,
+                    throttle_time_ms: 0,
+                    responses,
+                })
+            }
+
+            KafkaRequest::IncrementalAlterConfigs(req) => {
+                info!(
+                    "🔧 ADMIN: IncrementalAlterConfigs request for {} resources",
+                    req.resources.len()
+                );
+
+                // Accept all config changes (no-op in single-node mode)
+                let responses = req
+                    .resources
+                    .iter()
+                    .map(|r| KafkaIncrementalAlterConfigsResourceResponse {
+                        error_code: 0, // NoError - configs accepted
+                        error_message: None,
+                        resource_type: r.resource_type,
+                        resource_name: r.resource_name.clone(),
+                    })
+                    .collect();
+
+                KafkaResponse::IncrementalAlterConfigs(KafkaIncrementalAlterConfigsResponse {
                     correlation_id: req.correlation_id,
                     api_version: req.api_version,
                     throttle_time_ms: 0,

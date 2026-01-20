@@ -1,13 +1,13 @@
-use parking_lot::RwLock;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 /// Thread affinity and CPU pinning optimizations for FluxMQ
 ///
 /// This module implements thread-to-CPU binding strategies to achieve 400k+ msg/sec:
 /// - CPU affinity management for optimal thread placement
-/// - Thread pool optimization with NUMA awareness  
+/// - Thread pool optimization with NUMA awareness
 /// - CPU topology detection and utilization
 /// - Interrupt handling and CPU isolation strategies
+use parking_lot::RwLock;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use tokio::runtime::{Builder, Runtime};
@@ -112,7 +112,9 @@ impl CpuTopology {
 /// Thread affinity manager for optimal CPU binding
 pub struct ThreadAffinityManager {
     topology: CpuTopology,
+    /// Thread assignment tracking using RwLock (cold path - infrequent access)
     thread_assignments: Arc<RwLock<HashMap<thread::ThreadId, CpuAssignment>>>,
+    /// CPU utilization tracking using RwLock (cold path - infrequent access)
     cpu_utilization: Arc<RwLock<HashMap<usize, CpuUtilization>>>,
     assignment_strategy: AffinityStrategy,
 }
@@ -182,6 +184,7 @@ impl ThreadAffinityManager {
         }
     }
 
+    /// Assign thread affinity
     pub fn assign_thread_affinity(
         &self,
         thread_name: &str,
@@ -208,13 +211,10 @@ impl ThreadAffinityManager {
             .insert(current_thread_id, assignment);
 
         // Update CPU utilization
-        {
-            let mut utilization = self.cpu_utilization.write();
-            if let Some(cpu_util) = utilization.get_mut(&assigned_cpu) {
-                cpu_util.assigned_threads += 1;
-                cpu_util.thread_types.push(thread_type);
-                cpu_util.last_updated = std::time::Instant::now();
-            }
+        if let Some(cpu_util) = self.cpu_utilization.write().get_mut(&assigned_cpu) {
+            cpu_util.assigned_threads += 1;
+            cpu_util.thread_types.push(thread_type);
+            cpu_util.last_updated = std::time::Instant::now();
         }
 
         Ok(assigned_cpu)
@@ -248,9 +248,8 @@ impl ThreadAffinityManager {
         }
     }
 
+    /// Workload-optimized CPU selection
     fn select_workload_optimized(&self, thread_type: &ThreadType) -> Result<usize, String> {
-        let utilization = self.cpu_utilization.read();
-
         let preferred_cpus = match thread_type {
             ThreadType::NetworkIO => {
                 // Network I/O benefits from isolated cores with good cache
@@ -271,40 +270,31 @@ impl ThreadAffinityManager {
         };
 
         // Find least utilized CPU from preferred set
+        let cpu_util = self.cpu_utilization.read();
         let best_cpu = preferred_cpus
             .iter()
-            .min_by_key(|&&cpu| {
-                utilization
-                    .get(&cpu)
-                    .map(|u| u.assigned_threads)
-                    .unwrap_or(0)
-            })
+            .min_by_key(|&&cpu| cpu_util.get(&cpu).map(|u| u.assigned_threads).unwrap_or(0))
             .copied();
 
         best_cpu.ok_or_else(|| "No available CPU found".to_string())
     }
 
+    /// Isolated core selection
     fn select_isolated_core(&self, _thread_type: &ThreadType) -> Result<usize, String> {
         let isolated_cpus = self.topology.get_isolated_cpus();
-        let utilization = self.cpu_utilization.read();
 
         // Find least utilized isolated core
+        let cpu_util = self.cpu_utilization.read();
         let best_cpu = isolated_cpus
             .iter()
-            .min_by_key(|&&cpu| {
-                utilization
-                    .get(&cpu)
-                    .map(|u| u.assigned_threads)
-                    .unwrap_or(0)
-            })
+            .min_by_key(|&&cpu| cpu_util.get(&cpu).map(|u| u.assigned_threads).unwrap_or(0))
             .copied();
 
         best_cpu.ok_or_else(|| "No isolated CPU available".to_string())
     }
 
+    /// Hyperthread-aware CPU selection
     fn select_hyperthread_aware(&self, thread_type: &ThreadType) -> Result<usize, String> {
-        let utilization = self.cpu_utilization.read();
-
         // For CPU-intensive tasks, prefer physical cores
         let prefer_physical = matches!(
             thread_type,
@@ -318,14 +308,10 @@ impl ThreadAffinityManager {
         };
 
         // Find least utilized CPU
+        let cpu_util = self.cpu_utilization.read();
         let best_cpu = candidate_cpus
             .iter()
-            .min_by_key(|&&cpu| {
-                utilization
-                    .get(&cpu)
-                    .map(|u| u.assigned_threads)
-                    .unwrap_or(0)
-            })
+            .min_by_key(|&&cpu| cpu_util.get(&cpu).map(|u| u.assigned_threads).unwrap_or(0))
             .copied();
 
         best_cpu.ok_or_else(|| "No suitable CPU found".to_string())
@@ -421,33 +407,36 @@ impl ThreadAffinityManager {
         }
     }
 
+    /// Get thread assignment
     pub fn get_thread_assignment(&self, thread_id: thread::ThreadId) -> Option<CpuAssignment> {
         self.thread_assignments.read().get(&thread_id).cloned()
     }
 
+    /// Get CPU utilization
     pub fn get_cpu_utilization(&self) -> HashMap<usize, CpuUtilization> {
         self.cpu_utilization.read().clone()
     }
 
+    /// Get affinity statistics
     pub fn get_stats(&self) -> AffinityStats {
-        let assignments = self.thread_assignments.read();
-        let utilization = self.cpu_utilization.read();
+        let thread_assignments = self.thread_assignments.read();
+        let cpu_utilization = self.cpu_utilization.read();
 
-        let total_threads = assignments.len();
-        let active_cpus = utilization
+        let total_threads = thread_assignments.len();
+        let active_cpus = cpu_utilization
             .values()
             .filter(|u| u.assigned_threads > 0)
             .count();
 
         // Calculate NUMA distribution
         let mut numa_distribution = HashMap::new();
-        for assignment in assignments.values() {
+        for assignment in thread_assignments.values() {
             *numa_distribution.entry(assignment.numa_node).or_insert(0) += 1;
         }
 
         // Calculate thread type distribution
         let mut type_distribution = HashMap::new();
-        for assignment in assignments.values() {
+        for assignment in thread_assignments.values() {
             *type_distribution
                 .entry(format!("{:?}", assignment.thread_type))
                 .or_insert(0) += 1;
@@ -458,10 +447,10 @@ impl ThreadAffinityManager {
             strategy: self.assignment_strategy.clone(),
             total_threads,
             active_cpus,
-            cpu_utilization: utilization.clone(),
+            cpu_utilization: cpu_utilization.clone(),
             numa_distribution,
             type_distribution,
-            assignments: assignments.clone(),
+            assignments: thread_assignments.clone(),
         }
     }
 }

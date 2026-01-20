@@ -9,10 +9,10 @@ mod tests;
 
 use crate::protocol::{Message, Offset, PartitionId, TopicName};
 use crate::Result;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::info;
 
 pub use cluster::{ClusterConfig, ClusterCoordinator, ClusterStatus};
@@ -156,10 +156,9 @@ impl ReplicationCoordinator {
             in_sync_replicas: vec![self.broker_id],
         };
 
-        {
-            let mut states = self.partition_states.write().await;
-            states.insert(key.clone(), replica_info);
-        }
+        self.partition_states
+            .write()
+            .insert(key.clone(), replica_info);
 
         let leader_state = Arc::new(LeaderState::new(
             self.broker_id,
@@ -169,10 +168,7 @@ impl ReplicationCoordinator {
             self.config.clone(),
         ));
 
-        {
-            let mut leaders = self.leaders.write().await;
-            leaders.insert(key, leader_state);
-        }
+        self.leaders.write().insert(key, leader_state);
 
         info!("Became leader for {}:{}", topic, partition);
         Ok(())
@@ -197,10 +193,9 @@ impl ReplicationCoordinator {
             in_sync_replicas: vec![leader_id],
         };
 
-        {
-            let mut states = self.partition_states.write().await;
-            states.insert(key.clone(), replica_info);
-        }
+        self.partition_states
+            .write()
+            .insert(key.clone(), replica_info);
 
         let follower_state = Arc::new(FollowerState::new(
             self.broker_id,
@@ -210,10 +205,7 @@ impl ReplicationCoordinator {
             self.config.clone(),
         ));
 
-        {
-            let mut followers = self.followers.write().await;
-            followers.insert(key, follower_state);
-        }
+        self.followers.write().insert(key, follower_state);
 
         info!(
             "Became follower for {}:{} with leader {}",
@@ -228,8 +220,10 @@ impl ReplicationCoordinator {
         topic: &str,
         partition: PartitionId,
     ) -> Option<PartitionReplicaInfo> {
-        let states = self.partition_states.read().await;
-        states.get(&(topic.to_string(), partition)).cloned()
+        self.partition_states
+            .read()
+            .get(&(topic.to_string(), partition))
+            .cloned()
     }
 
     /// Check if this broker is the leader for a partition

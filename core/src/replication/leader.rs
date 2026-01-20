@@ -3,10 +3,10 @@ use crate::protocol::{Message, Offset, PartitionId, TopicName};
 use crate::storage::HybridStorage;
 use crate::Result;
 use crossbeam::channel;
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
@@ -19,20 +19,20 @@ pub struct LeaderState {
     term: u64,
     config: ReplicationConfig,
 
-    /// Followers and their replication progress
+    /// Followers and their replication progress using RwLock (cold path - infrequent access)
     follower_states: Arc<RwLock<HashMap<BrokerId, FollowerProgress>>>,
 
-    /// Next offset to send to each follower
-    next_index: Arc<RwLock<HashMap<BrokerId, Offset>>>,
+    /// Next offset to send to each follower using RwLock (cold path - infrequent access)
+    next_index: Arc<RwLock<HashMap<BrokerId, u64>>>,
 
-    /// Highest offset replicated by each follower
-    match_index: Arc<RwLock<HashMap<BrokerId, Offset>>>,
+    /// Highest offset replicated by each follower using RwLock (cold path - infrequent access)
+    match_index: Arc<RwLock<HashMap<BrokerId, u64>>>,
 
     /// Channel for receiving replication responses
     response_rx: Arc<tokio::sync::Mutex<Option<channel::Receiver<ReplicationMessage>>>>,
     _response_tx: channel::Sender<ReplicationMessage>,
 
-    /// Network manager for sending replication messages
+    /// Network manager for sending replication messages (parking_lot for sync access)
     network_manager: Arc<RwLock<Option<Weak<ReplicationNetworkManager>>>>,
 }
 
@@ -56,13 +56,13 @@ impl LeaderState {
     ) -> Self {
         let (response_tx, response_rx) = channel::unbounded();
 
-        let mut follower_states = HashMap::new();
-        let mut next_index = HashMap::new();
-        let mut match_index = HashMap::new();
+        let mut follower_states_map = HashMap::new();
+        let mut next_index_map = HashMap::new();
+        let mut match_index_map = HashMap::new();
 
         for follower_id in followers {
             if follower_id != broker_id {
-                follower_states.insert(
+                follower_states_map.insert(
                     follower_id,
                     FollowerProgress {
                         _broker_id: follower_id,
@@ -72,8 +72,8 @@ impl LeaderState {
                         is_alive: true,
                     },
                 );
-                next_index.insert(follower_id, 0);
-                match_index.insert(follower_id, 0);
+                next_index_map.insert(follower_id, 0u64);
+                match_index_map.insert(follower_id, 0u64);
             }
         }
 
@@ -83,9 +83,9 @@ impl LeaderState {
             partition,
             term: 1,
             config,
-            follower_states: Arc::new(RwLock::new(follower_states)),
-            next_index: Arc::new(RwLock::new(next_index)),
-            match_index: Arc::new(RwLock::new(match_index)),
+            follower_states: Arc::new(RwLock::new(follower_states_map)),
+            next_index: Arc::new(RwLock::new(next_index_map)),
+            match_index: Arc::new(RwLock::new(match_index_map)),
             response_rx: Arc::new(tokio::sync::Mutex::new(Some(response_rx))),
             _response_tx: response_tx,
             network_manager: Arc::new(RwLock::new(None)),
@@ -111,7 +111,7 @@ impl LeaderState {
             "Started leader replication for {}:{} with {} followers",
             self.topic,
             self.partition,
-            self.follower_states.read().await.len()
+            self.follower_states.read().len()
         );
 
         Ok(())
@@ -148,10 +148,7 @@ impl LeaderState {
         storage: Arc<HybridStorage>,
         entries: Vec<LogEntry>,
     ) -> Result<()> {
-        let followers: Vec<BrokerId> = {
-            let follower_states = self.follower_states.read().await;
-            follower_states.keys().copied().collect()
-        };
+        let followers: Vec<BrokerId> = self.follower_states.read().keys().copied().collect();
 
         for follower_id in followers {
             if let Err(e) = self
@@ -172,10 +169,12 @@ impl LeaderState {
         storage: Arc<HybridStorage>,
         entries: &[LogEntry],
     ) -> Result<()> {
-        let next_index = {
-            let next_indices = self.next_index.read().await;
-            next_indices.get(&follower_id).copied().unwrap_or(0)
-        };
+        let next_index = self
+            .next_index
+            .read()
+            .get(&follower_id)
+            .copied()
+            .unwrap_or(0);
 
         let prev_log_offset = if next_index > 0 { next_index - 1 } else { 0 };
         let leader_commit = self.get_commit_index(storage.clone()).await?;
@@ -261,10 +260,7 @@ impl LeaderState {
     async fn send_heartbeats(&self, storage: Arc<HybridStorage>) -> Result<()> {
         let commit_index = self.get_commit_index(storage).await?;
 
-        let followers: Vec<BrokerId> = {
-            let follower_states = self.follower_states.read().await;
-            follower_states.keys().copied().collect()
-        };
+        let followers: Vec<BrokerId> = self.follower_states.read().keys().copied().collect();
 
         let heartbeat = ReplicationMessage::Heartbeat {
             leader_id: self.broker_id,
@@ -312,8 +308,8 @@ impl LeaderState {
         let now = SystemTime::now();
         let timeout = Duration::from_millis(self.config.replication_timeout_ms);
 
-        let mut followers = self.follower_states.write().await;
-        for (follower_id, progress) in followers.iter_mut() {
+        let mut follower_states = self.follower_states.write();
+        for (follower_id, progress) in follower_states.iter_mut() {
             if now
                 .duration_since(progress.last_heartbeat)
                 .unwrap_or(timeout)
@@ -372,24 +368,18 @@ impl LeaderState {
             } => {
                 if success {
                     // Update follower progress
-                    {
-                        let mut match_indices = self.match_index.write().await;
-                        match_indices.insert(follower_id, last_log_offset);
-                    }
+                    self.match_index
+                        .write()
+                        .insert(follower_id, last_log_offset);
+                    self.next_index
+                        .write()
+                        .insert(follower_id, last_log_offset + 1);
 
-                    {
-                        let mut next_indices = self.next_index.write().await;
-                        next_indices.insert(follower_id, last_log_offset + 1);
-                    }
-
-                    {
-                        let mut followers = self.follower_states.write().await;
-                        if let Some(progress) = followers.get_mut(&follower_id) {
-                            progress.match_index = last_log_offset;
-                            progress.next_index = last_log_offset + 1;
-                            progress.last_heartbeat = SystemTime::now();
-                            progress.is_alive = true;
-                        }
+                    if let Some(progress) = self.follower_states.write().get_mut(&follower_id) {
+                        progress.match_index = last_log_offset;
+                        progress.next_index = last_log_offset + 1;
+                        progress.last_heartbeat = SystemTime::now();
+                        progress.is_alive = true;
                     }
 
                     debug!(
@@ -400,11 +390,9 @@ impl LeaderState {
                     );
                 } else {
                     // Replication failed, decrement next_index and retry
-                    {
-                        let mut next_indices = self.next_index.write().await;
-                        if let Some(next_idx) = next_indices.get_mut(&follower_id) {
-                            *next_idx = (*next_idx).saturating_sub(1);
-                        }
+                    let mut next_index = self.next_index.write();
+                    if let Some(current) = next_index.get(&follower_id).copied() {
+                        next_index.insert(follower_id, current.saturating_sub(1));
                     }
 
                     warn!(
@@ -419,8 +407,7 @@ impl LeaderState {
                 success,
             } => {
                 if success && term == self.term {
-                    let mut followers = self.follower_states.write().await;
-                    if let Some(progress) = followers.get_mut(&follower_id) {
+                    if let Some(progress) = self.follower_states.write().get_mut(&follower_id) {
                         progress.last_heartbeat = SystemTime::now();
                         progress.is_alive = true;
                     }
@@ -444,8 +431,8 @@ impl LeaderState {
     pub async fn get_isr(&self) -> Vec<BrokerId> {
         let mut isr = vec![self.broker_id]; // Leader is always in ISR
 
-        let followers = self.follower_states.read().await;
-        for (follower_id, progress) in followers.iter() {
+        let follower_states = self.follower_states.read();
+        for (follower_id, progress) in follower_states.iter() {
             if progress.is_alive {
                 isr.push(*follower_id);
             }
@@ -456,13 +443,13 @@ impl LeaderState {
 
     /// Set the network manager for this leader
     pub async fn set_network_manager(&self, network_manager: Arc<ReplicationNetworkManager>) {
-        let mut nm = self.network_manager.write().await;
+        let mut nm = self.network_manager.write();
         *nm = Some(Arc::downgrade(&network_manager));
     }
 
     /// Get the network manager if available
     async fn get_network_manager(&self) -> Option<Arc<ReplicationNetworkManager>> {
-        let nm = self.network_manager.read().await;
+        let nm = self.network_manager.read();
         if let Some(weak_nm) = nm.as_ref() {
             weak_nm.upgrade()
         } else {
@@ -472,8 +459,7 @@ impl LeaderState {
 
     /// Mark a follower as unhealthy for faster detection
     async fn mark_follower_unhealthy(&self, follower_id: BrokerId) {
-        let mut followers = self.follower_states.write().await;
-        if let Some(progress) = followers.get_mut(&follower_id) {
+        if let Some(progress) = self.follower_states.write().get_mut(&follower_id) {
             progress.is_alive = false;
             warn!(
                 "Marked follower {} as unhealthy for {}:{}",
@@ -526,10 +512,9 @@ impl ReplicationManager {
             .start_replication(Arc::clone(&self.storage))
             .await?;
 
-        {
-            let mut leaders = self.leaders.write().await;
-            leaders.insert((topic.to_string(), partition), leader_state_arc);
-        }
+        self.leaders
+            .write()
+            .insert((topic.to_string(), partition), leader_state_arc);
 
         info!("Added leader for {}:{}", topic, partition);
         Ok(())
@@ -543,12 +528,8 @@ impl ReplicationManager {
         messages: Vec<Message>,
         base_offset: Offset,
     ) -> Result<()> {
-        let leader_state = {
-            let leaders = self.leaders.read().await;
-            leaders.get(&(topic.to_string(), partition)).cloned()
-        };
-
-        if let Some(leader) = leader_state {
+        let leaders = self.leaders.read();
+        if let Some(leader) = leaders.get(&(topic.to_string(), partition)) {
             leader
                 .replicate_messages(Arc::clone(&self.storage), messages, base_offset)
                 .await?;

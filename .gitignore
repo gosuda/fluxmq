@@ -2,6 +2,7 @@ target/
 data/
 node_modules/
 kafka-4.1.0-src/
+/kafka/
 claude.md
 
 # macOS system files
@@ -23,3 +24,18 @@ server_debug*.log
 *.tmp
 *.temp
 cp.txt
+
+# Test results (benchmark outputs)
+results/
+fluxmq-java-tests/results/
+benchmark-suite/results/
+
+# IDE
+.idea/
+.vscode/
+
+# CDC test artifacts
+cdc-test/target/
+cdc-test/Cargo.lock
+cdc-test/postgres-data/
+cdc-test/zookeeper-data/

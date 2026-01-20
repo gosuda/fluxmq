@@ -115,8 +115,8 @@
 
 use crate::protocol::{PartitionId, TopicName};
 use crate::Result;
-use parking_lot::RwLock;
-use std::collections::HashMap;
+use dashmap::DashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::info;
 
@@ -161,10 +161,11 @@ impl Default for TopicConfig {
     }
 }
 
-/// Manages topic metadata and partition assignment
+/// Manages topic metadata and partition assignment (lock-free)
 #[derive(Debug)]
 pub struct TopicManager {
-    topics: Arc<RwLock<HashMap<TopicName, TopicMetadata>>>,
+    /// Lock-free topic storage using DashMap
+    topics: Arc<DashMap<TopicName, TopicMetadata>>,
 }
 
 #[derive(Debug, Clone)]
@@ -186,15 +187,14 @@ pub struct PartitionInfo {
 impl TopicManager {
     pub fn new() -> Self {
         Self {
-            topics: Arc::new(RwLock::new(HashMap::new())),
+            topics: Arc::new(DashMap::new()),
         }
     }
 
-    /// Create a new topic with the specified configuration
+    /// Create a new topic with the specified configuration (lock-free)
     pub fn create_topic(&self, topic_name: &str, config: TopicConfig) -> Result<()> {
-        let mut topics = self.topics.write();
-
-        if topics.contains_key(topic_name) {
+        // Lock-free check and insert
+        if self.topics.contains_key(topic_name) {
             return Ok(()); // Topic already exists, that's fine
         }
 
@@ -214,7 +214,7 @@ impl TopicManager {
             partitions,
         };
 
-        topics.insert(topic_name.to_string(), metadata);
+        self.topics.insert(topic_name.to_string(), metadata);
         info!(
             "Created topic '{}' with {} partitions",
             topic_name, config.num_partitions
@@ -223,26 +223,26 @@ impl TopicManager {
         Ok(())
     }
 
-    /// Get topic metadata
+    /// Get topic metadata (lock-free)
     pub fn get_topic(&self, topic_name: &str) -> Option<TopicMetadata> {
-        let topics = self.topics.read();
-        topics.get(topic_name).cloned()
+        self.topics.get(topic_name).map(|entry| entry.clone())
     }
 
-    /// List all topics
+    /// List all topics (lock-free)
     pub fn list_topics(&self) -> Vec<TopicName> {
-        let topics = self.topics.read();
-        topics.keys().cloned().collect()
+        self.topics
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
     }
 
-    /// Get partition assignment for a message key
+    /// Get partition assignment for a message key (lock-free)
     pub fn get_partition_for_key(
         &self,
         topic_name: &str,
         key: Option<&[u8]>,
     ) -> Option<PartitionId> {
-        let topics = self.topics.read();
-        let topic = topics.get(topic_name)?;
+        let topic = self.topics.get(topic_name)?;
 
         let partition = match key {
             Some(key_bytes) => {
@@ -261,10 +261,9 @@ impl TopicManager {
         Some(partition)
     }
 
-    /// Get partition assignment using round-robin for keyless messages
+    /// Get partition assignment using round-robin for keyless messages (lock-free)
     pub fn get_partition_round_robin(&self, topic_name: &str, counter: u64) -> Option<PartitionId> {
-        let topics = self.topics.read();
-        let topic = topics.get(topic_name)?;
+        let topic = self.topics.get(topic_name)?;
         Some((counter % topic.num_partitions as u64) as PartitionId)
     }
 
@@ -279,7 +278,7 @@ impl TopicManager {
         hash
     }
 
-    /// Auto-create topic with default configuration if it doesn't exist
+    /// Auto-create topic with default configuration if it doesn't exist (lock-free)
     pub fn ensure_topic_exists(&self, topic_name: &str) -> Result<TopicMetadata> {
         if let Some(topic) = self.get_topic(topic_name) {
             return Ok(topic);
@@ -293,28 +292,25 @@ impl TopicManager {
             .ok_or_else(|| crate::FluxmqError::Config("Failed to create topic".to_string()))
     }
 
-    /// Get all partitions for a topic
+    /// Get all partitions for a topic (lock-free)
     pub fn get_partitions(&self, topic_name: &str) -> Vec<PartitionId> {
-        let topics = self.topics.read();
-        match topics.get(topic_name) {
+        match self.topics.get(topic_name) {
             Some(topic) => topic.partitions.iter().map(|p| p.id).collect(),
             None => vec![],
         }
     }
 
-    /// Check if a specific partition exists for a topic
+    /// Check if a specific partition exists for a topic (lock-free)
     pub fn partition_exists(&self, topic_name: &str, partition_id: PartitionId) -> bool {
-        let topics = self.topics.read();
-        match topics.get(topic_name) {
+        match self.topics.get(topic_name) {
             Some(topic) => partition_id < topic.num_partitions,
             None => false,
         }
     }
 
-    /// Delete a topic
+    /// Delete a topic (lock-free)
     pub fn delete_topic(&self, topic_name: &str) -> crate::Result<()> {
-        let mut topics = self.topics.write();
-        match topics.remove(topic_name) {
+        match self.topics.remove(topic_name) {
             Some(_) => {
                 info!("Successfully deleted topic '{}'", topic_name);
                 Ok(())
@@ -326,10 +322,11 @@ impl TopicManager {
         }
     }
 
-    /// Get topic statistics
+    /// Get topic statistics (lock-free)
     pub fn get_topic_stats(&self, topic_name: &str) -> Option<u32> {
-        let topics = self.topics.read();
-        topics.get(topic_name).map(|topic| topic.num_partitions)
+        self.topics
+            .get(topic_name)
+            .map(|topic| topic.num_partitions)
     }
 }
 
@@ -343,21 +340,22 @@ pub enum PartitionStrategy {
     Manual(PartitionId),
 }
 
-/// Partition assignment utility
+/// Partition assignment utility (lock-free)
 pub struct PartitionAssigner {
     manager: Arc<TopicManager>,
-    round_robin_counters: Arc<RwLock<HashMap<TopicName, u64>>>,
+    /// Lock-free round-robin counters using DashMap with AtomicU64
+    round_robin_counters: Arc<DashMap<TopicName, AtomicU64>>,
 }
 
 impl PartitionAssigner {
     pub fn new(manager: Arc<TopicManager>) -> Self {
         Self {
             manager,
-            round_robin_counters: Arc::new(RwLock::new(HashMap::new())),
+            round_robin_counters: Arc::new(DashMap::new()),
         }
     }
 
-    /// Assign partition based on strategy and message properties
+    /// Assign partition based on strategy and message properties (lock-free)
     pub fn assign_partition(
         &self,
         topic_name: &str,
@@ -373,11 +371,14 @@ impl PartitionAssigner {
                 .get_partition_for_key(topic_name, key)
                 .unwrap_or(0),
             PartitionStrategy::RoundRobin => {
-                let mut counters = self.round_robin_counters.write();
-                let counter = counters.entry(topic_name.to_string()).or_insert(0);
-                *counter += 1;
+                // Lock-free atomic counter increment
+                let counter = self
+                    .round_robin_counters
+                    .entry(topic_name.to_string())
+                    .or_insert_with(|| AtomicU64::new(0));
+                let current = counter.fetch_add(1, Ordering::Relaxed) + 1;
                 self.manager
-                    .get_partition_round_robin(topic_name, *counter)
+                    .get_partition_round_robin(topic_name, current)
                     .unwrap_or(0)
             }
             PartitionStrategy::Manual(partition_id) => {

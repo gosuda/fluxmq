@@ -206,6 +206,44 @@ impl ProtocolAdapter {
                 // IncrementalAlterConfigs: Admin API handled separately
                 Err(AdapterError::UnsupportedApi(44, 0))
             }
+            // New Admin APIs (Kafka 4.1.0 compatibility)
+            KafkaRequest::ListPartitionReassignments(_req) => {
+                // ListPartitionReassignments: Admin API handled separately
+                Err(AdapterError::UnsupportedApi(46, 0))
+            }
+            KafkaRequest::OffsetDelete(_req) => {
+                // OffsetDelete: Admin API handled separately
+                Err(AdapterError::UnsupportedApi(47, 0))
+            }
+            KafkaRequest::DescribeCluster(_req) => {
+                // DescribeCluster: Admin API handled separately
+                Err(AdapterError::UnsupportedApi(60, 0))
+            }
+            KafkaRequest::DescribeProducers(_req) => {
+                // DescribeProducers: Admin API handled separately
+                Err(AdapterError::UnsupportedApi(61, 0))
+            }
+            KafkaRequest::PushTelemetry(_req) => {
+                // PushTelemetry: Telemetry API handled separately
+                Err(AdapterError::UnsupportedApi(72, 0))
+            }
+            // Phase 2 APIs
+            KafkaRequest::OffsetForLeaderEpoch(_req) => {
+                // OffsetForLeaderEpoch: Replication API handled separately
+                Err(AdapterError::UnsupportedApi(23, 0))
+            }
+            KafkaRequest::DescribeAcls(_req) => {
+                // DescribeAcls: ACL API handled separately
+                Err(AdapterError::UnsupportedApi(29, 0))
+            }
+            KafkaRequest::CreateAcls(_req) => {
+                // CreateAcls: ACL API handled separately
+                Err(AdapterError::UnsupportedApi(30, 0))
+            }
+            KafkaRequest::DeleteAcls(_req) => {
+                // DeleteAcls: ACL API handled separately
+                Err(AdapterError::UnsupportedApi(31, 0))
+            }
         }
     }
 
@@ -795,7 +833,7 @@ impl ProtocolAdapter {
             }
             let mut topic_bytes = vec![0u8; topic_len];
             cursor.copy_to_slice(&mut topic_bytes);
-            let topic = String::from_utf8_lossy(&topic_bytes).to_string();
+            let topic = String::from_utf8_lossy(&topic_bytes).into_owned();
             info!("📦 DESERIALIZE: Topic {}: '{}'", i, topic);
 
             // Partitions array
@@ -925,33 +963,9 @@ impl ProtocolAdapter {
 
         // Convert Kafka record batch to FluxMQ messages
         let messages = if let Some(records_bytes) = partition_data.records {
-            tracing::debug!(
-                "🔍 JAVA DEBUG: Processing produce request for topic='{}', partition={}, records_bytes_len={}",
-                topic_data.topic,
-                partition_data.partition,
-                records_bytes.len()
-            );
-
-            // Add hex dump of first 64 bytes for debugging
-            if records_bytes.len() > 0 {
-                let hex_dump = records_bytes
-                    .iter()
-                    .take(64)
-                    .map(|b| format!("{:02x}", b))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                tracing::debug!("🔍 JAVA DEBUG: Records bytes hex (first 64): {}", hex_dump);
-            }
-
-            let parsed_messages = Self::parse_kafka_record_batch(&records_bytes)?;
-            tracing::debug!(
-                "🔍 JAVA DEBUG: Parsed {} messages from {} bytes",
-                parsed_messages.len(),
-                records_bytes.len()
-            );
-            parsed_messages
+            // PERFORMANCE: Skip debug logging in hot path
+            Self::parse_kafka_record_batch(&records_bytes)?
         } else {
-            tracing::warn!("🔍 JAVA DEBUG: No records bytes in partition data");
             vec![]
         };
 
@@ -1875,62 +1889,46 @@ impl ProtocolAdapter {
         let decompressed_bytes = Bytes::from(decompressed_data);
         let mut decompressed_cursor = 0usize;
 
-        tracing::debug!(
+        tracing::trace!(
             "🔍 DECOMPRESSED DEBUG: {} bytes of records data (compression_type={})",
             decompressed_bytes.len(),
             compression_type
         );
 
-        // Debug: show first 32 bytes of decompressed data as hex
-        let debug_bytes = decompressed_bytes.len().min(32);
-        let hex_data: String = decompressed_bytes[0..debug_bytes]
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<Vec<_>>()
-            .join(" ");
-        tracing::debug!("🔍 DECOMPRESSED HEX: {}", hex_data);
+        // PERFORMANCE: Only generate hex dump at trace level (disabled in production)
+        #[cfg(debug_assertions)]
+        if tracing::enabled!(tracing::Level::TRACE) {
+            let debug_bytes = decompressed_bytes.len().min(32);
+            let hex_data: String = decompressed_bytes[0..debug_bytes]
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::trace!("🔍 DECOMPRESSED HEX: {}", hex_data);
+        }
+
+        // PERFORMANCE: Pre-allocate messages vector based on expected count
+        messages.reserve(records_count as usize);
 
         // Parse individual records from decompressed data
-        for i in 0..records_count {
-            tracing::debug!(
-                "🔍 SINGLE RECORD DEBUG: Parsing record {}/{}, cursor={}, buffer_len={}",
-                i + 1,
-                records_count,
-                decompressed_cursor,
-                decompressed_bytes.len()
-            );
+        for _i in 0..records_count {
+            // PERFORMANCE: Removed per-record debug logging in hot path
             match Self::parse_single_record_v2(&decompressed_bytes, &mut decompressed_cursor) {
                 Ok(Some(message)) => {
-                    tracing::debug!(
-                        "✅ Successfully parsed record {}/{}: key_len={}, value_len={}",
-                        i + 1,
-                        records_count,
-                        message.key.as_ref().map(|k| k.len()).unwrap_or(0),
-                        message.value.len()
-                    );
                     messages.push(message);
                 }
                 Ok(None) => {
-                    tracing::debug!(
-                        "⚠️ Skipped record {}/{} (control record)",
-                        i + 1,
-                        records_count
-                    );
+                    // Control record - skip silently
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "❌ Failed to parse record {}/{}: {}",
-                        i + 1,
-                        records_count,
-                        e
-                    );
+                    tracing::debug!("❌ Failed to parse record: {}", e);
                     // Continue parsing remaining records
                     break;
                 }
             }
         }
 
-        tracing::debug!(
+        tracing::trace!(
             "Successfully parsed RecordBatch v2: {} messages from {} records",
             messages.len(),
             records_count
@@ -1940,16 +1938,12 @@ impl ProtocolAdapter {
     }
 
     /// Parse a single record from RecordBatch v2 format
+    /// PERFORMANCE: Minimal logging in hot path - all debug logs moved to trace level
     fn parse_single_record_v2(
         records_bytes: &Bytes,
         cursor: &mut usize,
     ) -> Result<Option<Message>> {
         if *cursor >= records_bytes.len() {
-            tracing::debug!(
-                "🔍 SINGLE RECORD: Cursor {} >= buffer_len {}",
-                *cursor,
-                records_bytes.len()
-            );
             return Err(AdapterError::InvalidFormat(
                 "Cursor beyond buffer end".to_string(),
             ));
@@ -1960,19 +1954,7 @@ impl ProtocolAdapter {
         // keyLength(varint) + key + valueLength(varint) + value + headersCount(varint) + headers
 
         // Read record length (varint)
-        tracing::debug!(
-            "🔍 SINGLE RECORD: Starting parse at cursor {}, buffer len {}",
-            *cursor,
-            records_bytes.len()
-        );
-        let initial_cursor = *cursor;
         let record_length = Self::read_varint_from_bytes(records_bytes, cursor)?;
-        tracing::debug!(
-            "🔍 SINGLE RECORD: Record length = {} bytes, cursor advanced from {} to {}",
-            record_length,
-            initial_cursor,
-            *cursor
-        );
 
         if record_length <= 0 {
             return Err(AdapterError::InvalidFormat(format!(
@@ -2008,95 +1990,49 @@ impl ProtocolAdapter {
         Self::read_varint_from_bytes(records_bytes, cursor)?; // timestampDelta
         Self::read_varint_from_bytes(records_bytes, cursor)?; // offsetDelta
 
-        // Read key
-        let key_cursor_before = *cursor;
+        // Read key - PERFORMANCE: removed per-record logging
         let key_length = Self::read_varint_from_bytes(records_bytes, cursor)?;
-        tracing::debug!(
-            "🔍 SINGLE RECORD: Key length = {}, cursor {} -> {}",
-            key_length,
-            key_cursor_before,
-            *cursor
-        );
         let key = if key_length > 0 {
-            // Defensive check: ensure key_length is not negative when cast to usize
             let key_len_usize = key_length.max(0) as usize;
             if *cursor + key_len_usize > records_bytes.len() {
-                tracing::error!(
-                    "🔍 SINGLE RECORD: Buffer too small for key - need {} bytes, have {}",
-                    key_len_usize,
-                    records_bytes.len() - *cursor
-                );
                 return Err(AdapterError::InvalidFormat(
                     "Buffer too small for record key".to_string(),
                 ));
             }
-            // Additional safety check to prevent invalid slice ranges
             let end_pos = *cursor + key_len_usize;
             if end_pos < *cursor {
-                tracing::error!(
-                    "🔍 SINGLE RECORD: Invalid key length causing overflow - key_len: {}",
-                    key_length
-                );
                 return Err(AdapterError::InvalidFormat(
                     "Invalid key length causing slice overflow".to_string(),
                 ));
             }
-            let key_bytes = records_bytes[*cursor..end_pos].to_vec();
+            // PERFORMANCE: Use slice() for zero-copy when possible
+            let key_bytes = records_bytes.slice(*cursor..end_pos);
             *cursor += key_len_usize;
-            tracing::debug!(
-                "🔍 SINGLE RECORD: Read {} byte key, cursor now {}",
-                key_len_usize,
-                *cursor
-            );
-            Some(Bytes::from(key_bytes))
+            Some(key_bytes)
         } else {
-            tracing::debug!("🔍 SINGLE RECORD: No key (length {})", key_length);
             None
         };
 
-        // Read value
-        let value_cursor_before = *cursor;
+        // Read value - PERFORMANCE: removed per-record logging, use zero-copy slice
         let value_length = Self::read_varint_from_bytes(records_bytes, cursor)?;
-        tracing::debug!(
-            "🔍 SINGLE RECORD: Value length = {}, cursor {} -> {}",
-            value_length,
-            value_cursor_before,
-            *cursor
-        );
         let value = if value_length > 0 {
-            // Defensive check: ensure value_length is not negative when cast to usize
             let value_len_usize = value_length.max(0) as usize;
             if *cursor + value_len_usize > records_bytes.len() {
-                tracing::error!(
-                    "🔍 SINGLE RECORD: Buffer too small for value - need {} bytes, have {}",
-                    value_len_usize,
-                    records_bytes.len() - *cursor
-                );
                 return Err(AdapterError::InvalidFormat(
                     "Buffer too small for record value".to_string(),
                 ));
             }
-            // Additional safety check to prevent invalid slice ranges
             let end_pos = *cursor + value_len_usize;
             if end_pos < *cursor {
-                tracing::error!(
-                    "🔍 SINGLE RECORD: Invalid value length causing overflow - value_len: {}",
-                    value_length
-                );
                 return Err(AdapterError::InvalidFormat(
                     "Invalid value length causing slice overflow".to_string(),
                 ));
             }
-            let value_bytes = records_bytes[*cursor..end_pos].to_vec();
+            // PERFORMANCE: Use slice() for zero-copy
+            let value_bytes = records_bytes.slice(*cursor..end_pos);
             *cursor += value_len_usize;
-            tracing::debug!(
-                "🔍 SINGLE RECORD: Read {} byte value, cursor now {}",
-                value_len_usize,
-                *cursor
-            );
-            Bytes::from(value_bytes)
+            value_bytes
         } else {
-            tracing::debug!("🔍 SINGLE RECORD: Empty value (length {})", value_length);
             Bytes::new()
         };
 
@@ -2120,22 +2056,16 @@ impl ProtocolAdapter {
             *cursor = record_data_end;
         }
 
-        // Create FluxMQ message
+        // Create FluxMQ message - PERFORMANCE: no clone needed, already have ownership
         let message = Message {
-            key: key.clone(),
-            value: value.clone(),
+            key,
+            value,
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64,
             headers: HashMap::new(),
         };
-
-        tracing::debug!(
-            "🔍 SINGLE RECORD: ✅ Successfully created message - key: {} bytes, value: {} bytes",
-            key.as_ref().map(|k| k.len()).unwrap_or(0),
-            value.len()
-        );
 
         Ok(Some(message))
     }

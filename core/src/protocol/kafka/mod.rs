@@ -85,6 +85,19 @@ pub const API_KEY_SASL_AUTHENTICATE: i16 = 36;
 
 /// KIP-714 - Client metrics and observability
 pub const API_KEY_GET_TELEMETRY_SUBSCRIPTIONS: i16 = 71;
+pub const API_KEY_PUSH_TELEMETRY: i16 = 72;
+
+/// Additional Admin APIs (Kafka 4.1.0 compatibility)
+pub const API_KEY_LIST_PARTITION_REASSIGNMENTS: i16 = 46;
+pub const API_KEY_OFFSET_DELETE: i16 = 47;
+pub const API_KEY_DESCRIBE_CLUSTER: i16 = 60;
+pub const API_KEY_DESCRIBE_PRODUCERS: i16 = 61;
+
+/// Phase 2 APIs - Replication and Security
+pub const API_KEY_OFFSET_FOR_LEADER_EPOCH: i16 = 23;
+pub const API_KEY_DESCRIBE_ACLS: i16 = 29;
+pub const API_KEY_CREATE_ACLS: i16 = 30;
+pub const API_KEY_DELETE_ACLS: i16 = 31;
 
 /// Protocol detection magic bytes
 /// Kafka requests typically start with message length > 0 and reasonable API keys (0-50)

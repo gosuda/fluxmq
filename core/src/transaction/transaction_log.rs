@@ -4,17 +4,15 @@
 //! distributed coordination. It maintains the authoritative state of all transactions
 //! and enables exactly-once guarantees across broker restarts.
 
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
-use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use super::{
-    ProducerId, TopicPartition, TransactionMetadata, TransactionResult, TxnState,
-};
+use super::{ProducerId, TopicPartition, TransactionMetadata, TransactionResult, TxnState};
 
 /// Transaction log entry types
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,7 +137,7 @@ impl TransactionLogEntry {
 pub struct TransactionLog {
     /// Log file path
     log_path: PathBuf,
-    /// In-memory transaction states (for recovery and fast access)
+    /// In-memory transaction states using RwLock (cold path - infrequent access)
     transaction_states: Arc<RwLock<HashMap<String, TransactionMetadata>>>,
     /// Log entry sequence number
     next_sequence_number: Arc<std::sync::atomic::AtomicU64>,
@@ -219,7 +217,6 @@ impl TransactionLog {
         self.append_log_entry(entry).await?;
 
         // Update in-memory state
-        let mut states = self.transaction_states.write().await;
         let metadata = TransactionMetadata {
             transactional_id: transactional_id.clone(),
             producer_id,
@@ -230,7 +227,9 @@ impl TransactionLog {
             txn_start_timestamp: chrono::Utc::now().timestamp_millis(),
             txn_last_update_timestamp: chrono::Utc::now().timestamp_millis(),
         };
-        states.insert(transactional_id, metadata);
+        self.transaction_states
+            .write()
+            .insert(transactional_id, metadata);
 
         debug!(
             producer_id = producer_id,
@@ -258,8 +257,7 @@ impl TransactionLog {
         self.append_log_entry(entry).await?;
 
         // Update in-memory state
-        let mut states = self.transaction_states.write().await;
-        if let Some(metadata) = states.get_mut(transactional_id) {
+        if let Some(metadata) = self.transaction_states.write().get_mut(transactional_id) {
             metadata.state = TxnState::Ongoing;
             metadata.txn_start_timestamp = chrono::Utc::now().timestamp_millis();
             metadata.txn_last_update_timestamp = chrono::Utc::now().timestamp_millis();
@@ -296,8 +294,7 @@ impl TransactionLog {
         let partition_count = partitions.len();
 
         // Update in-memory state
-        let mut states = self.transaction_states.write().await;
-        if let Some(metadata) = states.get_mut(transactional_id) {
+        if let Some(metadata) = self.transaction_states.write().get_mut(transactional_id) {
             for partition in partitions {
                 metadata.partitions.insert(partition);
             }
@@ -335,8 +332,7 @@ impl TransactionLog {
         self.append_log_entry(entry).await?;
 
         // Update in-memory state
-        let mut states = self.transaction_states.write().await;
-        if let Some(metadata) = states.get_mut(transactional_id) {
+        if let Some(metadata) = self.transaction_states.write().get_mut(transactional_id) {
             metadata.state = if commit {
                 TxnState::PrepareCommit
             } else {
@@ -374,8 +370,7 @@ impl TransactionLog {
         self.append_log_entry(entry).await?;
 
         // Update in-memory state
-        let mut states = self.transaction_states.write().await;
-        if let Some(metadata) = states.get_mut(transactional_id) {
+        if let Some(metadata) = self.transaction_states.write().get_mut(transactional_id) {
             metadata.state = if commit {
                 TxnState::CompleteCommit
             } else {
@@ -399,23 +394,25 @@ impl TransactionLog {
         &self,
         transactional_id: &str,
     ) -> Option<TransactionMetadata> {
-        let states = self.transaction_states.read().await;
-        states.get(transactional_id).cloned()
+        self.transaction_states
+            .read()
+            .get(transactional_id)
+            .cloned()
     }
 
     /// Get all active transactions
     pub async fn get_active_transactions(&self) -> HashMap<String, TransactionMetadata> {
-        let states = self.transaction_states.read().await;
-        states
+        self.transaction_states
+            .read()
             .iter()
             .filter(|(_, metadata)| !metadata.state.is_terminal())
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(key, value)| (key.clone(), value.clone()))
             .collect()
     }
 
     /// Remove completed transactions from memory
     pub async fn cleanup_completed_transactions(&self) -> usize {
-        let mut states = self.transaction_states.write().await;
+        let mut states = self.transaction_states.write();
         let initial_count = states.len();
 
         states.retain(|_, metadata| !metadata.state.is_terminal());
@@ -495,14 +492,19 @@ impl TransactionLog {
         }
 
         // Update in-memory state
-        let mut states = self.transaction_states.write().await;
-        *states = recovered_transactions;
+        {
+            let mut states = self.transaction_states.write();
+            states.clear();
+            for (key, value) in recovered_transactions {
+                states.insert(key, value);
+            }
+        }
 
         self.next_sequence_number
             .store(max_sequence + 1, std::sync::atomic::Ordering::SeqCst);
 
         info!(
-            recovered_transactions = states.len(),
+            recovered_transactions = self.transaction_states.read().len(),
             max_sequence = max_sequence,
             "Transaction log recovery completed"
         );

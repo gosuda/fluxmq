@@ -138,7 +138,9 @@ impl ConsumerGroupCoordinator {
         storage: Option<Arc<HybridStorage>>,
         metadata_dir: Option<PathBuf>,
     ) -> Self {
-        let (state_change_tx, state_change_rx) = channel::unbounded();
+        // Bounded channel to prevent memory leak during rapid state changes
+        // 1000 entries is sufficient for normal rebalancing bursts
+        let (state_change_tx, state_change_rx) = channel::bounded(1_000);
 
         Self {
             config,

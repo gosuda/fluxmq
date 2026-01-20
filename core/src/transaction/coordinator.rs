@@ -4,11 +4,12 @@
 //! of all transactions in FluxMQ. It handles producer registration, transaction state
 //! management, and coordinates transaction completion across multiple partitions.
 
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
@@ -61,13 +62,13 @@ pub struct TransactionCoordinator {
     config: TransactionCoordinatorConfig,
     /// Producer ID manager
     producer_manager: Arc<ProducerIdManager>,
-    /// Transaction state machines by transactional ID
+    /// Transaction state machines by transactional ID using RwLock (cold path - infrequent access)
     transactions: Arc<RwLock<HashMap<String, TransactionStateMachine>>>,
     /// Persistent transaction log
     transaction_log: Arc<TransactionLog>,
     /// Coordinator metadata
     metadata: Arc<Mutex<CoordinatorMetadata>>,
-    /// Pending transaction markers (for WriteTxnMarkers API)
+    /// Pending transaction markers using RwLock (cold path - infrequent access)
     pending_markers: Arc<RwLock<HashMap<ProducerId, Vec<WritableTxnMarker>>>>,
 }
 
@@ -142,14 +143,15 @@ impl TransactionCoordinator {
                 .await?;
 
             // Create transaction state machine
-            let mut transactions = self.transactions.write().await;
             let state_machine = TransactionStateMachine::new(
                 txn_id.clone(),
                 producer_id,
                 producer_epoch,
                 timeout_ms,
             );
-            transactions.insert(txn_id.clone(), state_machine);
+            self.transactions
+                .write()
+                .insert(txn_id.clone(), state_machine);
         }
 
         info!(
@@ -205,31 +207,33 @@ impl TransactionCoordinator {
         }
 
         // Add partitions to transaction
-        let mut transactions = self.transactions.write().await;
-        if let Some(state_machine) = transactions.get_mut(&request.transactional_id) {
-            state_machine.add_partitions(all_partitions.clone())?;
+        {
+            let mut transactions = self.transactions.write();
+            if let Some(state_machine) = transactions.get_mut(&request.transactional_id) {
+                state_machine.add_partitions(all_partitions.clone())?;
 
-            // Log the partition addition
-            self.transaction_log
-                .log_add_partitions(
-                    &request.transactional_id,
-                    request.producer_id,
-                    request.producer_epoch,
-                    all_partitions.clone(),
-                )
-                .await?;
+                // Log the partition addition
+                self.transaction_log
+                    .log_add_partitions(
+                        &request.transactional_id,
+                        request.producer_id,
+                        request.producer_epoch,
+                        all_partitions.clone(),
+                    )
+                    .await?;
 
-            info!(
-                producer_id = request.producer_id,
-                transactional_id = %request.transactional_id,
-                partition_count = all_partitions.len(),
-                "Partitions added to transaction"
-            );
-        } else {
-            // Set error for all partitions
-            for result in &mut results {
-                for partition_result in &mut result.results {
-                    partition_result.error_code = 48; // InvalidTxnState
+                info!(
+                    producer_id = request.producer_id,
+                    transactional_id = %request.transactional_id,
+                    partition_count = all_partitions.len(),
+                    "Partitions added to transaction"
+                );
+            } else {
+                // Set error for all partitions
+                for result in &mut results {
+                    for partition_result in &mut result.results {
+                        partition_result.error_code = 48; // InvalidTxnState
+                    }
                 }
             }
         }
@@ -256,8 +260,11 @@ impl TransactionCoordinator {
         // In a full implementation, this would add the consumer group
         // to the transaction's pending offset commits
 
-        let transactions = self.transactions.read().await;
-        let error_code = if transactions.contains_key(&request.transactional_id) {
+        let error_code = if self
+            .transactions
+            .read()
+            .contains_key(&request.transactional_id)
+        {
             info!(
                 producer_id = request.producer_id,
                 transactional_id = %request.transactional_id,
@@ -286,88 +293,89 @@ impl TransactionCoordinator {
             .validate_producer(request.producer_id, request.producer_epoch)
             .await?;
 
-        let mut transactions = self.transactions.write().await;
-        let error_code = if let Some(state_machine) =
-            transactions.get_mut(&request.transactional_id)
-        {
-            match if request.committed {
-                state_machine.prepare_commit()
-            } else {
-                state_machine.prepare_abort()
-            } {
-                Ok(()) => {
-                    let partitions: Vec<_> = state_machine.partitions().iter().cloned().collect();
+        let error_code = {
+            let mut transactions = self.transactions.write();
+            if let Some(state_machine) = transactions.get_mut(&request.transactional_id) {
+                match if request.committed {
+                    state_machine.prepare_commit()
+                } else {
+                    state_machine.prepare_abort()
+                } {
+                    Ok(()) => {
+                        let partitions: Vec<_> =
+                            state_machine.partitions().iter().cloned().collect();
 
-                    // Log prepare transaction
-                    if let Err(e) = self
-                        .transaction_log
-                        .log_prepare_transaction(
-                            &request.transactional_id,
-                            request.producer_id,
-                            request.producer_epoch,
-                            request.committed,
-                            partitions.clone(),
-                        )
-                        .await
-                    {
-                        error!("Failed to log prepare transaction: {}", e);
-                        42 // InvalidRequest
-                    } else {
-                        // Create transaction markers for WriteTxnMarkers
-                        if !partitions.is_empty() {
-                            let marker = WritableTxnMarker {
-                                producer_id: request.producer_id,
-                                producer_epoch: request.producer_epoch,
-                                transaction_result: request.committed,
-                                topics: self.convert_partitions_to_marker_topics(&partitions),
-                                coordinator_epoch: self.config.coordinator_epoch,
-                            };
-
-                            let mut pending_markers = self.pending_markers.write().await;
-                            pending_markers
-                                .entry(request.producer_id)
-                                .or_insert_with(Vec::new)
-                                .push(marker);
-                        }
-
-                        // Complete the transaction
-                        if request.committed {
-                            state_machine.complete_commit().unwrap();
-                        } else {
-                            state_machine.complete_abort().unwrap();
-                        }
-
-                        // Log complete transaction
+                        // Log prepare transaction
                         if let Err(e) = self
                             .transaction_log
-                            .log_complete_transaction(
+                            .log_prepare_transaction(
                                 &request.transactional_id,
                                 request.producer_id,
                                 request.producer_epoch,
                                 request.committed,
+                                partitions.clone(),
                             )
                             .await
                         {
-                            error!("Failed to log complete transaction: {}", e);
+                            error!("Failed to log prepare transaction: {}", e);
+                            42 // InvalidRequest
+                        } else {
+                            // Create transaction markers for WriteTxnMarkers
+                            if !partitions.is_empty() {
+                                let marker = WritableTxnMarker {
+                                    producer_id: request.producer_id,
+                                    producer_epoch: request.producer_epoch,
+                                    transaction_result: request.committed,
+                                    topics: self.convert_partitions_to_marker_topics(&partitions),
+                                    coordinator_epoch: self.config.coordinator_epoch,
+                                };
+
+                                self.pending_markers
+                                    .write()
+                                    .entry(request.producer_id)
+                                    .or_insert_with(Vec::new)
+                                    .push(marker);
+                            }
+
+                            // Complete the transaction
+                            if request.committed {
+                                state_machine.complete_commit().unwrap();
+                            } else {
+                                state_machine.complete_abort().unwrap();
+                            }
+
+                            // Log complete transaction
+                            if let Err(e) = self
+                                .transaction_log
+                                .log_complete_transaction(
+                                    &request.transactional_id,
+                                    request.producer_id,
+                                    request.producer_epoch,
+                                    request.committed,
+                                )
+                                .await
+                            {
+                                error!("Failed to log complete transaction: {}", e);
+                            }
+
+                            info!(
+                                producer_id = request.producer_id,
+                                transactional_id = %request.transactional_id,
+                                committed = request.committed,
+                                "Transaction ended"
+                            );
+
+                            0 // NoError
                         }
-
-                        info!(
-                            producer_id = request.producer_id,
-                            transactional_id = %request.transactional_id,
-                            committed = request.committed,
-                            "Transaction ended"
-                        );
-
-                        0 // NoError
+                    }
+                    Err(e) => {
+                        warn!("Failed to end transaction: {}", e);
+                        48 // InvalidTxnState
                     }
                 }
-                Err(e) => {
-                    warn!("Failed to end transaction: {}", e);
-                    48 // InvalidTxnState
-                }
+            } else {
+                48 // InvalidTxnState
             }
-        } else {
-            48 // InvalidTxnState
         };
 
         Ok(EndTxnResponse {
@@ -475,10 +483,10 @@ impl TransactionCoordinator {
 
     /// Get coordinator statistics
     pub async fn get_stats(&self) -> TransactionCoordinatorStats {
-        let transactions = self.transactions.read().await;
         let producer_stats = self.producer_manager.get_stats().await;
         let metadata = self.metadata.lock().await;
 
+        let transactions = self.transactions.read();
         let mut state_counts = HashMap::new();
         for state_machine in transactions.values() {
             let state = state_machine.current_state();
@@ -497,7 +505,7 @@ impl TransactionCoordinator {
     async fn recover_transactions(&self) -> TransactionResult<()> {
         let active_transactions = self.transaction_log.get_active_transactions().await;
 
-        let mut transactions = self.transactions.write().await;
+        let mut transactions = self.transactions.write();
         for (txn_id, metadata) in active_transactions {
             let state = metadata.state;
             let state_machine = TransactionStateMachine::from_metadata(metadata);
@@ -537,8 +545,7 @@ impl TransactionCoordinator {
 
                 // Remove completed transactions from memory
                 if completed_transactions > 0 {
-                    let mut transactions_guard = transactions.write().await;
-                    transactions_guard.retain(|_, sm| !sm.is_terminal());
+                    transactions.write().retain(|_, sm| !sm.is_terminal());
                 }
 
                 if expired_producers > 0 || completed_transactions > 0 {

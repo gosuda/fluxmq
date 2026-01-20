@@ -1,0 +1,50 @@
+[package]
+name = "kafka-cdc-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Kafka client
+rdkafka = { version = "0.36", features = ["cmake-build"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Date/Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# PostgreSQL client (for test data generation)
+tokio-postgres = "0.7"
+
+[lib]
+name = "kafka_cdc_test"
+path = "src/lib.rs"
+
+[dev-dependencies]
+mockito = "1.2"
+tokio-test = "0.4"
+
+[[bin]]
+name = "simple_producer"
+path = "src/bin/simple_producer.rs"
+
+[[bin]]
+name = "simple_consumer"
+path = "src/bin/simple_consumer.rs"
+
+[[bin]]
+name = "e2e_latency_test"
+path = "src/bin/e2e_latency_test.rs"

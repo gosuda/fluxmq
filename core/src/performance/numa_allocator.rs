@@ -1,10 +1,10 @@
 use bytes::BytesMut;
-use parking_lot::{Mutex, RwLock};
+use crossbeam::queue::SegQueue;
 /// NUMA-aware memory allocation for ultra-high performance messaging
 ///
 /// This module implements NUMA (Non-Uniform Memory Access) optimizations to achieve 400k+ msg/sec:
 /// - CPU affinity-based memory allocation
-/// - NUMA node-specific memory pools
+/// - NUMA node-specific memory pools (lock-free with SegQueue)
 /// - Hardware cache-line optimization
 /// - Thread-local allocation strategies
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -86,22 +86,56 @@ impl NumaTopology {
     }
 }
 
-/// NUMA-aware allocator with node-specific memory pools
+/// NUMA-aware allocator with node-specific memory pools (lock-free)
 pub struct NumaAwareAllocator {
     topology: NumaTopology,
     node_pools: Vec<Arc<NodeMemoryPool>>,
-    allocation_stats: Arc<RwLock<InternalAllocationStats>>,
+    /// Lock-free allocation statistics using atomic counters
+    allocation_stats: Arc<LockFreeAllocationStats>,
     global_fallback: System,
 }
 
+/// Lock-free allocation statistics using atomic counters
+#[derive(Debug)]
+struct LockFreeAllocationStats {
+    total_allocations: AtomicUsize,
+    total_deallocations: AtomicUsize,
+    numa_local_allocs: AtomicUsize,
+    numa_remote_allocs: AtomicUsize,
+    fallback_allocs: AtomicUsize,
+    bytes_allocated: AtomicUsize,
+    bytes_deallocated: AtomicUsize,
+}
+
+impl Default for LockFreeAllocationStats {
+    fn default() -> Self {
+        Self {
+            total_allocations: AtomicUsize::new(0),
+            total_deallocations: AtomicUsize::new(0),
+            numa_local_allocs: AtomicUsize::new(0),
+            numa_remote_allocs: AtomicUsize::new(0),
+            fallback_allocs: AtomicUsize::new(0),
+            bytes_allocated: AtomicUsize::new(0),
+            bytes_deallocated: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Lock-free memory pool per NUMA node using SegQueue
 #[derive(Debug)]
 struct NodeMemoryPool {
     node_id: usize,
-    // Size-based memory pools for different allocation sizes
-    small_pool: Mutex<Vec<*mut u8>>,  // 64B - 1KB
-    medium_pool: Mutex<Vec<*mut u8>>, // 1KB - 64KB
-    large_pool: Mutex<Vec<*mut u8>>,  // 64KB - 1MB
-    huge_pool: Mutex<Vec<*mut u8>>,   // 1MB+
+    // Lock-free size-based memory pools for different allocation sizes
+    small_pool: SegQueue<*mut u8>,  // 64B - 1KB
+    medium_pool: SegQueue<*mut u8>, // 1KB - 64KB
+    large_pool: SegQueue<*mut u8>,  // 64KB - 1MB
+    huge_pool: SegQueue<*mut u8>,   // 1MB+
+
+    // Pool size tracking (SegQueue doesn't have len())
+    small_pool_size: AtomicUsize,
+    medium_pool_size: AtomicUsize,
+    large_pool_size: AtomicUsize,
+    huge_pool_size: AtomicUsize,
 
     // Pool statistics
     allocated_bytes: AtomicUsize,
@@ -121,10 +155,14 @@ impl NodeMemoryPool {
     fn new(node_id: usize) -> Self {
         Self {
             node_id,
-            small_pool: Mutex::new(Vec::with_capacity(1000)),
-            medium_pool: Mutex::new(Vec::with_capacity(500)),
-            large_pool: Mutex::new(Vec::with_capacity(100)),
-            huge_pool: Mutex::new(Vec::with_capacity(50)),
+            small_pool: SegQueue::new(),
+            medium_pool: SegQueue::new(),
+            large_pool: SegQueue::new(),
+            huge_pool: SegQueue::new(),
+            small_pool_size: AtomicUsize::new(0),
+            medium_pool_size: AtomicUsize::new(0),
+            large_pool_size: AtomicUsize::new(0),
+            huge_pool_size: AtomicUsize::new(0),
             allocated_bytes: AtomicUsize::new(0),
             deallocated_bytes: AtomicUsize::new(0),
             pool_hits: AtomicUsize::new(0),
@@ -132,23 +170,28 @@ impl NodeMemoryPool {
         }
     }
 
-    fn get_pool_for_size(&self, size: usize) -> &Mutex<Vec<*mut u8>> {
+    /// Get the appropriate lock-free pool and its size counter for a given size
+    fn get_pool_and_counter_for_size(
+        &self,
+        size: usize,
+    ) -> (&SegQueue<*mut u8>, &AtomicUsize, usize) {
         if size <= 1024 {
-            &self.small_pool
+            (&self.small_pool, &self.small_pool_size, 1000)
         } else if size <= 65536 {
-            &self.medium_pool
+            (&self.medium_pool, &self.medium_pool_size, 500)
         } else if size <= 1048576 {
-            &self.large_pool
+            (&self.large_pool, &self.large_pool_size, 100)
         } else {
-            &self.huge_pool
+            (&self.huge_pool, &self.huge_pool_size, 50)
         }
     }
 
+    /// Lock-free allocation from pool
     fn allocate_from_pool(&self, layout: Layout) -> Option<*mut u8> {
-        let pool = self.get_pool_for_size(layout.size());
-        let mut pool_vec = pool.lock();
+        let (pool, size_counter, _) = self.get_pool_and_counter_for_size(layout.size());
 
-        if let Some(ptr) = pool_vec.pop() {
+        if let Some(ptr) = pool.pop() {
+            size_counter.fetch_sub(1, Ordering::Relaxed);
             self.pool_hits.fetch_add(1, Ordering::Relaxed);
             self.allocated_bytes
                 .fetch_add(layout.size(), Ordering::Relaxed);
@@ -159,20 +202,16 @@ impl NodeMemoryPool {
         }
     }
 
+    /// Lock-free deallocation to pool
     fn deallocate_to_pool(&self, ptr: *mut u8, layout: Layout) {
-        let pool = self.get_pool_for_size(layout.size());
-        let mut pool_vec = pool.lock();
+        let (pool, size_counter, max_pool_size) = self.get_pool_and_counter_for_size(layout.size());
 
         // Only keep reasonable number of items in pool to avoid memory bloat
-        let max_pool_size = match layout.size() {
-            s if s <= 1024 => 1000,
-            s if s <= 65536 => 500,
-            s if s <= 1048576 => 100,
-            _ => 50,
-        };
+        let current_size = size_counter.load(Ordering::Relaxed);
 
-        if pool_vec.len() < max_pool_size {
-            pool_vec.push(ptr);
+        if current_size < max_pool_size {
+            pool.push(ptr);
+            size_counter.fetch_add(1, Ordering::Relaxed);
             self.deallocated_bytes
                 .fetch_add(layout.size(), Ordering::Relaxed);
         } else {
@@ -191,10 +230,10 @@ impl NodeMemoryPool {
             pool_hits: self.pool_hits.load(Ordering::Relaxed),
             pool_misses: self.pool_misses.load(Ordering::Relaxed),
             pool_sizes: PoolSizes {
-                small: self.small_pool.lock().len(),
-                medium: self.medium_pool.lock().len(),
-                large: self.large_pool.lock().len(),
-                huge: self.huge_pool.lock().len(),
+                small: self.small_pool_size.load(Ordering::Relaxed),
+                medium: self.medium_pool_size.load(Ordering::Relaxed),
+                large: self.large_pool_size.load(Ordering::Relaxed),
+                huge: self.huge_pool_size.load(Ordering::Relaxed),
             },
         }
     }
@@ -233,17 +272,6 @@ impl NodePoolStats {
     }
 }
 
-#[derive(Debug, Default, Clone)]
-struct InternalAllocationStats {
-    total_allocations: usize,
-    total_deallocations: usize,
-    numa_local_allocs: usize,
-    numa_remote_allocs: usize,
-    fallback_allocs: usize,
-    bytes_allocated: usize,
-    bytes_deallocated: usize,
-}
-
 impl NumaAwareAllocator {
     pub fn new() -> Self {
         let topology = NumaTopology::detect();
@@ -256,22 +284,27 @@ impl NumaAwareAllocator {
         Self {
             topology,
             node_pools,
-            allocation_stats: Arc::new(RwLock::new(InternalAllocationStats::default())),
+            allocation_stats: Arc::new(LockFreeAllocationStats::default()),
             global_fallback: System,
         }
     }
 
+    /// Lock-free NUMA-local allocation
     pub fn allocate_numa_local(&self, layout: Layout) -> *mut u8 {
         let current_node = self.topology.current_node;
 
         // Try to allocate from local NUMA node pool first
         if let Some(pool) = self.node_pools.get(current_node) {
             if let Some(ptr) = pool.allocate_from_pool(layout) {
-                self.update_stats(|stats| {
-                    stats.total_allocations += 1;
-                    stats.numa_local_allocs += 1;
-                    stats.bytes_allocated += layout.size();
-                });
+                self.allocation_stats
+                    .total_allocations
+                    .fetch_add(1, Ordering::Relaxed);
+                self.allocation_stats
+                    .numa_local_allocs
+                    .fetch_add(1, Ordering::Relaxed);
+                self.allocation_stats
+                    .bytes_allocated
+                    .fetch_add(layout.size(), Ordering::Relaxed);
                 return ptr;
             }
         }
@@ -279,58 +312,80 @@ impl NumaAwareAllocator {
         // Fallback to system allocator
         let ptr = unsafe { self.global_fallback.alloc(layout) };
         if !ptr.is_null() {
-            self.update_stats(|stats| {
-                stats.total_allocations += 1;
-                stats.fallback_allocs += 1;
-                stats.bytes_allocated += layout.size();
-            });
+            self.allocation_stats
+                .total_allocations
+                .fetch_add(1, Ordering::Relaxed);
+            self.allocation_stats
+                .fallback_allocs
+                .fetch_add(1, Ordering::Relaxed);
+            self.allocation_stats
+                .bytes_allocated
+                .fetch_add(layout.size(), Ordering::Relaxed);
         }
 
         ptr
     }
 
+    /// Lock-free NUMA-aware deallocation
     pub fn deallocate_numa_aware(&self, ptr: *mut u8, layout: Layout) {
         // Try to return to appropriate node pool
         let current_node = self.topology.current_node;
 
         if let Some(pool) = self.node_pools.get(current_node) {
             pool.deallocate_to_pool(ptr, layout);
-            self.update_stats(|stats| {
-                stats.total_deallocations += 1;
-                stats.bytes_deallocated += layout.size();
-            });
+            self.allocation_stats
+                .total_deallocations
+                .fetch_add(1, Ordering::Relaxed);
+            self.allocation_stats
+                .bytes_deallocated
+                .fetch_add(layout.size(), Ordering::Relaxed);
         } else {
             // Fallback to system deallocation
             unsafe { self.global_fallback.dealloc(ptr, layout) };
-            self.update_stats(|stats| {
-                stats.total_deallocations += 1;
-                stats.bytes_deallocated += layout.size();
-            });
+            self.allocation_stats
+                .total_deallocations
+                .fetch_add(1, Ordering::Relaxed);
+            self.allocation_stats
+                .bytes_deallocated
+                .fetch_add(layout.size(), Ordering::Relaxed);
         }
-    }
-
-    fn update_stats<F>(&self, f: F)
-    where
-        F: FnOnce(&mut InternalAllocationStats),
-    {
-        let mut stats = self.allocation_stats.write();
-        f(&mut stats);
     }
 
     pub fn get_topology(&self) -> &NumaTopology {
         &self.topology
     }
 
+    /// Get allocation statistics (lock-free read)
     pub fn get_allocation_stats(&self) -> AllocationStats {
-        let stats = self.allocation_stats.read().clone();
         AllocationStats {
-            total_allocations: stats.total_allocations,
-            total_deallocations: stats.total_deallocations,
-            numa_local_allocs: stats.numa_local_allocs,
-            numa_remote_allocs: stats.numa_remote_allocs,
-            fallback_allocs: stats.fallback_allocs,
-            bytes_allocated: stats.bytes_allocated,
-            bytes_deallocated: stats.bytes_deallocated,
+            total_allocations: self
+                .allocation_stats
+                .total_allocations
+                .load(Ordering::Relaxed),
+            total_deallocations: self
+                .allocation_stats
+                .total_deallocations
+                .load(Ordering::Relaxed),
+            numa_local_allocs: self
+                .allocation_stats
+                .numa_local_allocs
+                .load(Ordering::Relaxed),
+            numa_remote_allocs: self
+                .allocation_stats
+                .numa_remote_allocs
+                .load(Ordering::Relaxed),
+            fallback_allocs: self
+                .allocation_stats
+                .fallback_allocs
+                .load(Ordering::Relaxed),
+            bytes_allocated: self
+                .allocation_stats
+                .bytes_allocated
+                .load(Ordering::Relaxed),
+            bytes_deallocated: self
+                .allocation_stats
+                .bytes_deallocated
+                .load(Ordering::Relaxed),
         }
     }
 

@@ -21,6 +21,7 @@
 //! - **Consumer Lag Optimization**: Faster catch-up for lagging consumers
 
 use crate::protocol::{Message, Offset};
+use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -330,35 +331,34 @@ pub struct PartitionCacheStats {
     pub evictions: u64,
 }
 
-/// Global message cache manager for all partitions
+/// Global message cache manager for all partitions (lock-free)
 pub struct MessageCacheManager {
     config: MessageCacheConfig,
-    partition_caches: RwLock<HashMap<String, Arc<PartitionMessageCache>>>,
+    /// Lock-free partition cache lookup using DashMap
+    partition_caches: Arc<DashMap<String, Arc<PartitionMessageCache>>>,
 }
 
 impl MessageCacheManager {
     pub fn new(config: MessageCacheConfig) -> Self {
         Self {
             config,
-            partition_caches: RwLock::new(HashMap::new()),
+            partition_caches: Arc::new(DashMap::new()),
         }
     }
 
-    /// Get or create cache for a partition
+    /// Get or create cache for a partition (lock-free)
     pub fn get_partition_cache(&self, topic: &str, partition: u32) -> Arc<PartitionMessageCache> {
         let partition_key = format!("{}-{}", topic, partition);
 
-        {
-            let caches = self.partition_caches.read();
-            if let Some(cache) = caches.get(&partition_key) {
-                return cache.clone();
-            }
+        // Lock-free lookup
+        if let Some(cache) = self.partition_caches.get(&partition_key) {
+            return cache.clone();
         }
 
-        // Create new cache
-        let mut caches = self.partition_caches.write();
+        // Create new cache (lock-free insert)
         let cache = Arc::new(PartitionMessageCache::new(self.config.clone()));
-        caches.insert(partition_key, cache.clone());
+        self.partition_caches
+            .insert(partition_key.clone(), cache.clone());
 
         info!(
             "Created message cache for partition {}-{}",
@@ -401,20 +401,20 @@ impl MessageCacheManager {
         cache.get_batch(offsets)
     }
 
-    /// Cleanup expired messages across all partitions
+    /// Cleanup expired messages across all partitions (lock-free)
     pub fn cleanup_expired_messages(&self) {
-        let caches = self.partition_caches.read();
-        for cache in caches.values() {
-            cache.cleanup_expired();
+        for entry in self.partition_caches.iter() {
+            entry.value().cleanup_expired();
         }
     }
 
-    /// Get comprehensive cache statistics
+    /// Get comprehensive cache statistics (lock-free)
     pub fn get_global_stats(&self) -> GlobalCacheStats {
-        let caches = self.partition_caches.read();
         let mut total_stats = GlobalCacheStats::default();
 
-        for (partition_key, cache) in caches.iter() {
+        for entry in self.partition_caches.iter() {
+            let partition_key = entry.key();
+            let cache = entry.value();
             let stats = cache.get_stats();
             total_stats
                 .partition_stats
@@ -433,15 +433,14 @@ impl MessageCacheManager {
             0.0
         };
 
-        total_stats.active_partitions = caches.len();
+        total_stats.active_partitions = self.partition_caches.len();
         total_stats
     }
 
-    /// Remove cache for a partition (useful for partition deletion)
+    /// Remove cache for a partition (lock-free, useful for partition deletion)
     pub fn remove_partition_cache(&self, topic: &str, partition: u32) {
         let partition_key = format!("{}-{}", topic, partition);
-        let mut caches = self.partition_caches.write();
-        if caches.remove(&partition_key).is_some() {
+        if self.partition_caches.remove(&partition_key).is_some() {
             info!("Removed cache for partition {}-{}", topic, partition);
         }
     }

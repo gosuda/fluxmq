@@ -1,0 +1,28 @@
+# Build artifacts
+/target/
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test results and logs
+*.log
+*.json.bak
+results/
+output/
+
+# Docker volumes
+postgres-data/
+zookeeper-data/
+kafka-data/
+
+# Temporary files
+*.tmp
+*.swp
+*~

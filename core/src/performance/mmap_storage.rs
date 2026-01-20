@@ -417,7 +417,7 @@ impl MemoryMappedStorage {
 
         // Check if we need to rotate to a new segment
         if segment.write_offset + data.len() > segment.max_size {
-            tracing::info!(
+            tracing::debug!(
                 "Segment rotation triggered: current_offset={}, data_len={}, max_size={}, segment_id={}",
                 segment.write_offset,
                 data.len(),
@@ -434,7 +434,7 @@ impl MemoryMappedStorage {
             // Acquire new segment lock
             segment = partition_segment.current_segment.lock();
 
-            tracing::info!(
+            tracing::debug!(
                 "Segment rotation completed: new_segment_id={}, available_space={}",
                 segment.segment_id,
                 segment.max_size - segment.write_offset
@@ -665,7 +665,7 @@ impl MemoryMappedStorage {
         // Generate new segment ID based on current segments count + 1
         let new_segment_id = (partition_segment.segments.len() + 1) as u64;
 
-        tracing::info!(
+        tracing::debug!(
             "Creating new segment for topic='{}' partition={} segment_id={}",
             topic,
             partition,
@@ -686,7 +686,7 @@ impl MemoryMappedStorage {
             // Archive the old segment
             let old_segment = std::mem::replace(&mut *current_segment, new_segment);
 
-            tracing::info!(
+            tracing::debug!(
                 "Archived segment {} with {} bytes written",
                 old_segment.segment_id,
                 old_segment.write_offset
@@ -699,7 +699,7 @@ impl MemoryMappedStorage {
         // Check segment limits
         self.check_segment_limits(partition_segment)?;
 
-        tracing::info!(
+        tracing::debug!(
             "Segment rotation completed: topic='{}' partition={} new_segment_id={}",
             topic,
             partition,

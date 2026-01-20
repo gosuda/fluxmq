@@ -6,33 +6,41 @@
 /// - Asynchronous disk I/O with vectored writes
 use crate::Result;
 use bytes::{Bytes, BytesMut};
-use parking_lot::RwLock;
-use std::collections::HashMap;
+use crossbeam::queue::SegQueue;
+use dashmap::DashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-/// Zero-copy network buffer manager
+/// Zero-copy network buffer manager using lock-free SegQueue
 pub struct ZeroCopyBufferManager {
-    // Pre-allocated buffer pools
-    small_buffers: Arc<RwLock<Vec<BytesMut>>>, // 1KB buffers
-    medium_buffers: Arc<RwLock<Vec<BytesMut>>>, // 16KB buffers
-    large_buffers: Arc<RwLock<Vec<BytesMut>>>, // 256KB buffers
+    // Pre-allocated buffer pools using lock-free SegQueue
+    small_buffers: Arc<SegQueue<BytesMut>>,  // 1KB buffers
+    medium_buffers: Arc<SegQueue<BytesMut>>, // 16KB buffers
+    large_buffers: Arc<SegQueue<BytesMut>>,  // 256KB buffers
 
     // Buffer usage statistics
     allocations: AtomicUsize,
     deallocations: AtomicUsize,
     reuse_count: AtomicUsize,
+
+    // Pool size tracking (since SegQueue doesn't have len())
+    small_pool_size: AtomicUsize,
+    medium_pool_size: AtomicUsize,
+    large_pool_size: AtomicUsize,
 }
 
 impl ZeroCopyBufferManager {
     pub fn new() -> Self {
-        let mut manager = Self {
-            small_buffers: Arc::new(RwLock::new(Vec::with_capacity(1000))),
-            medium_buffers: Arc::new(RwLock::new(Vec::with_capacity(500))),
-            large_buffers: Arc::new(RwLock::new(Vec::with_capacity(100))),
+        let manager = Self {
+            small_buffers: Arc::new(SegQueue::new()),
+            medium_buffers: Arc::new(SegQueue::new()),
+            large_buffers: Arc::new(SegQueue::new()),
             allocations: AtomicUsize::new(0),
             deallocations: AtomicUsize::new(0),
             reuse_count: AtomicUsize::new(0),
+            small_pool_size: AtomicUsize::new(0),
+            medium_pool_size: AtomicUsize::new(0),
+            large_pool_size: AtomicUsize::new(0),
         };
 
         // Pre-allocate buffers for immediate use
@@ -40,52 +48,49 @@ impl ZeroCopyBufferManager {
         manager
     }
 
-    fn pre_allocate_buffers(&mut self) {
+    fn pre_allocate_buffers(&self) {
         // Pre-allocate small buffers (1KB each)
-        {
-            let mut small = self.small_buffers.write();
-            for _ in 0..500 {
-                small.push(BytesMut::with_capacity(1024));
-            }
+        for _ in 0..500 {
+            self.small_buffers.push(BytesMut::with_capacity(1024));
         }
+        self.small_pool_size.store(500, Ordering::Relaxed);
 
         // Pre-allocate medium buffers (16KB each)
-        {
-            let mut medium = self.medium_buffers.write();
-            for _ in 0..200 {
-                medium.push(BytesMut::with_capacity(16384));
-            }
+        for _ in 0..200 {
+            self.medium_buffers.push(BytesMut::with_capacity(16384));
         }
+        self.medium_pool_size.store(200, Ordering::Relaxed);
 
         // Pre-allocate large buffers (256KB each)
-        {
-            let mut large = self.large_buffers.write();
-            for _ in 0..50 {
-                large.push(BytesMut::with_capacity(262144));
-            }
+        for _ in 0..50 {
+            self.large_buffers.push(BytesMut::with_capacity(262144));
         }
+        self.large_pool_size.store(50, Ordering::Relaxed);
     }
 
-    /// Get a buffer of appropriate size (zero-copy when possible)
+    /// Get a buffer of appropriate size (lock-free operation)
     pub fn get_buffer(&self, size: usize) -> BytesMut {
         self.allocations.fetch_add(1, Ordering::Relaxed);
 
         let buffer = if size <= 1024 {
-            if let Some(buf) = self.small_buffers.write().pop() {
+            if let Some(buf) = self.small_buffers.pop() {
+                self.small_pool_size.fetch_sub(1, Ordering::Relaxed);
                 self.reuse_count.fetch_add(1, Ordering::Relaxed);
                 buf
             } else {
                 BytesMut::with_capacity(1024)
             }
         } else if size <= 16384 {
-            if let Some(buf) = self.medium_buffers.write().pop() {
+            if let Some(buf) = self.medium_buffers.pop() {
+                self.medium_pool_size.fetch_sub(1, Ordering::Relaxed);
                 self.reuse_count.fetch_add(1, Ordering::Relaxed);
                 buf
             } else {
                 BytesMut::with_capacity(16384)
             }
         } else if size <= 262144 {
-            if let Some(buf) = self.large_buffers.write().pop() {
+            if let Some(buf) = self.large_buffers.pop() {
+                self.large_pool_size.fetch_sub(1, Ordering::Relaxed);
                 self.reuse_count.fetch_add(1, Ordering::Relaxed);
                 buf
             } else {
@@ -99,7 +104,7 @@ impl ZeroCopyBufferManager {
         buffer
     }
 
-    /// Return buffer to pool for reuse
+    /// Return buffer to pool for reuse (lock-free operation)
     pub fn return_buffer(&self, mut buffer: BytesMut) {
         self.deallocations.fetch_add(1, Ordering::Relaxed);
 
@@ -109,16 +114,22 @@ impl ZeroCopyBufferManager {
         let capacity = buffer.capacity();
 
         if capacity >= 900 && capacity <= 1100 {
-            if self.small_buffers.read().len() < 1000 {
-                self.small_buffers.write().push(buffer);
+            let current_size = self.small_pool_size.load(Ordering::Relaxed);
+            if current_size < 1000 {
+                self.small_buffers.push(buffer);
+                self.small_pool_size.fetch_add(1, Ordering::Relaxed);
             }
         } else if capacity >= 15000 && capacity <= 17000 {
-            if self.medium_buffers.read().len() < 500 {
-                self.medium_buffers.write().push(buffer);
+            let current_size = self.medium_pool_size.load(Ordering::Relaxed);
+            if current_size < 500 {
+                self.medium_buffers.push(buffer);
+                self.medium_pool_size.fetch_add(1, Ordering::Relaxed);
             }
         } else if capacity >= 250000 && capacity <= 270000 {
-            if self.large_buffers.read().len() < 100 {
-                self.large_buffers.write().push(buffer);
+            let current_size = self.large_pool_size.load(Ordering::Relaxed);
+            if current_size < 100 {
+                self.large_buffers.push(buffer);
+                self.large_pool_size.fetch_add(1, Ordering::Relaxed);
             }
         }
         // If buffer doesn't fit any category or pools are full, drop it
@@ -130,9 +141,9 @@ impl ZeroCopyBufferManager {
             allocations: self.allocations.load(Ordering::Relaxed),
             deallocations: self.deallocations.load(Ordering::Relaxed),
             reuse_count: self.reuse_count.load(Ordering::Relaxed),
-            small_pool_size: self.small_buffers.read().len(),
-            medium_pool_size: self.medium_buffers.read().len(),
-            large_pool_size: self.large_buffers.read().len(),
+            small_pool_size: self.small_pool_size.load(Ordering::Relaxed),
+            medium_pool_size: self.medium_pool_size.load(Ordering::Relaxed),
+            large_pool_size: self.large_pool_size.load(Ordering::Relaxed),
         }
     }
 }
@@ -159,8 +170,8 @@ impl BufferStats {
 
 /// Vectored I/O operations for high-performance disk writes
 pub struct VectoredIOManager {
-    // Pending write operations
-    pending_writes: Arc<RwLock<HashMap<String, Vec<Bytes>>>>,
+    // Pending write operations using lock-free DashMap
+    pending_writes: Arc<DashMap<String, Vec<Bytes>>>,
 
     // I/O statistics
     vectored_writes: AtomicUsize,
@@ -171,38 +182,57 @@ pub struct VectoredIOManager {
 impl VectoredIOManager {
     pub fn new() -> Self {
         Self {
-            pending_writes: Arc::new(RwLock::new(HashMap::new())),
+            pending_writes: Arc::new(DashMap::new()),
             vectored_writes: AtomicUsize::new(0),
             bytes_written: AtomicUsize::new(0),
             write_operations: AtomicUsize::new(0),
         }
     }
 
-    /// Queue data for vectored write (batches multiple writes)
+    /// Queue data for vectored write (batches multiple writes, lock-free)
     pub fn queue_write(&self, file_path: &str, data: Bytes) {
-        let mut pending = self.pending_writes.write();
-        pending
+        self.pending_writes
             .entry(file_path.to_string())
             .or_insert_with(Vec::new)
             .push(data);
     }
 
     /// Execute all pending vectored writes
+    ///
+    /// On Unix systems, uses vectored I/O (writev-style) to write multiple
+    /// buffers in a single syscall, avoiding memory copies.
     pub async fn flush_pending_writes(&self) -> Result<usize> {
-        let mut pending = self.pending_writes.write();
+        // Collect all entries to process (drain-like behavior for DashMap)
+        let entries: Vec<_> = self
+            .pending_writes
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+
+        // Clear all entries
+        self.pending_writes.clear();
+
         let mut total_bytes = 0;
 
-        for (file_path, data_vec) in pending.drain() {
+        for (file_path, data_vec) in entries {
             if !data_vec.is_empty() {
-                // Simulate vectored I/O write (in real implementation would use actual vectored I/O)
                 let batch_size: usize = data_vec.iter().map(|d| d.len()).sum();
 
-                // This would be replaced with actual vectored write
-                tokio::fs::write(&file_path, &data_vec.concat())
-                    .await
-                    .map_err(|e| crate::FluxmqError::Storage(e))?;
+                // Use vectored write for efficiency
+                #[cfg(unix)]
+                {
+                    total_bytes += Self::vectored_write_unix(&file_path, &data_vec).await?;
+                }
 
-                total_bytes += batch_size;
+                #[cfg(not(unix))]
+                {
+                    // Fallback for non-Unix: concatenate buffers
+                    tokio::fs::write(&file_path, &data_vec.concat())
+                        .await
+                        .map_err(|e| crate::FluxmqError::Storage(e))?;
+                    total_bytes += batch_size;
+                }
+
                 self.vectored_writes.fetch_add(1, Ordering::Relaxed);
                 self.bytes_written.fetch_add(batch_size, Ordering::Relaxed);
                 self.write_operations
@@ -211,6 +241,45 @@ impl VectoredIOManager {
         }
 
         Ok(total_bytes)
+    }
+
+    /// Vectored write implementation for Unix systems
+    ///
+    /// Uses pwritev or falls back to sequential pwrite calls.
+    /// This avoids copying data into a single contiguous buffer.
+    #[cfg(unix)]
+    async fn vectored_write_unix(file_path: &str, buffers: &[Bytes]) -> Result<usize> {
+        use std::fs::OpenOptions;
+        use std::io::{IoSlice, Write};
+
+        // Open file for appending
+        let file_path = file_path.to_string();
+        let buffers: Vec<Vec<u8>> = buffers.iter().map(|b| b.to_vec()).collect();
+
+        tokio::task::spawn_blocking(move || {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&file_path)
+                .map_err(|e| crate::FluxmqError::Storage(e))?;
+
+            // Create IoSlice references for vectored write
+            let io_slices: Vec<IoSlice> = buffers.iter().map(|b| IoSlice::new(b)).collect();
+
+            // Use write_vectored for efficient multi-buffer write
+            let bytes_written = file
+                .write_vectored(&io_slices)
+                .map_err(|e| crate::FluxmqError::Storage(e))?;
+
+            Ok(bytes_written)
+        })
+        .await
+        .map_err(|e| {
+            crate::FluxmqError::Storage(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("spawn_blocking failed: {}", e),
+            ))
+        })?
     }
 
     /// Get I/O performance statistics

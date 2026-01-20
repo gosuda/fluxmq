@@ -3,11 +3,11 @@
 //! This module manages producer IDs and epochs for transactional producers.
 //! It ensures unique producer identification and proper epoch management for exactly-once semantics.
 
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use super::{TransactionError, TransactionResult, TxnState};
@@ -109,9 +109,9 @@ impl ProducerMetadata {
 pub struct ProducerIdManager {
     /// Next producer ID to allocate
     next_producer_id: AtomicI64,
-    /// Producer metadata by producer ID
+    /// Producer metadata by producer ID using RwLock (cold path - infrequent access)
     producers_by_id: Arc<RwLock<HashMap<ProducerId, ProducerMetadata>>>,
-    /// Producer ID lookup by transactional ID
+    /// Producer ID lookup by transactional ID using RwLock (cold path - infrequent access)
     producers_by_txn_id: Arc<RwLock<HashMap<String, ProducerId>>>,
     /// Producer ID allocation range
     producer_id_range: (i64, i64),
@@ -168,12 +168,16 @@ impl ProducerIdManager {
         current_producer_id: Option<ProducerId>,
         current_producer_epoch: Option<i16>,
     ) -> TransactionResult<(ProducerId, i16)> {
-        let mut producers_by_txn_id = self.producers_by_txn_id.write().await;
-        let mut producers_by_id = self.producers_by_id.write().await;
-
         // Check if transactional ID already exists
-        if let Some(&existing_producer_id) = producers_by_txn_id.get(transactional_id) {
-            if let Some(metadata) = producers_by_id.get_mut(&existing_producer_id) {
+        let existing_producer_id = self
+            .producers_by_txn_id
+            .read()
+            .get(transactional_id)
+            .copied();
+
+        if let Some(existing_producer_id) = existing_producer_id {
+            let mut producers = self.producers_by_id.write();
+            if let Some(metadata) = producers.get_mut(&existing_producer_id) {
                 // Validate current producer ID and epoch if provided
                 if let (Some(pid), Some(epoch)) = (current_producer_id, current_producer_epoch) {
                     if pid == existing_producer_id && metadata.validate_epoch(epoch) {
@@ -211,8 +215,10 @@ impl ProducerIdManager {
             transaction_timeout_ms,
         );
 
-        producers_by_id.insert(producer_id, metadata);
-        producers_by_txn_id.insert(transactional_id.to_string(), producer_id);
+        self.producers_by_id.write().insert(producer_id, metadata);
+        self.producers_by_txn_id
+            .write()
+            .insert(transactional_id.to_string(), producer_id);
 
         info!(
             producer_id = producer_id,
@@ -228,8 +234,7 @@ impl ProducerIdManager {
         let producer_id = self.allocate_producer_id();
         let metadata = ProducerMetadata::new(None, producer_id, 0);
 
-        let mut producers_by_id = self.producers_by_id.write().await;
-        producers_by_id.insert(producer_id, metadata);
+        self.producers_by_id.write().insert(producer_id, metadata);
 
         info!(
             producer_id = producer_id,
@@ -241,8 +246,7 @@ impl ProducerIdManager {
 
     /// Get producer metadata by ID
     pub async fn get_producer_metadata(&self, producer_id: ProducerId) -> Option<ProducerMetadata> {
-        let producers = self.producers_by_id.read().await;
-        producers.get(&producer_id).cloned()
+        self.producers_by_id.read().get(&producer_id).cloned()
     }
 
     /// Update producer transaction state
@@ -251,8 +255,7 @@ impl ProducerIdManager {
         producer_id: ProducerId,
         new_state: TxnState,
     ) -> TransactionResult<()> {
-        let mut producers = self.producers_by_id.write().await;
-        if let Some(metadata) = producers.get_mut(&producer_id) {
+        if let Some(metadata) = self.producers_by_id.write().get_mut(&producer_id) {
             metadata.update_state(new_state);
             Ok(())
         } else {
@@ -266,7 +269,7 @@ impl ProducerIdManager {
         producer_id: ProducerId,
         producer_epoch: i16,
     ) -> TransactionResult<()> {
-        let producers = self.producers_by_id.read().await;
+        let producers = self.producers_by_id.read();
         if let Some(metadata) = producers.get(&producer_id) {
             if metadata.validate_epoch(producer_epoch) {
                 Ok(())
@@ -283,21 +286,25 @@ impl ProducerIdManager {
 
     /// Remove expired producers (cleanup task)
     pub async fn cleanup_expired_producers(&self) -> usize {
-        let mut producers_by_id = self.producers_by_id.write().await;
-        let mut producers_by_txn_id = self.producers_by_txn_id.write().await;
+        let expired_producers: Vec<_> = {
+            let producers = self.producers_by_id.read();
+            producers
+                .iter()
+                .filter(|(_, metadata)| {
+                    metadata.txn_state.is_terminal() || metadata.is_transaction_expired()
+                })
+                .map(|(id, metadata)| (*id, metadata.transactional_id.clone()))
+                .collect()
+        };
 
-        let expired_producers: Vec<_> = producers_by_id
-            .iter()
-            .filter(|(_, metadata)| {
-                metadata.txn_state.is_terminal() || metadata.is_transaction_expired()
-            })
-            .map(|(&producer_id, metadata)| (producer_id, metadata.transactional_id.clone()))
-            .collect();
-
-        for (producer_id, transactional_id) in &expired_producers {
-            producers_by_id.remove(producer_id);
-            if let Some(txn_id) = transactional_id {
-                producers_by_txn_id.remove(txn_id);
+        {
+            let mut producers = self.producers_by_id.write();
+            let mut txn_ids = self.producers_by_txn_id.write();
+            for (producer_id, transactional_id) in &expired_producers {
+                producers.remove(producer_id);
+                if let Some(txn_id) = transactional_id {
+                    txn_ids.remove(txn_id);
+                }
             }
         }
 
@@ -311,14 +318,12 @@ impl ProducerIdManager {
 
     /// Get producer statistics
     pub async fn get_stats(&self) -> ProducerIdStats {
-        let producers_by_id = self.producers_by_id.read().await;
-        let _producers_by_txn_id = self.producers_by_txn_id.read().await;
-
+        let producers = self.producers_by_id.read();
         let mut state_counts = HashMap::new();
         let mut transactional_count = 0;
         let mut idempotent_count = 0;
 
-        for metadata in producers_by_id.values() {
+        for metadata in producers.values() {
             *state_counts.entry(metadata.txn_state).or_insert(0) += 1;
 
             if metadata.transactional_id.is_some() {
@@ -329,7 +334,7 @@ impl ProducerIdManager {
         }
 
         ProducerIdStats {
-            total_producers: producers_by_id.len(),
+            total_producers: producers.len(),
             transactional_producers: transactional_count,
             idempotent_producers: idempotent_count,
             next_producer_id: self.next_producer_id.load(Ordering::Relaxed),

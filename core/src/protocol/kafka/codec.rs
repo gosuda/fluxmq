@@ -75,10 +75,11 @@ impl KafkaCodec {
         // Parse request header
         let api_key = cursor.get_i16();
 
-        // DEBUG: Log first 16 bytes of request for debugging framing issues
-        if data.len() >= 16 {
+        // DEBUG: Log first 16 bytes of request for debugging framing issues (trace level)
+        #[cfg(debug_assertions)]
+        if data.len() >= 16 && tracing::enabled!(tracing::Level::TRACE) {
             let first_16 = &data[0..16];
-            warn!("🔍 decode_request: api_key={}, data_len={}, first_16_bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
+            tracing::trace!("🔍 decode_request: api_key={}, data_len={}, first_16_bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
                   api_key, data.len(),
                   first_16[0], first_16[1], first_16[2], first_16[3],
                   first_16[4], first_16[5], first_16[6], first_16[7],
@@ -346,6 +347,42 @@ impl KafkaCodec {
                 let request = Self::decode_alter_partition_reassignments_request(header, &mut cursor)?;
                 Ok(KafkaRequest::AlterPartitionReassignments(request))
             }
+            46 => { // API_KEY_LIST_PARTITION_REASSIGNMENTS
+                let request = Self::decode_list_partition_reassignments_request(header, &mut cursor)?;
+                Ok(KafkaRequest::ListPartitionReassignments(request))
+            }
+            47 => { // API_KEY_OFFSET_DELETE
+                let request = Self::decode_offset_delete_request(header, &mut cursor)?;
+                Ok(KafkaRequest::OffsetDelete(request))
+            }
+            60 => { // API_KEY_DESCRIBE_CLUSTER
+                let request = Self::decode_describe_cluster_request(header, &mut cursor)?;
+                Ok(KafkaRequest::DescribeCluster(request))
+            }
+            61 => { // API_KEY_DESCRIBE_PRODUCERS
+                let request = Self::decode_describe_producers_request(header, &mut cursor)?;
+                Ok(KafkaRequest::DescribeProducers(request))
+            }
+            72 => { // API_KEY_PUSH_TELEMETRY
+                let request = Self::decode_push_telemetry_request(header, &mut cursor)?;
+                Ok(KafkaRequest::PushTelemetry(request))
+            }
+            23 => { // API_KEY_OFFSET_FOR_LEADER_EPOCH
+                let request = Self::decode_offset_for_leader_epoch_request(header, &mut cursor)?;
+                Ok(KafkaRequest::OffsetForLeaderEpoch(request))
+            }
+            29 => { // API_KEY_DESCRIBE_ACLS
+                let request = Self::decode_describe_acls_request(header, &mut cursor)?;
+                Ok(KafkaRequest::DescribeAcls(request))
+            }
+            30 => { // API_KEY_CREATE_ACLS
+                let request = Self::decode_create_acls_request(header, &mut cursor)?;
+                Ok(KafkaRequest::CreateAcls(request))
+            }
+            31 => { // API_KEY_DELETE_ACLS
+                let request = Self::decode_delete_acls_request(header, &mut cursor)?;
+                Ok(KafkaRequest::DeleteAcls(request))
+            }
             _ => Err(KafkaCodecError::UnsupportedVersion(api_key, api_version)),
         }
     }
@@ -418,9 +455,10 @@ impl KafkaCodec {
                 Self::encode_sasl_authenticate_response(resp, &mut buf)?
             }
             KafkaResponse::GetTelemetrySubscriptions(resp) => {
-                // Simple telemetry response encoding
-                // Header
+                // Flexible format (v0+) - uses compact arrays and tagged fields
+                // Header with tagged fields
                 buf.put_i32(resp.header.correlation_id);
+                buf.put_u8(0); // Empty tagged fields in header
 
                 // Body
                 buf.put_i32(resp.throttle_time_ms);
@@ -428,8 +466,8 @@ impl KafkaCodec {
                 buf.extend_from_slice(&resp.client_instance_id);
                 buf.put_i32(resp.subscription_id);
 
-                // Accepted compression types array
-                buf.put_i32(resp.accepted_compression_types.len() as i32);
+                // Accepted compression types - compact array
+                Self::encode_varint(&mut buf, (resp.accepted_compression_types.len() + 1) as u64);
                 for compression_type in &resp.accepted_compression_types {
                     buf.put_i8(*compression_type);
                 }
@@ -438,13 +476,13 @@ impl KafkaCodec {
                 buf.put_i32(resp.telemetry_max_bytes);
                 buf.put_u8(if resp.delta_temporality { 1 } else { 0 });
 
-                // Requested metrics array
-                buf.put_i32(resp.requested_metrics.len() as i32);
+                // Requested metrics - compact array of compact strings
+                Self::encode_varint(&mut buf, (resp.requested_metrics.len() + 1) as u64);
                 for metric in &resp.requested_metrics {
-                    let metric_bytes = metric.as_bytes();
-                    buf.put_i16(metric_bytes.len() as i16);
-                    buf.extend_from_slice(metric_bytes);
+                    Self::encode_compact_string(metric, &mut buf);
                 }
+
+                buf.put_u8(0); // Empty tagged fields at end
             }
             // Cluster Coordination APIs (Inter-broker communication)
             KafkaResponse::LeaderAndIsr(resp) => {
@@ -490,6 +528,34 @@ impl KafkaCodec {
             }
             KafkaResponse::AlterPartitionReassignments(resp) => {
                 Self::encode_alter_partition_reassignments_response(resp, &mut buf)?;
+            }
+            // New Admin APIs (Kafka 4.1.0 compatibility)
+            KafkaResponse::ListPartitionReassignments(resp) => {
+                Self::encode_list_partition_reassignments_response(resp, &mut buf)?;
+            }
+            KafkaResponse::OffsetDelete(resp) => {
+                Self::encode_offset_delete_response(resp, &mut buf)?;
+            }
+            KafkaResponse::DescribeCluster(resp) => {
+                Self::encode_describe_cluster_response(resp, &mut buf)?;
+            }
+            KafkaResponse::DescribeProducers(resp) => {
+                Self::encode_describe_producers_response(resp, &mut buf)?;
+            }
+            KafkaResponse::PushTelemetry(resp) => {
+                Self::encode_push_telemetry_response(resp, &mut buf)?;
+            }
+            KafkaResponse::OffsetForLeaderEpoch(resp) => {
+                Self::encode_offset_for_leader_epoch_response(resp, &mut buf)?;
+            }
+            KafkaResponse::DescribeAcls(resp) => {
+                Self::encode_describe_acls_response(resp, &mut buf)?;
+            }
+            KafkaResponse::CreateAcls(resp) => {
+                Self::encode_create_acls_response(resp, &mut buf)?;
+            }
+            KafkaResponse::DeleteAcls(resp) => {
+                Self::encode_delete_acls_response(resp, &mut buf)?;
             }
         }
 
@@ -5527,6 +5593,907 @@ impl KafkaCodec {
             timeout_ms,
             topics,
         })
+    }
+
+    // ========================================================================
+    // LIST PARTITION REASSIGNMENTS API (Key = 46)
+    // ========================================================================
+
+    fn decode_list_partition_reassignments_request(
+        header: KafkaRequestHeader,
+        cursor: &mut Cursor<&[u8]>,
+    ) -> Result<KafkaListPartitionReassignmentsRequest> {
+        // This API is flexible from v0+
+        let timeout_ms = cursor.get_i32();
+
+        // Topics (nullable compact array)
+        let topics = match Self::decode_compact_array_len(cursor)? {
+            Some(topic_count) => {
+                let mut topics = Vec::with_capacity(topic_count.min(1000));
+                for _ in 0..topic_count {
+                    let name = Self::decode_compact_string(cursor)?.unwrap_or_default();
+                    // Partition indexes (compact array)
+                    let partition_count = Self::decode_compact_array_len(cursor)?
+                        .unwrap_or(0);
+                    let mut partition_indexes = Vec::with_capacity(partition_count.min(10000));
+                    for _ in 0..partition_count {
+                        partition_indexes.push(cursor.get_i32());
+                    }
+                    Self::skip_tagged_fields(cursor)?;
+                    topics.push(KafkaListPartitionReassignmentsTopic {
+                        name,
+                        partition_indexes,
+                    });
+                }
+                Some(topics)
+            }
+            None => None,
+        };
+
+        Self::skip_tagged_fields(cursor)?;
+
+        Ok(KafkaListPartitionReassignmentsRequest {
+            header,
+            timeout_ms,
+            topics,
+        })
+    }
+
+    fn encode_list_partition_reassignments_response(
+        resp: &KafkaListPartitionReassignmentsResponse,
+        buf: &mut BytesMut,
+    ) -> Result<()> {
+        // Response header (flexible version)
+        buf.put_i32(resp.header.correlation_id);
+        buf.put_u8(0); // Empty tagged fields in header
+
+        // ThrottleTimeMs
+        buf.put_i32(resp.throttle_time_ms);
+        // ErrorCode
+        buf.put_i16(resp.error_code);
+        // ErrorMessage (nullable compact string)
+        Self::encode_compact_nullable_string(&resp.error_message, buf);
+
+        // Topics (compact array)
+        Self::encode_compact_array_len(resp.topics.len(), buf);
+        for topic in &resp.topics {
+            Self::encode_compact_string(&topic.name, buf);
+            // Partitions (compact array)
+            Self::encode_compact_array_len(topic.partitions.len(), buf);
+            for partition in &topic.partitions {
+                buf.put_i32(partition.partition_index);
+                // Replicas (compact array)
+                Self::encode_compact_array_len(partition.replicas.len(), buf);
+                for replica in &partition.replicas {
+                    buf.put_i32(*replica);
+                }
+                // AddingReplicas (compact array)
+                Self::encode_compact_array_len(partition.adding_replicas.len(), buf);
+                for replica in &partition.adding_replicas {
+                    buf.put_i32(*replica);
+                }
+                // RemovingReplicas (compact array)
+                Self::encode_compact_array_len(partition.removing_replicas.len(), buf);
+                for replica in &partition.removing_replicas {
+                    buf.put_i32(*replica);
+                }
+                buf.put_u8(0); // Tagged fields
+            }
+            buf.put_u8(0); // Tagged fields
+        }
+        buf.put_u8(0); // Tagged fields
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // OFFSET DELETE API (Key = 47)
+    // ========================================================================
+
+    fn decode_offset_delete_request(
+        header: KafkaRequestHeader,
+        cursor: &mut Cursor<&[u8]>,
+    ) -> Result<KafkaOffsetDeleteRequest> {
+        // This API is NOT flexible (flexibleVersions: none)
+        let group_id = Self::decode_string(cursor)?;
+
+        let topic_count = cursor.get_i32() as usize;
+        let mut topics = Vec::with_capacity(topic_count.min(1000));
+        for _ in 0..topic_count {
+            let name = Self::decode_string(cursor)?;
+            let partition_count = cursor.get_i32() as usize;
+            let mut partitions = Vec::with_capacity(partition_count.min(10000));
+            for _ in 0..partition_count {
+                partitions.push(KafkaOffsetDeleteRequestPartition {
+                    partition_index: cursor.get_i32(),
+                });
+            }
+            topics.push(KafkaOffsetDeleteRequestTopic { name, partitions });
+        }
+
+        Ok(KafkaOffsetDeleteRequest {
+            header,
+            group_id,
+            topics,
+        })
+    }
+
+    fn encode_offset_delete_response(
+        resp: &KafkaOffsetDeleteResponse,
+        buf: &mut BytesMut,
+    ) -> Result<()> {
+        // Response header (non-flexible)
+        buf.put_i32(resp.header.correlation_id);
+
+        // ErrorCode
+        buf.put_i16(resp.error_code);
+        // ThrottleTimeMs
+        buf.put_i32(resp.throttle_time_ms);
+
+        // Topics (standard array)
+        buf.put_i32(resp.topics.len() as i32);
+        for topic in &resp.topics {
+            Self::encode_string(&topic.name, buf);
+            buf.put_i32(topic.partitions.len() as i32);
+            for partition in &topic.partitions {
+                buf.put_i32(partition.partition_index);
+                buf.put_i16(partition.error_code);
+            }
+        }
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // DESCRIBE CLUSTER API (Key = 60)
+    // ========================================================================
+
+    fn decode_describe_cluster_request(
+        header: KafkaRequestHeader,
+        cursor: &mut Cursor<&[u8]>,
+    ) -> Result<KafkaDescribeClusterRequest> {
+        // This API is flexible from v0+
+        let include_cluster_authorized_operations = cursor.get_u8() != 0;
+
+        // EndpointType (v1+)
+        let endpoint_type = if header.api_version >= 1 && cursor.remaining() >= 1 {
+            cursor.get_i8()
+        } else {
+            1 // Default to brokers
+        };
+
+        Self::skip_tagged_fields(cursor)?;
+
+        Ok(KafkaDescribeClusterRequest {
+            header,
+            include_cluster_authorized_operations,
+            endpoint_type,
+        })
+    }
+
+    fn encode_describe_cluster_response(
+        resp: &KafkaDescribeClusterResponse,
+        buf: &mut BytesMut,
+    ) -> Result<()> {
+        // Response header (flexible version)
+        buf.put_i32(resp.header.correlation_id);
+        buf.put_u8(0); // Empty tagged fields in header
+
+        // ThrottleTimeMs
+        buf.put_i32(resp.throttle_time_ms);
+        // ErrorCode
+        buf.put_i16(resp.error_code);
+        // ErrorMessage (nullable compact string)
+        Self::encode_compact_nullable_string(&resp.error_message, buf);
+
+        // EndpointType (v1+)
+        if resp.api_version >= 1 {
+            buf.put_i8(resp.endpoint_type);
+        }
+
+        // ClusterId (compact string)
+        Self::encode_compact_string(&resp.cluster_id, buf);
+        // ControllerId
+        buf.put_i32(resp.controller_id);
+
+        // Brokers (compact array)
+        Self::encode_compact_array_len(resp.brokers.len(), buf);
+        for broker in &resp.brokers {
+            buf.put_i32(broker.broker_id);
+            Self::encode_compact_string(&broker.host, buf);
+            buf.put_i32(broker.port);
+            Self::encode_compact_nullable_string(&broker.rack, buf);
+            buf.put_u8(0); // Tagged fields
+        }
+
+        // ClusterAuthorizedOperations
+        buf.put_i32(resp.cluster_authorized_operations);
+
+        buf.put_u8(0); // Tagged fields
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // DESCRIBE PRODUCERS API (Key = 61)
+    // ========================================================================
+
+    fn decode_describe_producers_request(
+        header: KafkaRequestHeader,
+        cursor: &mut Cursor<&[u8]>,
+    ) -> Result<KafkaDescribeProducersRequest> {
+        // This API is flexible from v0+
+        let topic_count = Self::decode_compact_array_len(cursor)?.unwrap_or(0);
+        let mut topics = Vec::with_capacity(topic_count.min(1000));
+
+        for _ in 0..topic_count {
+            let name = Self::decode_compact_string(cursor)?.unwrap_or_default();
+            let partition_count = Self::decode_compact_array_len(cursor)?.unwrap_or(0);
+            let mut partition_indexes = Vec::with_capacity(partition_count.min(10000));
+            for _ in 0..partition_count {
+                partition_indexes.push(cursor.get_i32());
+            }
+            Self::skip_tagged_fields(cursor)?;
+            topics.push(KafkaDescribeProducersTopicRequest {
+                name,
+                partition_indexes,
+            });
+        }
+
+        Self::skip_tagged_fields(cursor)?;
+
+        Ok(KafkaDescribeProducersRequest { header, topics })
+    }
+
+    fn encode_describe_producers_response(
+        resp: &KafkaDescribeProducersResponse,
+        buf: &mut BytesMut,
+    ) -> Result<()> {
+        // Response header (flexible version)
+        buf.put_i32(resp.header.correlation_id);
+        buf.put_u8(0); // Empty tagged fields in header
+
+        // ThrottleTimeMs
+        buf.put_i32(resp.throttle_time_ms);
+
+        // Topics (compact array)
+        Self::encode_compact_array_len(resp.topics.len(), buf);
+        for topic in &resp.topics {
+            Self::encode_compact_string(&topic.name, buf);
+            // Partitions (compact array)
+            Self::encode_compact_array_len(topic.partitions.len(), buf);
+            for partition in &topic.partitions {
+                buf.put_i32(partition.partition_index);
+                buf.put_i16(partition.error_code);
+                Self::encode_compact_nullable_string(&partition.error_message, buf);
+                // ActiveProducers (compact array)
+                Self::encode_compact_array_len(partition.active_producers.len(), buf);
+                for producer in &partition.active_producers {
+                    buf.put_i64(producer.producer_id);
+                    buf.put_i32(producer.producer_epoch);
+                    buf.put_i32(producer.last_sequence);
+                    buf.put_i64(producer.last_timestamp);
+                    buf.put_i32(producer.coordinator_epoch);
+                    buf.put_i64(producer.current_txn_start_offset);
+                    buf.put_u8(0); // Tagged fields
+                }
+                buf.put_u8(0); // Tagged fields
+            }
+            buf.put_u8(0); // Tagged fields
+        }
+        buf.put_u8(0); // Tagged fields
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // PUSH TELEMETRY API (Key = 72)
+    // ========================================================================
+
+    fn decode_push_telemetry_request(
+        header: KafkaRequestHeader,
+        cursor: &mut Cursor<&[u8]>,
+    ) -> Result<KafkaPushTelemetryRequest> {
+        // This API is flexible from v0+
+        // ClientInstanceId (UUID = 16 bytes)
+        let mut client_instance_id = [0u8; 16];
+        if cursor.remaining() < 16 {
+            return Err(KafkaCodecError::InvalidFormat(
+                "PushTelemetry: not enough bytes for client_instance_id".to_string()
+            ));
+        }
+        cursor.copy_to_slice(&mut client_instance_id);
+
+        // SubscriptionId
+        let subscription_id = cursor.get_i32();
+        // Terminating
+        let terminating = cursor.get_u8() != 0;
+        // CompressionType
+        let compression_type = cursor.get_i8();
+
+        // Metrics (compact bytes)
+        let metrics_len = Self::decode_varint(cursor)? as usize;
+        let actual_len = if metrics_len > 0 { metrics_len - 1 } else { 0 };
+        let metrics = if actual_len > 0 && cursor.remaining() >= actual_len {
+            let mut data = vec![0u8; actual_len];
+            cursor.copy_to_slice(&mut data);
+            Bytes::from(data)
+        } else {
+            Bytes::new()
+        };
+
+        Self::skip_tagged_fields(cursor)?;
+
+        Ok(KafkaPushTelemetryRequest {
+            header,
+            client_instance_id,
+            subscription_id,
+            terminating,
+            compression_type,
+            metrics,
+        })
+    }
+
+    fn encode_push_telemetry_response(
+        resp: &KafkaPushTelemetryResponse,
+        buf: &mut BytesMut,
+    ) -> Result<()> {
+        // Response header (flexible version)
+        buf.put_i32(resp.header.correlation_id);
+        buf.put_u8(0); // Empty tagged fields in header
+
+        // ThrottleTimeMs
+        buf.put_i32(resp.throttle_time_ms);
+        // ErrorCode
+        buf.put_i16(resp.error_code);
+
+        buf.put_u8(0); // Tagged fields
+
+        Ok(())
+    }
+
+    // ============================================================================
+    // OFFSET FOR LEADER EPOCH API (ApiKey = 23)
+    // ============================================================================
+
+    fn decode_offset_for_leader_epoch_request(
+        header: KafkaRequestHeader,
+        cursor: &mut Cursor<&[u8]>,
+    ) -> Result<KafkaOffsetForLeaderEpochRequest> {
+        let api_version = header.api_version;
+        let flexible = api_version >= 4;
+
+        // ReplicaId (v3+)
+        let replica_id = if api_version >= 3 {
+            cursor.get_i32()
+        } else {
+            -1
+        };
+
+        // Topics array
+        let topics_count = if flexible {
+            Self::decode_varint(cursor)? as i32 - 1
+        } else {
+            cursor.get_i32()
+        };
+
+        let mut topics = Vec::with_capacity(topics_count.max(0) as usize);
+        for _ in 0..topics_count {
+            let topic = if flexible {
+                Self::decode_compact_string(cursor)?.unwrap_or_default()
+            } else {
+                Self::decode_string(cursor)?
+            };
+
+            let partitions_count = if flexible {
+                Self::decode_varint(cursor)? as i32 - 1
+            } else {
+                cursor.get_i32()
+            };
+
+            let mut partitions = Vec::with_capacity(partitions_count.max(0) as usize);
+            for _ in 0..partitions_count {
+                let partition = cursor.get_i32();
+                let current_leader_epoch = if api_version >= 2 {
+                    cursor.get_i32()
+                } else {
+                    -1
+                };
+                let leader_epoch = cursor.get_i32();
+
+                if flexible {
+                    Self::skip_tagged_fields(cursor)?;
+                }
+
+                partitions.push(KafkaOffsetForLeaderEpochPartition {
+                    partition,
+                    current_leader_epoch,
+                    leader_epoch,
+                });
+            }
+
+            if flexible {
+                Self::skip_tagged_fields(cursor)?;
+            }
+
+            topics.push(KafkaOffsetForLeaderEpochTopic { topic, partitions });
+        }
+
+        if flexible {
+            Self::skip_tagged_fields(cursor)?;
+        }
+
+        Ok(KafkaOffsetForLeaderEpochRequest {
+            header,
+            replica_id,
+            topics,
+        })
+    }
+
+    fn encode_offset_for_leader_epoch_response(
+        resp: &KafkaOffsetForLeaderEpochResponse,
+        buf: &mut BytesMut,
+    ) -> Result<()> {
+        let api_version = resp.api_version;
+        let flexible = api_version >= 4;
+
+        // Response header
+        buf.put_i32(resp.header.correlation_id);
+        if flexible {
+            buf.put_u8(0); // Empty tagged fields in header
+        }
+
+        // ThrottleTimeMs (v2+)
+        if api_version >= 2 {
+            buf.put_i32(resp.throttle_time_ms);
+        }
+
+        // Topics array
+        if flexible {
+            Self::encode_varint(buf, (resp.topics.len() + 1) as u64);
+        } else {
+            buf.put_i32(resp.topics.len() as i32);
+        }
+
+        for topic in &resp.topics {
+            if flexible {
+                Self::encode_compact_string(&topic.topic, buf);
+            } else {
+                Self::encode_string(&topic.topic, buf);
+            }
+
+            if flexible {
+                Self::encode_varint(buf, (topic.partitions.len() + 1) as u64);
+            } else {
+                buf.put_i32(topic.partitions.len() as i32);
+            }
+
+            for partition in &topic.partitions {
+                buf.put_i16(partition.error_code);
+                buf.put_i32(partition.partition);
+                if api_version >= 1 {
+                    buf.put_i32(partition.leader_epoch);
+                }
+                buf.put_i64(partition.end_offset);
+
+                if flexible {
+                    buf.put_u8(0); // Tagged fields
+                }
+            }
+
+            if flexible {
+                buf.put_u8(0); // Tagged fields
+            }
+        }
+
+        if flexible {
+            buf.put_u8(0); // Tagged fields
+        }
+
+        Ok(())
+    }
+
+    // ============================================================================
+    // DESCRIBE ACLS API (ApiKey = 29)
+    // ============================================================================
+
+    fn decode_describe_acls_request(
+        header: KafkaRequestHeader,
+        cursor: &mut Cursor<&[u8]>,
+    ) -> Result<KafkaDescribeAclsRequest> {
+        let api_version = header.api_version;
+        let flexible = api_version >= 2;
+
+        let resource_type_filter = cursor.get_i8();
+
+        let resource_name_filter = if flexible {
+            Self::decode_compact_string(cursor)?
+        } else {
+            Self::decode_nullable_string(cursor)?
+        };
+
+        let pattern_type_filter = if api_version >= 1 {
+            cursor.get_i8()
+        } else {
+            3 // MATCH by default
+        };
+
+        let principal_filter = if flexible {
+            Self::decode_compact_string(cursor)?
+        } else {
+            Self::decode_nullable_string(cursor)?
+        };
+
+        let host_filter = if flexible {
+            Self::decode_compact_string(cursor)?
+        } else {
+            Self::decode_nullable_string(cursor)?
+        };
+
+        let operation = cursor.get_i8();
+        let permission_type = cursor.get_i8();
+
+        if flexible {
+            Self::skip_tagged_fields(cursor)?;
+        }
+
+        Ok(KafkaDescribeAclsRequest {
+            header,
+            resource_type_filter,
+            resource_name_filter,
+            pattern_type_filter,
+            principal_filter,
+            host_filter,
+            operation,
+            permission_type,
+        })
+    }
+
+    fn encode_describe_acls_response(
+        resp: &KafkaDescribeAclsResponse,
+        buf: &mut BytesMut,
+    ) -> Result<()> {
+        let api_version = resp.api_version;
+        let flexible = api_version >= 2;
+
+        // Response header
+        buf.put_i32(resp.header.correlation_id);
+        if flexible {
+            buf.put_u8(0); // Empty tagged fields in header
+        }
+
+        buf.put_i32(resp.throttle_time_ms);
+        buf.put_i16(resp.error_code);
+
+        if flexible {
+            Self::encode_compact_nullable_string(&resp.error_message, buf);
+        } else {
+            Self::encode_nullable_string(&resp.error_message, buf);
+        }
+
+        // Resources array
+        if flexible {
+            Self::encode_varint(buf, (resp.resources.len() + 1) as u64);
+        } else {
+            buf.put_i32(resp.resources.len() as i32);
+        }
+
+        for resource in &resp.resources {
+            buf.put_i8(resource.resource_type);
+
+            if flexible {
+                Self::encode_compact_string(&resource.resource_name, buf);
+            } else {
+                Self::encode_string(&resource.resource_name, buf);
+            }
+
+            if api_version >= 1 {
+                buf.put_i8(resource.pattern_type);
+            }
+
+            // ACLs array
+            if flexible {
+                Self::encode_varint(buf, (resource.acls.len() + 1) as u64);
+            } else {
+                buf.put_i32(resource.acls.len() as i32);
+            }
+
+            for acl in &resource.acls {
+                if flexible {
+                    Self::encode_compact_string(&acl.principal, buf);
+                    Self::encode_compact_string(&acl.host, buf);
+                } else {
+                    Self::encode_string(&acl.principal, buf);
+                    Self::encode_string(&acl.host, buf);
+                }
+                buf.put_i8(acl.operation);
+                buf.put_i8(acl.permission_type);
+
+                if flexible {
+                    buf.put_u8(0); // Tagged fields
+                }
+            }
+
+            if flexible {
+                buf.put_u8(0); // Tagged fields
+            }
+        }
+
+        if flexible {
+            buf.put_u8(0); // Tagged fields
+        }
+
+        Ok(())
+    }
+
+    // ============================================================================
+    // CREATE ACLS API (ApiKey = 30)
+    // ============================================================================
+
+    fn decode_create_acls_request(
+        header: KafkaRequestHeader,
+        cursor: &mut Cursor<&[u8]>,
+    ) -> Result<KafkaCreateAclsRequest> {
+        let api_version = header.api_version;
+        let flexible = api_version >= 2;
+
+        let creations_count = if flexible {
+            Self::decode_varint(cursor)? as i32 - 1
+        } else {
+            cursor.get_i32()
+        };
+
+        let mut creations = Vec::with_capacity(creations_count.max(0) as usize);
+        for _ in 0..creations_count {
+            let resource_type = cursor.get_i8();
+
+            let resource_name = if flexible {
+                Self::decode_compact_string(cursor)?.unwrap_or_default()
+            } else {
+                Self::decode_string(cursor)?
+            };
+
+            let pattern_type = if api_version >= 1 {
+                cursor.get_i8()
+            } else {
+                3 // LITERAL by default
+            };
+
+            let principal = if flexible {
+                Self::decode_compact_string(cursor)?.unwrap_or_default()
+            } else {
+                Self::decode_string(cursor)?
+            };
+
+            let host = if flexible {
+                Self::decode_compact_string(cursor)?.unwrap_or_default()
+            } else {
+                Self::decode_string(cursor)?
+            };
+
+            let operation = cursor.get_i8();
+            let permission_type = cursor.get_i8();
+
+            if flexible {
+                Self::skip_tagged_fields(cursor)?;
+            }
+
+            creations.push(KafkaAclCreation {
+                resource_type,
+                resource_name,
+                pattern_type,
+                principal,
+                host,
+                operation,
+                permission_type,
+            });
+        }
+
+        if flexible {
+            Self::skip_tagged_fields(cursor)?;
+        }
+
+        Ok(KafkaCreateAclsRequest { header, creations })
+    }
+
+    fn encode_create_acls_response(
+        resp: &KafkaCreateAclsResponse,
+        buf: &mut BytesMut,
+    ) -> Result<()> {
+        let api_version = resp.api_version;
+        let flexible = api_version >= 2;
+
+        // Response header
+        buf.put_i32(resp.header.correlation_id);
+        if flexible {
+            buf.put_u8(0); // Empty tagged fields in header
+        }
+
+        buf.put_i32(resp.throttle_time_ms);
+
+        // Results array
+        if flexible {
+            Self::encode_varint(buf, (resp.results.len() + 1) as u64);
+        } else {
+            buf.put_i32(resp.results.len() as i32);
+        }
+
+        for result in &resp.results {
+            buf.put_i16(result.error_code);
+
+            if flexible {
+                Self::encode_compact_nullable_string(&result.error_message, buf);
+            } else {
+                Self::encode_nullable_string(&result.error_message, buf);
+            }
+
+            if flexible {
+                buf.put_u8(0); // Tagged fields
+            }
+        }
+
+        if flexible {
+            buf.put_u8(0); // Tagged fields
+        }
+
+        Ok(())
+    }
+
+    // ============================================================================
+    // DELETE ACLS API (ApiKey = 31)
+    // ============================================================================
+
+    fn decode_delete_acls_request(
+        header: KafkaRequestHeader,
+        cursor: &mut Cursor<&[u8]>,
+    ) -> Result<KafkaDeleteAclsRequest> {
+        let api_version = header.api_version;
+        let flexible = api_version >= 2;
+
+        let filters_count = if flexible {
+            Self::decode_varint(cursor)? as i32 - 1
+        } else {
+            cursor.get_i32()
+        };
+
+        let mut filters = Vec::with_capacity(filters_count.max(0) as usize);
+        for _ in 0..filters_count {
+            let resource_type_filter = cursor.get_i8();
+
+            let resource_name_filter = if flexible {
+                Self::decode_compact_string(cursor)?
+            } else {
+                Self::decode_nullable_string(cursor)?
+            };
+
+            let pattern_type_filter = if api_version >= 1 {
+                cursor.get_i8()
+            } else {
+                3 // MATCH by default
+            };
+
+            let principal_filter = if flexible {
+                Self::decode_compact_string(cursor)?
+            } else {
+                Self::decode_nullable_string(cursor)?
+            };
+
+            let host_filter = if flexible {
+                Self::decode_compact_string(cursor)?
+            } else {
+                Self::decode_nullable_string(cursor)?
+            };
+
+            let operation = cursor.get_i8();
+            let permission_type = cursor.get_i8();
+
+            if flexible {
+                Self::skip_tagged_fields(cursor)?;
+            }
+
+            filters.push(KafkaDeleteAclsFilter {
+                resource_type_filter,
+                resource_name_filter,
+                pattern_type_filter,
+                principal_filter,
+                host_filter,
+                operation,
+                permission_type,
+            });
+        }
+
+        if flexible {
+            Self::skip_tagged_fields(cursor)?;
+        }
+
+        Ok(KafkaDeleteAclsRequest { header, filters })
+    }
+
+    fn encode_delete_acls_response(
+        resp: &KafkaDeleteAclsResponse,
+        buf: &mut BytesMut,
+    ) -> Result<()> {
+        let api_version = resp.api_version;
+        let flexible = api_version >= 2;
+
+        // Response header
+        buf.put_i32(resp.header.correlation_id);
+        if flexible {
+            buf.put_u8(0); // Empty tagged fields in header
+        }
+
+        buf.put_i32(resp.throttle_time_ms);
+
+        // Filter results array
+        if flexible {
+            Self::encode_varint(buf, (resp.filter_results.len() + 1) as u64);
+        } else {
+            buf.put_i32(resp.filter_results.len() as i32);
+        }
+
+        for filter_result in &resp.filter_results {
+            buf.put_i16(filter_result.error_code);
+
+            if flexible {
+                Self::encode_compact_nullable_string(&filter_result.error_message, buf);
+            } else {
+                Self::encode_nullable_string(&filter_result.error_message, buf);
+            }
+
+            // Matching ACLs array
+            if flexible {
+                Self::encode_varint(buf, (filter_result.matching_acls.len() + 1) as u64);
+            } else {
+                buf.put_i32(filter_result.matching_acls.len() as i32);
+            }
+
+            for acl in &filter_result.matching_acls {
+                buf.put_i16(acl.error_code);
+
+                if flexible {
+                    Self::encode_compact_nullable_string(&acl.error_message, buf);
+                } else {
+                    Self::encode_nullable_string(&acl.error_message, buf);
+                }
+
+                buf.put_i8(acl.resource_type);
+
+                if flexible {
+                    Self::encode_compact_string(&acl.resource_name, buf);
+                } else {
+                    Self::encode_string(&acl.resource_name, buf);
+                }
+
+                if api_version >= 1 {
+                    buf.put_i8(acl.pattern_type);
+                }
+
+                if flexible {
+                    Self::encode_compact_string(&acl.principal, buf);
+                    Self::encode_compact_string(&acl.host, buf);
+                } else {
+                    Self::encode_string(&acl.principal, buf);
+                    Self::encode_string(&acl.host, buf);
+                }
+
+                buf.put_i8(acl.operation);
+                buf.put_i8(acl.permission_type);
+
+                if flexible {
+                    buf.put_u8(0); // Tagged fields
+                }
+            }
+
+            if flexible {
+                buf.put_u8(0); // Tagged fields
+            }
+        }
+
+        if flexible {
+            buf.put_u8(0); // Tagged fields
+        }
+
+        Ok(())
     }
 
 }

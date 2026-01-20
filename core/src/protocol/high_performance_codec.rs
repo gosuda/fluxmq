@@ -68,7 +68,14 @@ impl HighPerformanceKafkaCodec {
     /// Build optimized ApiVersions response for broad compatibility
     /// Uses standard (non-flexible) format for better compatibility with older clients
     fn build_api_versions_response(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(200);
+        // Pre-calculated buffer size to avoid reallocations:
+        // - correlation_id: 4 bytes
+        // - error_code: 2 bytes
+        // - array_length (i32): 4 bytes
+        // - 45 APIs * 6 bytes each: 270 bytes
+        // - throttle_time: 4 bytes
+        // Total: 284 bytes (use 300 for safety margin)
+        let mut buf = BytesMut::with_capacity(300);
 
         // CRITICAL FIX: Don't include length prefix in template - it will be added by framing layer
         // Response header starts with correlation_id (will be patched at runtime)
@@ -83,7 +90,7 @@ impl HighPerformanceKafkaCodec {
 
         // 2. ApiKeys (standard array) - NOT compact array
         // Standard array: length as SIGNED int32, not unsigned
-        buf.put_i32(35); // Number of API entries as SIGNED int32 (Kafka protocol requirement)
+        buf.put_i32(45); // Number of API entries as SIGNED int32 (Kafka protocol requirement)
 
         // Add supported API versions - use conservative versions for compatibility
         let apis = [
@@ -113,11 +120,17 @@ impl HighPerformanceKafkaCodec {
             (21, 0, 2), // DeleteRecords (v0-v2)
             // Transaction APIs (exactly-once semantics) - supports latest versions
             (22, 0, 4), // InitProducerId (v0-v4, v2+ uses flexible encoding with tagged fields)
+            // Phase 2 APIs - Replication
+            (23, 2, 4), // OffsetForLeaderEpoch (v2-v4, v4 is flexible)
             (24, 0, 3), // AddPartitionsToTxn (v0-v3, v2+ uses flexible encoding)
             (25, 0, 3), // AddOffsetsToTxn (v0-v3, v2+ uses flexible encoding)
             (26, 0, 3), // EndTxn (v0-v3, v2+ uses flexible encoding)
             (27, 0, 1), // WriteTxnMarkers (v0-v1)
             (28, 0, 3), // TxnOffsetCommit (v0-v3)
+            // Phase 2 APIs - ACLs
+            (29, 1, 3), // DescribeAcls (v1-v3, v2+ is flexible)
+            (30, 1, 3), // CreateAcls (v1-v3, v2+ is flexible)
+            (31, 1, 3), // DeleteAcls (v1-v3, v2+ is flexible)
             (32, 0, 3), // DescribeConfigs (conservative v3)
             (33, 0, 2), // AlterConfigs (conservative v2)
             (36, 0, 2), // SaslAuthenticate (required for Java)
@@ -126,6 +139,13 @@ impl HighPerformanceKafkaCodec {
             (42, 0, 2), // DeleteGroups (v0-v2)
             (44, 0, 1), // IncrementalAlterConfigs (v0-v1)
             (45, 0, 0), // AlterPartitionReassignments (v0)
+            // New Admin APIs (Kafka 4.1.0 compatibility)
+            (46, 0, 0), // ListPartitionReassignments (v0)
+            (47, 0, 0), // OffsetDelete (v0)
+            (60, 0, 1), // DescribeCluster (v0-v1)
+            (61, 0, 0), // DescribeProducers (v0)
+            (71, 0, 0), // GetTelemetrySubscriptions (v0)
+            (72, 0, 0), // PushTelemetry (v0)
         ];
 
         for (api_key, min_version, max_version) in apis {
@@ -153,7 +173,19 @@ impl HighPerformanceKafkaCodec {
     /// This is because ApiVersions is the version negotiation API itself.
     /// See KIP-482 for details.
     fn build_api_versions_response_v3(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(200);
+        // Pre-calculated buffer size for flexible format:
+        // - correlation_id: 4 bytes
+        // - error_code: 2 bytes
+        // - compact array varint: ~2 bytes
+        // - 45 APIs * 7 bytes each (6 + tagged fields): 315 bytes
+        // - throttle_time: 4 bytes
+        // - supported_features compact array: ~2 bytes
+        // - finalized_features_epoch: 8 bytes
+        // - finalized_features compact array: ~2 bytes
+        // - zk_migration_ready: 1 byte
+        // - tagged_fields: 1 byte
+        // Total: ~341 bytes (use 360 for safety margin)
+        let mut buf = BytesMut::with_capacity(360);
 
         // CRITICAL FIX: ApiVersions response ALWAYS uses ResponseHeaderV0
         // (correlation_id only, NO tagged fields) even for v3+ responses.
@@ -168,9 +200,9 @@ impl HighPerformanceKafkaCodec {
 
         // 2. ApiKeys - COMPACT ARRAY (varint length + 1)
         // Compact array: length is encoded as unsigned varint, value is length + 1
-        // 34 APIs: 0-22 (skip 23), 24-28, 32-33, 36, 37, 42, 44
-        let num_apis = 34u32;
-        self.put_unsigned_varint(&mut buf, num_apis + 1); // 34 + 1 = 35
+        // 45 APIs: core + admin + telemetry + phase 2
+        let num_apis = 45u32;
+        self.put_unsigned_varint(&mut buf, num_apis + 1); // 45 + 1 = 46
 
         // Add supported API versions
         let apis = [
@@ -200,11 +232,17 @@ impl HighPerformanceKafkaCodec {
             (21, 0, 2), // DeleteRecords (v0-v2)
             // Transaction APIs (exactly-once semantics) - supports latest versions
             (22, 0, 4), // InitProducerId (v0-v4, v2+ uses flexible encoding with tagged fields)
+            // Phase 2 APIs - Replication
+            (23, 2, 4), // OffsetForLeaderEpoch (v2-v4, v4 is flexible)
             (24, 0, 3), // AddPartitionsToTxn (v0-v3, v2+ uses flexible encoding)
             (25, 0, 3), // AddOffsetsToTxn (v0-v3, v2+ uses flexible encoding)
             (26, 0, 3), // EndTxn (v0-v3, v2+ uses flexible encoding)
             (27, 0, 1), // WriteTxnMarkers (v0-v1)
             (28, 0, 3), // TxnOffsetCommit (v0-v3)
+            // Phase 2 APIs - ACLs
+            (29, 1, 3), // DescribeAcls (v1-v3, v2+ is flexible)
+            (30, 1, 3), // CreateAcls (v1-v3, v2+ is flexible)
+            (31, 1, 3), // DeleteAcls (v1-v3, v2+ is flexible)
             (32, 0, 3), // DescribeConfigs
             (33, 0, 2), // AlterConfigs
             (36, 0, 2), // SaslAuthenticate
@@ -212,6 +250,14 @@ impl HighPerformanceKafkaCodec {
             (37, 0, 3), // CreatePartitions (v0-v3)
             (42, 0, 2), // DeleteGroups (v0-v2)
             (44, 0, 1), // IncrementalAlterConfigs (v0-v1)
+            (45, 0, 0), // AlterPartitionReassignments (v0)
+            // New Admin APIs (Kafka 4.1.0 compatibility)
+            (46, 0, 0), // ListPartitionReassignments (v0)
+            (47, 0, 0), // OffsetDelete (v0)
+            (60, 0, 1), // DescribeCluster (v0-v1)
+            (61, 0, 0), // DescribeProducers (v0)
+            (71, 0, 0), // GetTelemetrySubscriptions (v0)
+            (72, 0, 0), // PushTelemetry (v0)
         ];
 
         for (api_key, min_version, max_version) in apis {
@@ -249,7 +295,17 @@ impl HighPerformanceKafkaCodec {
 
     /// Build metadata response template
     fn build_metadata_template(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(100);
+        // Pre-calculated buffer size:
+        // - length_placeholder: 4 bytes
+        // - correlation_id: 4 bytes
+        // - error_code: 2 bytes
+        // - broker_count: 4 bytes
+        // - broker_id: 4 bytes
+        // - host_length: 2 bytes + "localhost": 9 bytes
+        // - port: 4 bytes
+        // - rack: 2 bytes
+        // Total: 35 bytes (use 64 for safety margin)
+        let mut buf = BytesMut::with_capacity(64);
 
         // Response header template
         buf.put_u32(0); // Length placeholder
@@ -356,7 +412,7 @@ impl HighPerformanceKafkaCodec {
             return None;
         }
 
-        let topic = String::from_utf8_lossy(&data[8..8 + topic_len]).to_string();
+        let topic = String::from_utf8_lossy(&data[8..8 + topic_len]).into_owned();
         let consumed = 8 + topic_len;
 
         let request = ProduceRequest {
@@ -451,9 +507,27 @@ impl HighPerformanceKafkaCodec {
         }
     }
 
-    /// Encode unsigned varint according to Kafka specification
-    /// Variable-length encoding where each byte uses 7 bits for data and 1 bit as continuation flag
-    fn put_unsigned_varint(&self, buf: &mut BytesMut, mut value: u32) {
+    /// Encode unsigned varint with fast path optimization
+    ///
+    /// Variable-length encoding where each byte uses 7 bits for data and 1 bit as continuation flag.
+    /// Most varints in Kafka protocol are single-byte values (< 128),
+    /// so we optimize for that common case with an inline fast path.
+    #[inline(always)]
+    fn put_unsigned_varint(&self, buf: &mut BytesMut, value: u32) {
+        // Fast path: ~80% of varints are single-byte (value < 128)
+        if value < 0x80 {
+            buf.put_u8(value as u8);
+            return;
+        }
+        // Slow path for multi-byte varints
+        self.put_unsigned_varint_slow(buf, value);
+    }
+
+    /// Slow path for multi-byte varint encoding
+    /// Separated to keep the fast path code minimal for better inlining
+    #[cold]
+    #[inline(never)]
+    fn put_unsigned_varint_slow(&self, buf: &mut BytesMut, mut value: u32) {
         while value >= 0x80 {
             buf.put_u8((value & 0x7F) as u8 | 0x80);
             value >>= 7;

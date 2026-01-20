@@ -1,6 +1,7 @@
 use super::{BrokerId, ReplicationMessage};
 use crate::Result;
 use bytes::BytesMut;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -9,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
@@ -18,9 +19,9 @@ use tracing::{debug, error, info, warn};
 pub struct ReplicationNetwork {
     broker_id: BrokerId,
     listen_addr: SocketAddr,
-    /// Connections to other brokers (peer_id -> connection)
+    /// Connections to other brokers (peer_id -> connection) using RwLock (cold path - infrequent access)
     peer_connections: Arc<RwLock<HashMap<BrokerId, Arc<PeerConnection>>>>,
-    /// Message handlers for incoming replication messages
+    /// Message handlers for incoming replication messages using RwLock (cold path - infrequent access)
     message_handlers: Arc<RwLock<HashMap<BrokerId, mpsc::UnboundedSender<ReplicationMessage>>>>,
     /// Network configuration
     config: NetworkConfig,
@@ -140,12 +141,9 @@ impl ReplicationNetwork {
     /// Connect to a peer broker
     pub async fn connect_to_peer(&self, peer_id: BrokerId, peer_addr: SocketAddr) -> Result<()> {
         // Check if already connected
-        {
-            let connections = self.peer_connections.read().await;
-            if connections.contains_key(&peer_id) {
-                debug!("Already connected to broker {}", peer_id);
-                return Ok(());
-            }
+        if self.peer_connections.read().contains_key(&peer_id) {
+            debug!("Already connected to broker {}", peer_id);
+            return Ok(());
         }
 
         info!("Connecting to peer broker {} at {}", peer_id, peer_addr);
@@ -168,10 +166,7 @@ impl ReplicationNetwork {
             _handle: handle,
         });
 
-        {
-            let mut connections = self.peer_connections.write().await;
-            connections.insert(peer_id, connection);
-        }
+        self.peer_connections.write().insert(peer_id, connection);
 
         info!("Successfully connected to peer broker {}", peer_id);
         Ok(())
@@ -179,12 +174,8 @@ impl ReplicationNetwork {
 
     /// Send a message to a peer broker
     pub async fn send_to_peer(&self, peer_id: BrokerId, message: ReplicationMessage) -> Result<()> {
-        let connection = {
-            let connections = self.peer_connections.read().await;
-            connections.get(&peer_id).cloned()
-        };
-
-        if let Some(conn) = connection {
+        let connections = self.peer_connections.read();
+        if let Some(conn) = connections.get(&peer_id) {
             conn.sender.send(message).map_err(|e| {
                 crate::FluxmqError::Replication(format!(
                     "Failed to send message to peer {}: {}",
@@ -205,14 +196,14 @@ impl ReplicationNetwork {
         &self,
         handler: mpsc::UnboundedSender<ReplicationMessage>,
     ) {
-        let mut handlers = self.message_handlers.write().await;
-        handlers.insert(self.broker_id, handler);
+        self.message_handlers
+            .write()
+            .insert(self.broker_id, handler);
     }
 
     /// Disconnect from a peer broker
     pub async fn disconnect_from_peer(&self, peer_id: BrokerId) {
-        let mut connections = self.peer_connections.write().await;
-        if let Some(connection) = connections.remove(&peer_id) {
+        if let Some(connection) = self.peer_connections.write().remove(&peer_id) {
             debug!("Disconnected from peer broker {}", peer_id);
             // Connection will be dropped, which will stop the handler
             drop(connection);
@@ -221,8 +212,7 @@ impl ReplicationNetwork {
 
     /// Get connected peer broker IDs
     pub async fn get_connected_peers(&self) -> Vec<BrokerId> {
-        let connections = self.peer_connections.read().await;
-        connections.keys().copied().collect()
+        self.peer_connections.read().keys().copied().collect()
     }
 
     /// Handle incoming connection from another broker
@@ -411,7 +401,7 @@ impl ReplicationNetwork {
             }
 
             // Forward to appropriate handler
-            let handlers = message_handlers.read().await;
+            let handlers = message_handlers.read();
             if let Some(handler) = handlers.get(&local_broker_id) {
                 if let Err(e) = handler.send(network_message.payload) {
                     error!("Failed to forward message to handler: {}", e);
@@ -492,15 +482,19 @@ impl ReplicationNetworkManager {
 
     /// Register a broker address
     pub async fn register_broker(&self, broker_id: BrokerId, addr: SocketAddr) {
-        let mut registry = self.broker_registry.write().await;
-        registry.insert(broker_id, addr);
+        self.broker_registry.write().insert(broker_id, addr);
         info!("Registered broker {} at address {}", broker_id, addr);
     }
 
     /// Connect to all registered brokers
     pub async fn connect_to_all_brokers(&self) -> Result<()> {
-        let registry = self.broker_registry.read().await;
-        for (&broker_id, &addr) in registry.iter() {
+        let brokers: Vec<_> = self
+            .broker_registry
+            .read()
+            .iter()
+            .map(|(&k, &v)| (k, v))
+            .collect();
+        for (broker_id, addr) in brokers {
             if let Err(e) = self.network.connect_to_peer(broker_id, addr).await {
                 warn!("Failed to connect to broker {}: {}", broker_id, e);
             }
@@ -525,10 +519,7 @@ impl ReplicationNetworkManager {
     /// Get network statistics
     pub async fn get_stats(&self) -> NetworkStats {
         let connected_peers = self.network.get_connected_peers().await;
-        let registered_brokers = {
-            let registry = self.broker_registry.read().await;
-            registry.len()
-        };
+        let registered_brokers = self.broker_registry.read().len();
 
         NetworkStats {
             connected_peers: connected_peers.len(),

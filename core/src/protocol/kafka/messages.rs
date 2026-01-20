@@ -632,6 +632,17 @@ pub enum KafkaRequest {
     CreatePartitions(KafkaCreatePartitionsRequest),
     DeleteGroups(KafkaDeleteGroupsRequest),
     AlterPartitionReassignments(KafkaAlterPartitionReassignmentsRequest),
+    // New Admin APIs (Kafka 4.1.0 compatibility)
+    ListPartitionReassignments(KafkaListPartitionReassignmentsRequest),
+    OffsetDelete(KafkaOffsetDeleteRequest),
+    DescribeCluster(KafkaDescribeClusterRequest),
+    DescribeProducers(KafkaDescribeProducersRequest),
+    PushTelemetry(KafkaPushTelemetryRequest),
+    // Phase 2 APIs
+    OffsetForLeaderEpoch(KafkaOffsetForLeaderEpochRequest),
+    DescribeAcls(KafkaDescribeAclsRequest),
+    CreateAcls(KafkaCreateAclsRequest),
+    DeleteAcls(KafkaDeleteAclsRequest),
 }
 
 /// Unified Kafka response enum
@@ -675,6 +686,17 @@ pub enum KafkaResponse {
     CreatePartitions(KafkaCreatePartitionsResponse),
     DeleteGroups(KafkaDeleteGroupsResponse),
     AlterPartitionReassignments(KafkaAlterPartitionReassignmentsResponse),
+    // New Admin APIs (Kafka 4.1.0 compatibility)
+    ListPartitionReassignments(KafkaListPartitionReassignmentsResponse),
+    OffsetDelete(KafkaOffsetDeleteResponse),
+    DescribeCluster(KafkaDescribeClusterResponse),
+    DescribeProducers(KafkaDescribeProducersResponse),
+    PushTelemetry(KafkaPushTelemetryResponse),
+    // Phase 2 APIs
+    OffsetForLeaderEpoch(KafkaOffsetForLeaderEpochResponse),
+    DescribeAcls(KafkaDescribeAclsResponse),
+    CreateAcls(KafkaCreateAclsResponse),
+    DeleteAcls(KafkaDeleteAclsResponse),
 }
 
 impl KafkaRequest {
@@ -717,6 +739,15 @@ impl KafkaRequest {
             KafkaRequest::CreatePartitions(_) => 37,
             KafkaRequest::DeleteGroups(_) => 42,
             KafkaRequest::AlterPartitionReassignments(_) => 45,
+            KafkaRequest::ListPartitionReassignments(_) => 46,
+            KafkaRequest::OffsetDelete(_) => 47,
+            KafkaRequest::DescribeCluster(_) => 60,
+            KafkaRequest::DescribeProducers(_) => 61,
+            KafkaRequest::PushTelemetry(_) => 72,
+            KafkaRequest::OffsetForLeaderEpoch(_) => 23,
+            KafkaRequest::DescribeAcls(_) => 29,
+            KafkaRequest::CreateAcls(_) => 30,
+            KafkaRequest::DeleteAcls(_) => 31,
         }
     }
 
@@ -759,6 +790,15 @@ impl KafkaRequest {
             KafkaRequest::CreatePartitions(req) => req.header.correlation_id,
             KafkaRequest::DeleteGroups(req) => req.header.correlation_id,
             KafkaRequest::AlterPartitionReassignments(req) => req.header.correlation_id,
+            KafkaRequest::ListPartitionReassignments(req) => req.header.correlation_id,
+            KafkaRequest::OffsetDelete(req) => req.header.correlation_id,
+            KafkaRequest::DescribeCluster(req) => req.header.correlation_id,
+            KafkaRequest::DescribeProducers(req) => req.header.correlation_id,
+            KafkaRequest::PushTelemetry(req) => req.header.correlation_id,
+            KafkaRequest::OffsetForLeaderEpoch(req) => req.header.correlation_id,
+            KafkaRequest::DescribeAcls(req) => req.header.correlation_id,
+            KafkaRequest::CreateAcls(req) => req.header.correlation_id,
+            KafkaRequest::DeleteAcls(req) => req.header.correlation_id,
         }
     }
 
@@ -801,6 +841,15 @@ impl KafkaRequest {
             KafkaRequest::CreatePartitions(req) => req.header.api_version,
             KafkaRequest::DeleteGroups(req) => req.header.api_version,
             KafkaRequest::AlterPartitionReassignments(req) => req.header.api_version,
+            KafkaRequest::ListPartitionReassignments(req) => req.header.api_version,
+            KafkaRequest::OffsetDelete(req) => req.header.api_version,
+            KafkaRequest::DescribeCluster(req) => req.header.api_version,
+            KafkaRequest::DescribeProducers(req) => req.header.api_version,
+            KafkaRequest::PushTelemetry(req) => req.header.api_version,
+            KafkaRequest::OffsetForLeaderEpoch(req) => req.header.api_version,
+            KafkaRequest::DescribeAcls(req) => req.header.api_version,
+            KafkaRequest::CreateAcls(req) => req.header.api_version,
+            KafkaRequest::DeleteAcls(req) => req.header.api_version,
         }
     }
 }
@@ -845,6 +894,15 @@ impl KafkaResponse {
             KafkaResponse::CreatePartitions(resp) => resp.header.correlation_id,
             KafkaResponse::DeleteGroups(resp) => resp.header.correlation_id,
             KafkaResponse::AlterPartitionReassignments(resp) => resp.header.correlation_id,
+            KafkaResponse::ListPartitionReassignments(resp) => resp.header.correlation_id,
+            KafkaResponse::OffsetDelete(resp) => resp.header.correlation_id,
+            KafkaResponse::DescribeCluster(resp) => resp.header.correlation_id,
+            KafkaResponse::DescribeProducers(resp) => resp.header.correlation_id,
+            KafkaResponse::PushTelemetry(resp) => resp.header.correlation_id,
+            KafkaResponse::OffsetForLeaderEpoch(resp) => resp.header.correlation_id,
+            KafkaResponse::DescribeAcls(resp) => resp.header.correlation_id,
+            KafkaResponse::CreateAcls(resp) => resp.header.correlation_id,
+            KafkaResponse::DeleteAcls(resp) => resp.header.correlation_id,
         }
     }
 }
@@ -1515,4 +1573,363 @@ pub struct KafkaReassignablePartitionResponse {
     pub partition_index: i32,
     pub error_code: i16,
     pub error_message: Option<String>,
+}
+
+// ============================================================================
+// LIST PARTITION REASSIGNMENTS API (ApiKey = 46)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaListPartitionReassignmentsRequest {
+    pub header: KafkaRequestHeader,
+    pub timeout_ms: i32,
+    pub topics: Option<Vec<KafkaListPartitionReassignmentsTopic>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaListPartitionReassignmentsTopic {
+    pub name: String,
+    pub partition_indexes: Vec<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaListPartitionReassignmentsResponse {
+    pub header: KafkaResponseHeader,
+    pub api_version: i16,
+    pub throttle_time_ms: i32,
+    pub error_code: i16,
+    pub error_message: Option<String>,
+    pub topics: Vec<KafkaOngoingTopicReassignment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaOngoingTopicReassignment {
+    pub name: String,
+    pub partitions: Vec<KafkaOngoingPartitionReassignment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaOngoingPartitionReassignment {
+    pub partition_index: i32,
+    pub replicas: Vec<i32>,
+    pub adding_replicas: Vec<i32>,
+    pub removing_replicas: Vec<i32>,
+}
+
+// ============================================================================
+// OFFSET DELETE API (ApiKey = 47)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaOffsetDeleteRequest {
+    pub header: KafkaRequestHeader,
+    pub group_id: String,
+    pub topics: Vec<KafkaOffsetDeleteRequestTopic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaOffsetDeleteRequestTopic {
+    pub name: String,
+    pub partitions: Vec<KafkaOffsetDeleteRequestPartition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaOffsetDeleteRequestPartition {
+    pub partition_index: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaOffsetDeleteResponse {
+    pub header: KafkaResponseHeader,
+    pub api_version: i16,
+    pub error_code: i16,
+    pub throttle_time_ms: i32,
+    pub topics: Vec<KafkaOffsetDeleteResponseTopic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaOffsetDeleteResponseTopic {
+    pub name: String,
+    pub partitions: Vec<KafkaOffsetDeleteResponsePartition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaOffsetDeleteResponsePartition {
+    pub partition_index: i32,
+    pub error_code: i16,
+}
+
+// ============================================================================
+// DESCRIBE CLUSTER API (ApiKey = 60)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDescribeClusterRequest {
+    pub header: KafkaRequestHeader,
+    pub include_cluster_authorized_operations: bool,
+    pub endpoint_type: i8, // v1+: 1=brokers, 2=controllers
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDescribeClusterResponse {
+    pub header: KafkaResponseHeader,
+    pub api_version: i16,
+    pub throttle_time_ms: i32,
+    pub error_code: i16,
+    pub error_message: Option<String>,
+    pub endpoint_type: i8, // v1+: 1=brokers, 2=controllers
+    pub cluster_id: String,
+    pub controller_id: i32,
+    pub brokers: Vec<KafkaDescribeClusterBroker>,
+    pub cluster_authorized_operations: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDescribeClusterBroker {
+    pub broker_id: i32,
+    pub host: String,
+    pub port: i32,
+    pub rack: Option<String>,
+}
+
+// ============================================================================
+// DESCRIBE PRODUCERS API (ApiKey = 61)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDescribeProducersRequest {
+    pub header: KafkaRequestHeader,
+    pub topics: Vec<KafkaDescribeProducersTopicRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDescribeProducersTopicRequest {
+    pub name: String,
+    pub partition_indexes: Vec<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDescribeProducersResponse {
+    pub header: KafkaResponseHeader,
+    pub api_version: i16,
+    pub throttle_time_ms: i32,
+    pub topics: Vec<KafkaDescribeProducersTopicResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDescribeProducersTopicResponse {
+    pub name: String,
+    pub partitions: Vec<KafkaDescribeProducersPartitionResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDescribeProducersPartitionResponse {
+    pub partition_index: i32,
+    pub error_code: i16,
+    pub error_message: Option<String>,
+    pub active_producers: Vec<KafkaProducerState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaProducerState {
+    pub producer_id: i64,
+    pub producer_epoch: i32,
+    pub last_sequence: i32,
+    pub last_timestamp: i64,
+    pub coordinator_epoch: i32,
+    pub current_txn_start_offset: i64,
+}
+
+// ============================================================================
+// PUSH TELEMETRY API (ApiKey = 72)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaPushTelemetryRequest {
+    pub header: KafkaRequestHeader,
+    pub client_instance_id: [u8; 16],
+    pub subscription_id: i32,
+    pub terminating: bool,
+    pub compression_type: i8,
+    pub metrics: Bytes,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaPushTelemetryResponse {
+    pub header: KafkaResponseHeader,
+    pub api_version: i16,
+    pub throttle_time_ms: i32,
+    pub error_code: i16,
+}
+
+// ============================================================================
+// OFFSET FOR LEADER EPOCH API (ApiKey = 23)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaOffsetForLeaderEpochRequest {
+    pub header: KafkaRequestHeader,
+    pub replica_id: i32, // v3+: -2 = debug, -1 = consumer
+    pub topics: Vec<KafkaOffsetForLeaderEpochTopic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaOffsetForLeaderEpochTopic {
+    pub topic: String,
+    pub partitions: Vec<KafkaOffsetForLeaderEpochPartition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaOffsetForLeaderEpochPartition {
+    pub partition: i32,
+    pub current_leader_epoch: i32, // v2+
+    pub leader_epoch: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaOffsetForLeaderEpochResponse {
+    pub header: KafkaResponseHeader,
+    pub api_version: i16,
+    pub throttle_time_ms: i32, // v2+
+    pub topics: Vec<KafkaOffsetForLeaderEpochTopicResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaOffsetForLeaderEpochTopicResponse {
+    pub topic: String,
+    pub partitions: Vec<KafkaOffsetForLeaderEpochPartitionResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaOffsetForLeaderEpochPartitionResponse {
+    pub error_code: i16,
+    pub partition: i32,
+    pub leader_epoch: i32, // v1+
+    pub end_offset: i64,
+}
+
+// ============================================================================
+// DESCRIBE ACLS API (ApiKey = 29)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDescribeAclsRequest {
+    pub header: KafkaRequestHeader,
+    pub resource_type_filter: i8,
+    pub resource_name_filter: Option<String>,
+    pub pattern_type_filter: i8, // v1+: 1=literal, 2=prefixed, 3=any, 4=match
+    pub principal_filter: Option<String>,
+    pub host_filter: Option<String>,
+    pub operation: i8,
+    pub permission_type: i8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDescribeAclsResponse {
+    pub header: KafkaResponseHeader,
+    pub api_version: i16,
+    pub throttle_time_ms: i32,
+    pub error_code: i16,
+    pub error_message: Option<String>,
+    pub resources: Vec<KafkaDescribeAclsResource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDescribeAclsResource {
+    pub resource_type: i8,
+    pub resource_name: String,
+    pub pattern_type: i8, // v1+
+    pub acls: Vec<KafkaAclDescription>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaAclDescription {
+    pub principal: String,
+    pub host: String,
+    pub operation: i8,
+    pub permission_type: i8,
+}
+
+// ============================================================================
+// CREATE ACLS API (ApiKey = 30)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaCreateAclsRequest {
+    pub header: KafkaRequestHeader,
+    pub creations: Vec<KafkaAclCreation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaAclCreation {
+    pub resource_type: i8,
+    pub resource_name: String,
+    pub pattern_type: i8, // v1+
+    pub principal: String,
+    pub host: String,
+    pub operation: i8,
+    pub permission_type: i8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaCreateAclsResponse {
+    pub header: KafkaResponseHeader,
+    pub api_version: i16,
+    pub throttle_time_ms: i32,
+    pub results: Vec<KafkaAclCreationResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaAclCreationResult {
+    pub error_code: i16,
+    pub error_message: Option<String>,
+}
+
+// ============================================================================
+// DELETE ACLS API (ApiKey = 31)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDeleteAclsRequest {
+    pub header: KafkaRequestHeader,
+    pub filters: Vec<KafkaDeleteAclsFilter>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDeleteAclsFilter {
+    pub resource_type_filter: i8,
+    pub resource_name_filter: Option<String>,
+    pub pattern_type_filter: i8, // v1+
+    pub principal_filter: Option<String>,
+    pub host_filter: Option<String>,
+    pub operation: i8,
+    pub permission_type: i8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDeleteAclsResponse {
+    pub header: KafkaResponseHeader,
+    pub api_version: i16,
+    pub throttle_time_ms: i32,
+    pub filter_results: Vec<KafkaDeleteAclsFilterResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDeleteAclsFilterResult {
+    pub error_code: i16,
+    pub error_message: Option<String>,
+    pub matching_acls: Vec<KafkaDeleteAclsMatchingAcl>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaDeleteAclsMatchingAcl {
+    pub error_code: i16,
+    pub error_message: Option<String>,
+    pub resource_type: i8,
+    pub resource_name: String,
+    pub pattern_type: i8, // v1+
+    pub principal: String,
+    pub host: String,
+    pub operation: i8,
+    pub permission_type: i8,
 }
