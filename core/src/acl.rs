@@ -308,9 +308,9 @@ impl AclManager {
     ) -> AuthorizationResult {
         // Super users bypass all checks
         if self.super_users.contains(principal) {
-            debug!(
-                "Allowing super user {} for {:?}:{} operation {:?}",
-                principal, resource_type, resource_name, operation
+            info!(
+                "ACL AUDIT: ALLOWED (super_user) principal={} resource={:?}:{} operation={:?} host={}",
+                principal, resource_type, resource_name, operation, host.unwrap_or("*")
             );
             return AuthorizationResult::Allowed;
         }
@@ -320,15 +320,15 @@ impl AclManager {
             Some(indices) => indices,
             None => {
                 return if self.allow_everyone {
-                    debug!(
-                        "No ACLs found for {}, allowing due to allow_everyone=true",
-                        principal
+                    info!(
+                        "ACL AUDIT: ALLOWED (allow_everyone) principal={} resource={:?}:{} operation={:?} host={}",
+                        principal, resource_type, resource_name, operation, host.unwrap_or("*")
                     );
                     AuthorizationResult::Allowed
                 } else {
-                    debug!(
-                        "No ACLs found for {}, denying due to allow_everyone=false",
-                        principal
+                    warn!(
+                        "ACL AUDIT: DENIED (no_acl) principal={} resource={:?}:{} operation={:?} host={}",
+                        principal, resource_type, resource_name, operation, host.unwrap_or("*")
                     );
                     AuthorizationResult::NoMatch
                 };
@@ -373,19 +373,22 @@ impl AclManager {
         }
 
         if has_allow {
-            debug!(
-                "Allowing {} access to {:?}:{} operation {:?}",
-                principal, resource_type, resource_name, operation
+            info!(
+                "ACL AUDIT: ALLOWED (explicit_acl) principal={} resource={:?}:{} operation={:?} host={}",
+                principal, resource_type, resource_name, operation, host_str
             );
             AuthorizationResult::Allowed
         } else if self.allow_everyone {
-            debug!(
-                "No specific ACL for {}, allowing due to allow_everyone=true",
-                principal
+            info!(
+                "ACL AUDIT: ALLOWED (allow_everyone, no_specific_acl) principal={} resource={:?}:{} operation={:?} host={}",
+                principal, resource_type, resource_name, operation, host_str
             );
             AuthorizationResult::Allowed
         } else {
-            debug!("No ALLOW ACL found for {}, denying access", principal);
+            warn!(
+                "ACL AUDIT: DENIED (no_allow_acl) principal={} resource={:?}:{} operation={:?} host={}",
+                principal, resource_type, resource_name, operation, host_str
+            );
             AuthorizationResult::NoMatch
         }
     }

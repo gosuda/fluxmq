@@ -17,7 +17,7 @@ use super::{
     messages::*,
     producer_id_manager::ProducerIdManager,
     state_machine::TransactionStateMachine,
-    transaction_log::{TransactionLog, TransactionLogConfig},
+    transaction_log::{TransactionLog, TransactionLogConfig, TransactionLogEntry},
     CoordinatorMetadata, ProducerId, TopicPartition, TransactionResult, TxnState,
 };
 
@@ -305,22 +305,41 @@ impl TransactionCoordinator {
                         let partitions: Vec<_> =
                             state_machine.partitions().iter().cloned().collect();
 
-                        // Log prepare transaction
-                        if let Err(e) = self
-                            .transaction_log
-                            .log_prepare_transaction(
-                                &request.transactional_id,
-                                request.producer_id,
-                                request.producer_epoch,
-                                request.committed,
-                                partitions.clone(),
-                            )
-                            .await
-                        {
-                            error!("Failed to log prepare transaction: {}", e);
+                        // Log prepare (+ pending markers if applicable) in a single batched fsync
+                        let log_result = if !partitions.is_empty() {
+                            let marker_topics_data: Vec<(String, Vec<i32>)> = self
+                                .convert_partitions_to_marker_topics(&partitions)
+                                .iter()
+                                .map(|t| (t.name.clone(), t.partitions.clone()))
+                                .collect();
+
+                            self.transaction_log
+                                .log_prepare_and_pending_markers(
+                                    &request.transactional_id,
+                                    request.producer_id,
+                                    request.producer_epoch,
+                                    request.committed,
+                                    partitions.clone(),
+                                    marker_topics_data,
+                                )
+                                .await
+                        } else {
+                            self.transaction_log
+                                .log_prepare_transaction(
+                                    &request.transactional_id,
+                                    request.producer_id,
+                                    request.producer_epoch,
+                                    request.committed,
+                                    partitions.clone(),
+                                )
+                                .await
+                        };
+
+                        if let Err(e) = log_result {
+                            error!("Failed to log transaction prepare: {}", e);
                             42 // InvalidRequest
                         } else {
-                            // Create transaction markers for WriteTxnMarkers
+                            // Add markers to memory (after successful log write)
                             if !partitions.is_empty() {
                                 let marker = WritableTxnMarker {
                                     producer_id: request.producer_id,
@@ -337,15 +356,21 @@ impl TransactionCoordinator {
                                     .push(marker);
                             }
 
-                            // Complete the transaction
-                            if request.committed {
-                                state_machine.complete_commit().unwrap();
+                            // Complete the transaction (propagate errors instead of panicking)
+                            let complete_result = if request.committed {
+                                state_machine.complete_commit()
                             } else {
-                                state_machine.complete_abort().unwrap();
-                            }
-
-                            // Log complete transaction
-                            if let Err(e) = self
+                                state_machine.complete_abort()
+                            };
+                            if let Err(e) = complete_result {
+                                error!(
+                                    producer_id = request.producer_id,
+                                    transactional_id = %request.transactional_id,
+                                    "Failed to complete transaction state transition: {}",
+                                    e
+                                );
+                                50 // COORDINATOR_NOT_AVAILABLE
+                            } else if let Err(e) = self
                                 .transaction_log
                                 .log_complete_transaction(
                                     &request.transactional_id,
@@ -355,17 +380,20 @@ impl TransactionCoordinator {
                                 )
                                 .await
                             {
-                                error!("Failed to log complete transaction: {}", e);
+                                error!(
+                                    "Failed to log complete transaction for {}: {}",
+                                    request.transactional_id, e
+                                );
+                                50 // COORDINATOR_NOT_AVAILABLE
+                            } else {
+                                info!(
+                                    producer_id = request.producer_id,
+                                    transactional_id = %request.transactional_id,
+                                    committed = request.committed,
+                                    "Transaction ended"
+                                );
+                                0 // NoError
                             }
-
-                            info!(
-                                producer_id = request.producer_id,
-                                transactional_id = %request.transactional_id,
-                                committed = request.committed,
-                                "Transaction ended"
-                            );
-
-                            0 // NoError
                         }
                     }
                     Err(e) => {
@@ -516,6 +544,53 @@ impl TransactionCoordinator {
                 state = ?state,
                 "Recovered transaction"
             );
+        }
+
+        // Recover pending markers that weren't completed before crash
+        match self
+            .transaction_log
+            .get_pending_markers_for_recovery()
+            .await
+        {
+            Ok(pending_entries) => {
+                let mut markers = self.pending_markers.write();
+                for entry in pending_entries {
+                    if let TransactionLogEntry::PendingMarkers {
+                        producer_id,
+                        producer_epoch,
+                        commit,
+                        marker_topics,
+                        ..
+                    } = entry
+                    {
+                        let topics: Vec<WritableTxnMarkerTopic> = marker_topics
+                            .into_iter()
+                            .map(|(name, partitions)| WritableTxnMarkerTopic { name, partitions })
+                            .collect();
+
+                        let marker = WritableTxnMarker {
+                            producer_id,
+                            producer_epoch,
+                            transaction_result: commit,
+                            topics,
+                            coordinator_epoch: self.config.coordinator_epoch,
+                        };
+
+                        markers
+                            .entry(producer_id)
+                            .or_insert_with(Vec::new)
+                            .push(marker);
+
+                        info!(
+                            producer_id = producer_id,
+                            "Recovered pending transaction marker"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to recover pending markers: {}", e);
+            }
         }
 
         info!(

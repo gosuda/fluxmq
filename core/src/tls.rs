@@ -97,10 +97,40 @@ impl FluxTlsAcceptor {
             return Err(TlsError::NoPrivateKeys);
         }
 
-        // Build TLS server configuration
-        let mut tls_config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, keys.remove(0))?;
+        // Build TLS server configuration with optional client certificate verification (mTLS)
+        let mut tls_config = if config.require_client_certs {
+            let ca_cert_path = config.ca_cert_path.as_ref().ok_or_else(|| {
+                TlsError::ConfigError(rustls::Error::General(
+                    "CA certificate path required when client certificates are enabled".to_string(),
+                ))
+            })?;
+
+            info!("Enabling mutual TLS with CA cert: {}", ca_cert_path);
+            let ca_certs = load_certs(ca_cert_path)?;
+            if ca_certs.is_empty() {
+                return Err(TlsError::NoCertificates);
+            }
+
+            let mut root_store = rustls::RootCertStore::empty();
+            for ca_cert in ca_certs {
+                root_store
+                    .add(ca_cert)
+                    .map_err(|e| TlsError::CertificateParse(e.to_string()))?;
+            }
+
+            let client_verifier =
+                rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+                    .build()
+                    .map_err(|e| TlsError::ConfigError(rustls::Error::General(e.to_string())))?;
+
+            ServerConfig::builder()
+                .with_client_cert_verifier(client_verifier)
+                .with_single_cert(certs, keys.remove(0))?
+        } else {
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, keys.remove(0))?
+        };
 
         // Configure ALPN protocols (support HTTP/2 and HTTP/1.1)
         tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];

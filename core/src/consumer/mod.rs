@@ -200,7 +200,12 @@ mod tests;
 use crate::protocol::{PartitionId, TopicName};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
+
+/// Default value for deserialized Instant fields (serde cannot serialize Instant)
+fn default_instant() -> Instant {
+    Instant::now()
+}
 
 pub use coordinator::{ConsumerGroupCoordinator, ConsumerGroupManager};
 
@@ -225,6 +230,29 @@ pub enum ConsumerGroupState {
     Dead,
 }
 
+impl ConsumerGroupState {
+    /// Validate whether a state transition is allowed.
+    /// Returns true if transitioning from `self` to `target` is a valid state change.
+    pub fn can_transition_to(&self, target: &ConsumerGroupState) -> bool {
+        matches!(
+            (self, target),
+            // Normal lifecycle transitions
+            (ConsumerGroupState::Empty, ConsumerGroupState::PreparingRebalance)
+                | (ConsumerGroupState::Stable, ConsumerGroupState::PreparingRebalance)
+                | (ConsumerGroupState::PreparingRebalance, ConsumerGroupState::CompletingRebalance)
+                | (ConsumerGroupState::CompletingRebalance, ConsumerGroupState::Stable)
+                // Member removal can empty the group from any active state
+                | (ConsumerGroupState::PreparingRebalance, ConsumerGroupState::Empty)
+                | (ConsumerGroupState::CompletingRebalance, ConsumerGroupState::Empty)
+                | (ConsumerGroupState::Stable, ConsumerGroupState::Empty)
+                // Any state can transition to Dead
+                | (_, ConsumerGroupState::Dead)
+                // Dead group can be resurrected by new JoinGroup
+                | (ConsumerGroupState::Dead, ConsumerGroupState::PreparingRebalance)
+        )
+    }
+}
+
 /// Consumer group member information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsumerGroupMember {
@@ -237,6 +265,9 @@ pub struct ConsumerGroupMember {
     pub subscribed_topics: Vec<TopicName>,
     pub assigned_partitions: Vec<TopicPartition>,
     pub last_heartbeat: SystemTime,
+    /// Monotonic clock for timeout calculations (immune to NTP clock adjustments)
+    #[serde(skip, default = "default_instant")]
+    pub last_heartbeat_monotonic: Instant,
     pub is_leader: bool,
 }
 
@@ -551,10 +582,9 @@ impl PartitionAssignor {
         for (index, partition) in partitions.iter().enumerate() {
             let consumer_index = index % consumers.len();
             let consumer = &consumers[consumer_index];
-            assignments
-                .get_mut(consumer)
-                .unwrap()
-                .push(partition.clone());
+            if let Some(parts) = assignments.get_mut(consumer) {
+                parts.push(partition.clone());
+            }
         }
 
         assignments
@@ -595,10 +625,9 @@ impl PartitionAssignor {
 
                 for _ in 0..count {
                     if partition_index < topic_parts.len() {
-                        assignments
-                            .get_mut(consumer)
-                            .unwrap()
-                            .push(topic_parts[partition_index].clone());
+                        if let Some(parts) = assignments.get_mut(consumer) {
+                            parts.push(topic_parts[partition_index].clone());
+                        }
                         partition_index += 1;
                     }
                 }

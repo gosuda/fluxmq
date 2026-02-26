@@ -75,14 +75,14 @@ pub struct ClusterCoordinator {
     /// Traditional replication coordinator (for compatibility)
     replication_coordinator: Arc<ReplicationCoordinator>,
 
-    /// Channel for sending RPC messages
-    rpc_sender: mpsc::UnboundedSender<(BrokerId, RaftMessage)>,
-    rpc_receiver: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<(BrokerId, RaftMessage)>>>,
+    /// Channel for sending RPC messages (bounded to prevent OOM under network partitions)
+    rpc_sender: mpsc::Sender<(BrokerId, RaftMessage)>,
+    rpc_receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<(BrokerId, RaftMessage)>>>,
 
-    /// Channel for applying committed entries
-    apply_sender: mpsc::UnboundedSender<(TopicName, PartitionId, LogEntry)>,
-    apply_receiver:
-        Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<(TopicName, PartitionId, LogEntry)>>>,
+    /// Channel for applying committed entries (bounded to provide backpressure).
+    /// Uses Arc<str> instead of String to avoid per-message allocation in forwarders.
+    apply_sender: mpsc::Sender<(Arc<str>, PartitionId, LogEntry)>,
+    apply_receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<(Arc<str>, PartitionId, LogEntry)>>>,
 }
 
 impl ClusterCoordinator {
@@ -98,8 +98,10 @@ impl ClusterCoordinator {
             config.replication_config.clone(),
         ));
 
-        let (rpc_sender, rpc_receiver) = mpsc::unbounded_channel();
-        let (apply_sender, apply_receiver) = mpsc::unbounded_channel();
+        const RPC_CHANNEL_CAPACITY: usize = 10_000;
+        const APPLY_CHANNEL_CAPACITY: usize = 10_000;
+        let (rpc_sender, rpc_receiver) = mpsc::channel(RPC_CHANNEL_CAPACITY);
+        let (apply_sender, apply_receiver) = mpsc::channel(APPLY_CHANNEL_CAPACITY);
 
         Self {
             config,
@@ -170,14 +172,15 @@ impl ClusterCoordinator {
             .collect();
 
         let partition_apply_sender = {
-            let topic = topic.to_string();
+            let topic: Arc<str> = Arc::from(topic);
             let apply_sender = self.apply_sender.clone();
-            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (tx, mut rx) = mpsc::channel(10_000);
 
-            // Spawn a task to forward partition-specific entries
+            // Spawn a task to forward partition-specific entries.
+            // Arc<str> clone is an atomic increment — no String allocation per message.
             tokio::spawn(async move {
                 while let Some(entry) = rx.recv().await {
-                    if let Err(e) = apply_sender.send((topic.clone(), partition, entry)) {
+                    if let Err(e) = apply_sender.send((topic.clone(), partition, entry)).await {
                         error!("Failed to forward apply entry: {}", e);
                         break;
                     }

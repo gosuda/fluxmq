@@ -19,8 +19,11 @@
 //! - **ZSTD**: ~400MB/s compression, ~1GB/s decompression (best compression ratio)
 
 use bytes::Bytes;
-use std::io;
+use std::io::{self, Read};
 use thiserror::Error;
+
+/// Maximum decompressed size to prevent decompression bomb attacks (10 MB)
+const MAX_DECOMPRESSED_SIZE: usize = 10 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum CompressionError {
@@ -123,15 +126,23 @@ impl CompressionEngine {
         compressed_data: &[u8],
         expected_size: Option<usize>,
     ) -> Result<Bytes, CompressionError> {
-        let decompressed = if let Some(size_hint) = expected_size {
-            // Use size hint for better performance
+        let size_hint = expected_size
+            .map(|s| s.min(MAX_DECOMPRESSED_SIZE))
+            .unwrap_or(MAX_DECOMPRESSED_SIZE);
+        let decompressed = if expected_size.is_some() {
             lz4_flex::decompress(compressed_data, size_hint)
                 .map_err(|e| CompressionError::DecompressionFailed(e.to_string()))?
         } else {
-            // Decompress without size hint
             lz4_flex::decompress_size_prepended(compressed_data)
                 .map_err(|e| CompressionError::DecompressionFailed(e.to_string()))?
         };
+        if decompressed.len() > MAX_DECOMPRESSED_SIZE {
+            return Err(CompressionError::DecompressionFailed(format!(
+                "Decompressed size {} exceeds limit {}",
+                decompressed.len(),
+                MAX_DECOMPRESSED_SIZE
+            )));
+        }
         Ok(Bytes::from(decompressed))
     }
 
@@ -150,6 +161,15 @@ impl CompressionEngine {
         compressed_data: &[u8],
         _expected_size: Option<usize>,
     ) -> Result<Bytes, CompressionError> {
+        // Check declared uncompressed length before allocating
+        let declared_len = snap::raw::decompress_len(compressed_data)
+            .map_err(|e| CompressionError::DecompressionFailed(e.to_string()))?;
+        if declared_len > MAX_DECOMPRESSED_SIZE {
+            return Err(CompressionError::DecompressionFailed(format!(
+                "Snappy declared size {} exceeds limit {}",
+                declared_len, MAX_DECOMPRESSED_SIZE
+            )));
+        }
         let mut decoder = snap::raw::Decoder::new();
         let decompressed = decoder
             .decompress_vec(compressed_data)
@@ -175,11 +195,18 @@ impl CompressionEngine {
         compressed_data: &[u8],
         _expected_size: Option<usize>,
     ) -> Result<Bytes, CompressionError> {
-        use std::io::Read;
-
         let mut buffer = Vec::new();
-        let mut decoder = flate2::read::GzDecoder::new(compressed_data);
-        decoder.read_to_end(&mut buffer)?;
+        let decoder = flate2::read::GzDecoder::new(compressed_data);
+        // Read with size limit to prevent decompression bombs
+        let bytes_read = decoder
+            .take((MAX_DECOMPRESSED_SIZE + 1) as u64)
+            .read_to_end(&mut buffer)?;
+        if bytes_read > MAX_DECOMPRESSED_SIZE {
+            return Err(CompressionError::DecompressionFailed(format!(
+                "Gzip decompressed size exceeds limit {}",
+                MAX_DECOMPRESSED_SIZE
+            )));
+        }
 
         Ok(Bytes::from(buffer))
     }
@@ -198,18 +225,23 @@ impl CompressionEngine {
         compressed_data: &[u8],
         expected_size: Option<usize>,
     ) -> Result<Bytes, CompressionError> {
-        let decompressed = if let Some(size_hint) = expected_size {
-            // Use size hint for better performance
-            let mut buffer = Vec::with_capacity(size_hint);
-            zstd::stream::copy_decode(compressed_data, &mut buffer)
-                .map_err(|e| CompressionError::DecompressionFailed(e.to_string()))?;
-            buffer
-        } else {
-            // Decompress without size hint
-            zstd::decode_all(compressed_data)
-                .map_err(|e| CompressionError::DecompressionFailed(e.to_string()))?
-        };
-        Ok(Bytes::from(decompressed))
+        let capacity = expected_size
+            .map(|s| s.min(MAX_DECOMPRESSED_SIZE))
+            .unwrap_or(8192);
+        let mut buffer = Vec::with_capacity(capacity);
+        let decoder = zstd::stream::Decoder::new(compressed_data)
+            .map_err(|e| CompressionError::DecompressionFailed(e.to_string()))?;
+        let bytes_read = decoder
+            .take((MAX_DECOMPRESSED_SIZE + 1) as u64)
+            .read_to_end(&mut buffer)
+            .map_err(|e| CompressionError::DecompressionFailed(e.to_string()))?;
+        if bytes_read > MAX_DECOMPRESSED_SIZE {
+            return Err(CompressionError::DecompressionFailed(format!(
+                "Zstd decompressed size exceeds limit {}",
+                MAX_DECOMPRESSED_SIZE
+            )));
+        }
+        Ok(Bytes::from(buffer))
     }
 
     /// Get estimated compression ratio for a given type and data

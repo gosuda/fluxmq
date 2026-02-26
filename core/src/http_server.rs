@@ -50,7 +50,9 @@ impl HttpMetricsServer {
         let address = format!("0.0.0.0:{}", self.port);
         info!("HTTP metrics server listening on port {}", self.port);
 
-        let mut server = Server::new(&address).await.unwrap();
+        let mut server = Server::new(&address)
+            .await
+            .map_err(|e| format!("Failed to bind HTTP metrics server to {}: {}", address, e))?;
 
         println!("start server on: {}", address);
         loop {

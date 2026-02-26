@@ -615,7 +615,14 @@ impl ZeroCopyProcessor {
             data[offset + 5],
         ]);
 
-        let total_len = 6 + key_len as usize + value_len as usize;
+        let total_len = 6usize
+            .checked_add(key_len as usize)
+            .and_then(|v| v.checked_add(value_len as usize));
+
+        let total_len = match total_len {
+            Some(len) => len,
+            None => return None,
+        };
 
         if offset + total_len > data.len() {
             return None;

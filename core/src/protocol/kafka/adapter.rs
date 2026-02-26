@@ -1705,14 +1705,17 @@ impl ProtocolAdapter {
                 }
             };
 
-            // Decompress if needed
+            // Decompress if needed — reject on failure instead of silently storing compressed bytes
             let final_value = match compression_type {
                 CompressionType::None => Bytes::copy_from_slice(value_data),
                 _ => match decompress_fast(value_data, compression_type, None) {
                     Ok(decompressed) => decompressed,
                     Err(e) => {
-                        tracing::warn!("Decompression failed: {}, using compressed data as-is", e);
-                        Bytes::copy_from_slice(value_data)
+                        tracing::error!(
+                            "Decompression failed for compression type {:?}: {}. Rejecting corrupt message.",
+                            compression_type, e
+                        );
+                        continue; // Skip this corrupt message instead of storing garbage
                     }
                 },
             };

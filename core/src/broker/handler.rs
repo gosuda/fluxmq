@@ -86,7 +86,7 @@ use crate::{
 };
 use std::{cell::RefCell, collections::HashMap, collections::HashSet, sync::Arc};
 use tokio::sync::broadcast::error::RecvError;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 // Thread-local cache for topic-partition existence checks
 // This dramatically reduces lock contention on the topic_manager for repeated produce calls
@@ -522,7 +522,8 @@ impl MessageHandler {
     }
 
     async fn handle_produce(&self, request: ProduceRequest) -> Result<Response> {
-        // 🚀 JAVA CLIENT COMPATIBILITY: Start performance timing for Java client optimization
+        // Performance timing only in debug builds to avoid hot-path syscall
+        #[cfg(debug_assertions)]
         let start_time = std::time::Instant::now();
 
         // If partition is u32::MAX, use dynamic assignment
@@ -628,24 +629,15 @@ impl MessageHandler {
         // Calculate metrics before moving messages
         let message_count = request.messages.len() as u64;
 
-        // Calculate total bytes for metrics (performance optimized)
+        // Lightweight byte estimate: sum only value lengths (dominant cost)
+        // Avoids iterating headers which are rarely used in hot produce path
         let total_bytes: u64 = request
             .messages
             .iter()
-            .map(|msg| {
-                let key_size = msg.key.as_ref().map(|k| k.len()).unwrap_or(0);
-                let value_size = msg.value.len();
-                let headers_size = msg
-                    .headers
-                    .iter()
-                    .map(|(k, v)| k.len() + v.len())
-                    .sum::<usize>();
-                // Include timestamp (8 bytes)
-                key_size + value_size + headers_size + 8
-            })
+            .map(|msg| msg.value.len() + msg.key.as_ref().map(|k| k.len()).unwrap_or(0) + 8)
             .sum::<usize>() as u64;
 
-        // ⚡ PERFORMANCE FIX: Zero-copy produce path
+        // Zero-copy produce path
         // - No message cloning needed here
         // - Caching happens lazily on fetch (already implemented in fetch_messages_internal)
         // - This eliminates ~740MB of memory copying per 500K messages
@@ -653,12 +645,15 @@ impl MessageHandler {
             self.storage
                 .append_messages(&request.topic, partition, request.messages)?;
 
-        let processing_duration = start_time.elapsed();
-        trace!(
-            "✅ STORAGE: Direct storage write completed, offset: {}, duration: {:?}",
-            base_offset,
-            processing_duration
-        );
+        #[cfg(debug_assertions)]
+        {
+            let processing_duration = start_time.elapsed();
+            trace!(
+                "STORAGE: Direct storage write completed, offset: {}, duration: {:?}",
+                base_offset,
+                processing_duration
+            );
+        }
 
         // Record metrics with actual message data
         self.metrics
@@ -678,26 +673,25 @@ impl MessageHandler {
             }
         }
 
-        // 🚀 JAVA CLIENT COMPATIBILITY: Measure total processing time and log performance
-        let total_duration = start_time.elapsed();
-        if total_duration > std::time::Duration::from_millis(500) {
-            debug!("🚨 JAVA CLIENT CRITICAL: Total processing time exceeded 500ms: {:?} (Java client timeout risk!)", total_duration);
-        } else if total_duration > std::time::Duration::from_millis(100) {
+        #[cfg(debug_assertions)]
+        {
+            let total_duration = start_time.elapsed();
+            if total_duration > std::time::Duration::from_millis(500) {
+                debug!(
+                    "JAVA CLIENT CRITICAL: Total processing time exceeded 500ms: {:?}",
+                    total_duration
+                );
+            } else if total_duration > std::time::Duration::from_millis(100) {
+                debug!(
+                    "JAVA CLIENT WARNING: Processing time: {:?} (target: <100ms)",
+                    total_duration
+                );
+            }
             debug!(
-                "⚠️ JAVA CLIENT WARNING: Processing time: {:?} (target: <100ms for Java clients)",
-                total_duration
-            );
-        } else {
-            debug!(
-                "✅ JAVA CLIENT OPTIMIZED: Fast processing achieved: {:?}",
-                total_duration
+                "Produced messages to topic: {}, partition: {}, base_offset: {}, acks: {}, processing_time: {:?}",
+                request.topic, partition, base_offset, request.acks, total_duration
             );
         }
-
-        debug!(
-            "Produced messages to topic: {}, partition: {}, base_offset: {}, acks: {}, processing_time: {:?}",
-            request.topic, partition, base_offset, request.acks, total_duration
-        );
 
         // Handle acks=0 (fire-and-forget) - no response should be sent
         if request.acks == 0 {
@@ -720,7 +714,6 @@ impl MessageHandler {
             error_message: None,
         };
 
-        debug!("📤 JAVA CLIENT ACK: Sending immediate acknowledgment for correlation_id: {}, total_time: {:?}", request.correlation_id, total_duration);
         Ok(Response::Produce(response))
     }
 
@@ -2082,22 +2075,102 @@ impl MessageHandler {
     }
 
     async fn handle_sasl_authenticate(&self, request: SaslAuthenticateRequest) -> Result<Response> {
+        const MAX_AUTH_BYTES: usize = 64 * 1024; // 64KB limit
+        const SASL_AUTH_FAILED: i16 = 58; // SASL_AUTHENTICATION_FAILED error code
+
         debug!(
             "SASL authenticate requested with {} bytes of auth data",
             request.auth_bytes.len()
         );
 
-        // For now, return a simple successful authentication response
-        // In a full implementation, this would:
-        // 1. Parse the auth_bytes based on the SASL mechanism
-        // 2. Validate credentials against a user database
-        // 3. Create a session token if authentication succeeds
+        // Validate auth_bytes size
+        if request.auth_bytes.len() > MAX_AUTH_BYTES {
+            warn!(
+                "SASL auth_bytes too large: {} bytes",
+                request.auth_bytes.len()
+            );
+            return Ok(Response::SaslAuthenticate(SaslAuthenticateResponse {
+                correlation_id: request.correlation_id,
+                error_code: SASL_AUTH_FAILED,
+                error_message: Some("Authentication data too large".to_string()),
+                auth_bytes: Vec::new(),
+                session_lifetime_ms: 0,
+            }));
+        }
 
+        // Parse SASL PLAIN format: [authzid]\0username\0password
+        let parts: Vec<&[u8]> = request.auth_bytes.splitn(3, |&b| b == 0).collect();
+        if parts.len() != 3 {
+            warn!(
+                "Invalid SASL PLAIN format: expected 3 null-delimited parts, got {}",
+                parts.len()
+            );
+            return Ok(Response::SaslAuthenticate(SaslAuthenticateResponse {
+                correlation_id: request.correlation_id,
+                error_code: SASL_AUTH_FAILED,
+                error_message: Some("Invalid SASL PLAIN format".to_string()),
+                auth_bytes: Vec::new(),
+                session_lifetime_ms: 0,
+            }));
+        }
+
+        let username = String::from_utf8_lossy(parts[1]);
+        let _password = parts[2]; // Not logged for security
+
+        // Constant-time comparison utility for credential validation.
+        // Prevents timing side-channel attacks when comparing secrets.
+        fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+            if a.len() != b.len() {
+                return false;
+            }
+            let mut result: u8 = 0;
+            for (x, y) in a.iter().zip(b.iter()) {
+                result |= x ^ y;
+            }
+            result == 0
+        }
+
+        // TODO: When a password store is implemented, use constant_time_eq()
+        // to compare password hashes instead of direct comparison.
+        // Example: constant_time_eq(computed_hash.as_bytes(), stored_hash.as_bytes())
+        let _ = constant_time_eq; // suppress unused warning until password store is added
+
+        // When ACL is enabled, validate against known principals
+        if let Some(ref acl_manager) = self.acl_manager {
+            let acl = acl_manager.read();
+            let principal = Principal::user(&username);
+            // Check if user is authorized (super_user check happens inside authorize)
+            let auth_result = acl.authorize(
+                &principal,
+                &ResourceType::Cluster,
+                "kafka-cluster",
+                &Operation::ClusterAction,
+                None,
+            );
+            if auth_result == AuthorizationResult::Denied {
+                warn!("SASL authentication denied for user '{}'", username);
+                return Ok(Response::SaslAuthenticate(SaslAuthenticateResponse {
+                    correlation_id: request.correlation_id,
+                    error_code: SASL_AUTH_FAILED,
+                    error_message: Some(format!("Authentication failed for user '{}'", username)),
+                    auth_bytes: Vec::new(),
+                    session_lifetime_ms: 0,
+                }));
+            }
+        } else {
+            // No ACL manager — allow but log warning
+            warn!(
+                "SASL authentication accepted without validation for user '{}' (ACL disabled)",
+                username
+            );
+        }
+
+        info!("SASL authentication successful for user '{}'", username);
         Ok(Response::SaslAuthenticate(SaslAuthenticateResponse {
             correlation_id: request.correlation_id,
-            error_code: 0, // Success
+            error_code: 0,
             error_message: None,
-            auth_bytes: Vec::new(),       // Empty response for successful auth
+            auth_bytes: Vec::new(),
             session_lifetime_ms: 3600000, // 1 hour session
         }))
     }

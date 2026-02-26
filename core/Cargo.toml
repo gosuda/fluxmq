@@ -64,7 +64,7 @@ flume = "0.11"                     # High-performance async channel for Tokio
 
 # Low-level networking
 socket2 = { workspace = true }
-libc = "0.2.175"               # For sendfile/splice system calls
+libc = "0.2.181"               # For sendfile/splice system calls
 
 # Error handling
 thiserror = { workspace = true }
@@ -99,13 +99,13 @@ dashmap.workspace = true
 chrono = { workspace = true }
 
 # Compression support
-lz4_flex = "0.11.5"
+lz4_flex = "0.12.0"
 snap = "1.1.1"
-flate2 = "1.1.2"
+flate2 = "1.1.9"
 zstd = "0.13.3"
 
 # Http
-atomic_http = "0.6.3"
+atomic_http = "0.9.1"
 
 # High-performance global allocators (optional features)
 tikv-jemallocator = { version = "0.6", optional = true }
@@ -115,6 +115,7 @@ mimalloc = { version = "0.1", optional = true, default-features = false }
 tokio-test = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
+proptest = { workspace = true }
 
 # Platform-specific dependencies
 [target.'cfg(target_os = "linux")'.dependencies]

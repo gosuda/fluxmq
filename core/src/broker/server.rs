@@ -359,13 +359,19 @@ impl BrokerServer {
                 // Handle new connections
                 accept_result = listener.accept() => {
                     match accept_result {
-                Ok((stream, peer_addr)) => {
+                Ok((mut stream, peer_addr)) => {
                     // 🚀 ULTRA-PERFORMANCE: Check connection pool capacity
                     if !self.connection_pool.can_accept_connection() {
                         warn!(
-                            "Connection pool at capacity, dropping connection from {}",
+                            "Connection pool at capacity ({} active), rejecting connection from {}",
+                            self.connection_pool.get_stats().active_connections,
                             peer_addr
                         );
+                        // Explicit graceful shutdown sends TCP FIN (not RST),
+                        // giving the client a clean signal that the server refused the connection
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stream.shutdown().await;
+                        drop(stream);
                         continue;
                     }
 
@@ -546,84 +552,112 @@ impl BrokerServer {
         let mut kafka_framed = tokio_util::codec::Framed::new(stream, KafkaFrameCodec);
         let hp_codec = Arc::new(HighPerformanceKafkaCodec::new());
 
+        // Connection idle timeout to prevent slowloris attacks
+        const CONNECTION_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
         loop {
-            match tokio_stream::StreamExt::next(&mut kafka_framed).await {
-                Some(Ok(message_bytes)) => {
-                    let (api_key, correlation_id) = if message_bytes.len() >= 8 {
-                        let api_key = i16::from_be_bytes([message_bytes[0], message_bytes[1]]);
-                        let corr_id = i32::from_be_bytes([
-                            message_bytes[4],
-                            message_bytes[5],
-                            message_bytes[6],
-                            message_bytes[7],
-                        ]);
-                        (api_key, corr_id)
-                    } else {
-                        warn!("Invalid message format: {} bytes", message_bytes.len());
-                        continue;
-                    };
+            match tokio::time::timeout(
+                CONNECTION_IDLE_TIMEOUT,
+                tokio_stream::StreamExt::next(&mut kafka_framed),
+            )
+            .await
+            {
+                Err(_elapsed) => {
+                    warn!("Connection idle timeout - closing connection");
+                    break;
+                }
+                Ok(frame_result) => match frame_result {
+                    Some(Ok(message_bytes)) => {
+                        let (api_key, correlation_id) = if message_bytes.len() >= 8 {
+                            let api_key = i16::from_be_bytes([message_bytes[0], message_bytes[1]]);
+                            let corr_id = i32::from_be_bytes([
+                                message_bytes[4],
+                                message_bytes[5],
+                                message_bytes[6],
+                                message_bytes[7],
+                            ]);
+                            (api_key, corr_id)
+                        } else {
+                            warn!("Invalid message format: {} bytes", message_bytes.len());
+                            continue;
+                        };
 
-                    debug!(
-                        "🚀 RECV: api_key={}, correlation_id={}, len={}",
-                        api_key,
-                        correlation_id,
-                        message_bytes.len()
-                    );
+                        debug!(
+                            "🚀 RECV: api_key={}, correlation_id={}, len={}",
+                            api_key,
+                            correlation_id,
+                            message_bytes.len()
+                        );
 
-                    // 🚀 BUFFER_POOL: Get pooled buffer for response encoding
-                    // Estimate response size based on request type
-                    let estimated_response_size = match api_key {
-                        18 => 360,  // ApiVersions - fixed size
-                        3 => 1024,  // Metadata - medium
-                        0 => 256,   // Produce - small
-                        1 => 16384, // Fetch - can be large
-                        _ => 1024,  // Default
-                    };
-                    let _pooled_buf = buffer_manager.get_buffer(estimated_response_size);
+                        // 🚀 BUFFER_POOL: Get pooled buffer for response encoding
+                        // Estimate response size based on request type
+                        let estimated_response_size = match api_key {
+                            18 => 360,  // ApiVersions - fixed size
+                            3 => 1024,  // Metadata - medium
+                            0 => 256,   // Produce - small
+                            1 => 16384, // Fetch - can be large
+                            _ => 1024,  // Default
+                        };
+                        let _pooled_buf = buffer_manager.get_buffer(estimated_response_size);
 
-                    match Self::process_kafka_message_pipelined(&handler, &hp_codec, message_bytes)
+                        match Self::process_kafka_message_pipelined(
+                            &handler,
+                            &hp_codec,
+                            message_bytes,
+                        )
                         .await
-                    {
-                        Ok(response_bytes) => {
-                            if !response_bytes.is_empty() {
-                                debug!(
-                                    "🚀 SEND: response for correlation_id={}, len={}",
-                                    correlation_id,
-                                    response_bytes.len()
-                                );
+                        {
+                            Ok(response_bytes) => {
+                                if !response_bytes.is_empty() {
+                                    // Write backpressure: reject oversized responses to prevent OOM
+                                    const MAX_RESPONSE_SIZE: usize = 64 * 1024 * 1024; // 64MB
+                                    if response_bytes.len() > MAX_RESPONSE_SIZE {
+                                        warn!(
+                                        "Response too large ({} bytes) for correlation_id={}, closing connection",
+                                        response_bytes.len(), correlation_id
+                                    );
+                                        break;
+                                    }
 
-                                if let Err(e) = kafka_framed.send(response_bytes).await {
-                                    warn!("Failed to send response: {}", e);
-                                    break;
-                                }
-                                if let Err(e) = kafka_framed.flush().await {
-                                    warn!("Failed to flush response: {}", e);
-                                    break;
+                                    debug!(
+                                        "🚀 SEND: response for correlation_id={}, len={}",
+                                        correlation_id,
+                                        response_bytes.len()
+                                    );
+
+                                    if let Err(e) = kafka_framed.send(response_bytes).await {
+                                        warn!("Failed to send response: {}", e);
+                                        break;
+                                    }
+                                    if let Err(e) = kafka_framed.flush().await {
+                                        warn!("Failed to flush response: {}", e);
+                                        break;
+                                    }
                                 }
                             }
+                            Err(e) => {
+                                warn!(
+                                    "Request processing failed for correlation_id={}: {}",
+                                    correlation_id, e
+                                );
+                            }
                         }
-                        Err(e) => {
-                            warn!(
-                                "Request processing failed for correlation_id={}: {}",
-                                correlation_id, e
-                            );
-                        }
-                    }
 
-                    // Note: _pooled_buf will be dropped here. For true buffer reuse,
-                    // we could track BytesMut ownership and return to pool, but the
-                    // current encode path returns Bytes which is immutable.
-                }
-                Some(Err(e)) => {
-                    warn!("Failed to decode message: {}", e);
-                    break;
-                }
-                None => {
-                    debug!("🚀 Client disconnected (stream closed)");
-                    break;
-                }
-            }
-        }
+                        // Note: _pooled_buf will be dropped here. For true buffer reuse,
+                        // we could track BytesMut ownership and return to pool, but the
+                        // current encode path returns Bytes which is immutable.
+                    }
+                    Some(Err(e)) => {
+                        warn!("Failed to decode message: {}", e);
+                        break;
+                    }
+                    None => {
+                        debug!("🚀 Client disconnected (stream closed)");
+                        break;
+                    }
+                }, // close inner match (frame_result)
+            } // close outer match (timeout)
+        } // close loop
 
         metrics.broker.connection_closed();
         debug!("🚀 BUFFER_POOL: Client connection ended");

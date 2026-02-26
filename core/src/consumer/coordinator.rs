@@ -30,6 +30,8 @@ pub struct ConsumerGroupCoordinator {
     state_change_rx: Arc<tokio::sync::Mutex<Option<channel::Receiver<GroupStateChange>>>>,
     /// Directory for persisting group metadata
     metadata_dir: Option<PathBuf>,
+    /// Per-group notification for SyncGroup (leader notifies followers when stable)
+    sync_notify: Arc<DashMap<ConsumerGroupId, Arc<tokio::sync::Notify>>>,
 }
 
 /// Internal group state change notifications
@@ -151,6 +153,7 @@ impl ConsumerGroupCoordinator {
             state_change_tx,
             state_change_rx: Arc::new(tokio::sync::Mutex::new(Some(state_change_rx))),
             metadata_dir,
+            sync_notify: Arc::new(DashMap::new()),
         }
     }
 
@@ -660,6 +663,7 @@ impl ConsumerGroupCoordinator {
             subscribed_topics,
             assigned_partitions: Vec::new(),
             last_heartbeat: now,
+            last_heartbeat_monotonic: std::time::Instant::now(),
             is_leader: false,
         };
 
@@ -754,8 +758,9 @@ impl ConsumerGroupCoordinator {
             .get_mut(&consumer_id)
             .ok_or(error_codes::UNKNOWN_CONSUMER_ID)?;
 
-        // Update member's last heartbeat
+        // Update member's last heartbeat (both wall-clock for serialization and monotonic for timeouts)
         member.last_heartbeat = SystemTime::now();
+        member.last_heartbeat_monotonic = std::time::Instant::now();
 
         // If this request contains assignments (from the leader), apply them to all members
         // Note: In Kafka protocol, only the leader sends non-empty assignments in SyncGroup
@@ -795,6 +800,11 @@ impl ConsumerGroupCoordinator {
                 group_id,
                 group_ref.members.len()
             );
+
+            // Notify waiting followers that the group is now stable
+            if let Some(notify) = self.sync_notify.get(&group_id) {
+                notify.value().notify_waiters();
+            }
         }
 
         // Return this consumer's assignment (from the just-applied assignments or previously stored)
@@ -811,31 +821,43 @@ impl ConsumerGroupCoordinator {
         drop(group_ref);
 
         // If the group is not in Stable state and the consumer has no assignment,
-        // wait a bit for the leader's SyncGroup to be processed
+        // wait for the leader's SyncGroup using Notify instead of polling
         if !is_stable && assignment.is_empty() {
             info!(
                 "📝 SyncGroup for consumer '{}': group '{}' not stable yet, waiting for leader's assignment...",
                 consumer_id, group_id
             );
 
-            // Wait up to 100ms for the leader to apply assignments
-            for _ in 0..10 {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            // Get or create a Notify for this group
+            let notify = self
+                .sync_notify
+                .entry(group_id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+                .value()
+                .clone();
 
-                // Re-check group state
-                if let Some(group_ref) = self.groups.get(&group_id) {
-                    if group_ref.state == ConsumerGroupState::Stable {
-                        // Group became stable, get the assignment
-                        if let Some(member) = group_ref.members.get(&consumer_id) {
-                            assignment = member.assigned_partitions.clone();
-                            is_stable = true;
-                            info!(
-                                "📝 SyncGroup for consumer '{}': group became stable, got {} partitions",
-                                consumer_id, assignment.len()
-                            );
-                            break;
+            // Wait up to 5 seconds for the leader to apply assignments
+            match tokio::time::timeout(std::time::Duration::from_secs(5), notify.notified()).await {
+                Ok(()) => {
+                    // Notified — re-check group state
+                    if let Some(group_ref) = self.groups.get(&group_id) {
+                        if group_ref.state == ConsumerGroupState::Stable {
+                            if let Some(member) = group_ref.members.get(&consumer_id) {
+                                assignment = member.assigned_partitions.clone();
+                                is_stable = true;
+                                info!(
+                                    "📝 SyncGroup for consumer '{}': group became stable, got {} partitions",
+                                    consumer_id, assignment.len()
+                                );
+                            }
                         }
                     }
+                }
+                Err(_) => {
+                    info!(
+                        "📝 SyncGroup for consumer '{}': timed out waiting for leader",
+                        consumer_id
+                    );
                 }
             }
         }
@@ -874,9 +896,10 @@ impl ConsumerGroupCoordinator {
             return error_codes::ILLEGAL_GENERATION;
         }
 
-        // Update member's last heartbeat
+        // Update member's last heartbeat (both wall-clock and monotonic)
         if let Some(member) = group_ref.members.get_mut(&consumer_id) {
             member.last_heartbeat = SystemTime::now();
+            member.last_heartbeat_monotonic = std::time::Instant::now();
             error_codes::NONE
         } else {
             error_codes::UNKNOWN_CONSUMER_ID
@@ -958,17 +981,17 @@ impl ConsumerGroupCoordinator {
     }
 
     async fn check_expired_consumers(&self) -> Result<()> {
-        let now = SystemTime::now();
+        let now = std::time::Instant::now();
         let mut expired_members = Vec::new();
 
-        // First pass: collect expired members
+        // First pass: collect expired members using monotonic clock (immune to NTP adjustments)
         for entry in self.groups.iter() {
             let group_id = entry.key();
             let group = entry.value();
 
             for (consumer_id, member) in &group.members {
                 let elapsed = now
-                    .duration_since(member.last_heartbeat)
+                    .checked_duration_since(member.last_heartbeat_monotonic)
                     .unwrap_or(Duration::from_secs(0));
 
                 if elapsed.as_millis() > member.session_timeout_ms as u128 {
@@ -977,9 +1000,26 @@ impl ConsumerGroupCoordinator {
             }
         }
 
-        // Second pass: remove expired members and trigger rebalances
+        // Second pass: re-validate and remove expired members atomically
+        // TOCTOU fix: member may have sent heartbeat or re-joined between passes
         for (group_id, consumer_id) in expired_members {
             if let Some(mut group_ref) = self.groups.get_mut(&group_id) {
+                // Re-validate inside the mutable lock: check member still exists and is expired
+                let still_expired = group_ref.members.get(&consumer_id).map_or(false, |member| {
+                    let elapsed = now
+                        .checked_duration_since(member.last_heartbeat_monotonic)
+                        .unwrap_or(Duration::from_secs(0));
+                    elapsed.as_millis() > member.session_timeout_ms as u128
+                });
+
+                if !still_expired {
+                    debug!(
+                        "Consumer {} in group {} refreshed heartbeat between passes, skipping removal",
+                        consumer_id, group_id
+                    );
+                    continue;
+                }
+
                 group_ref.members.remove(&consumer_id);
 
                 // Update group state
@@ -1003,7 +1043,7 @@ impl ConsumerGroupCoordinator {
                     group_ref.generation_id += 1;
                 }
 
-                group_ref.state_timestamp = now;
+                group_ref.state_timestamp = SystemTime::now();
 
                 warn!(
                     "Removed expired consumer {} from group {}",
@@ -1290,7 +1330,19 @@ impl ConsumerGroupCoordinator {
         retention_time_ms: i64,
         offsets: Vec<TopicPartitionOffset>,
     ) -> std::result::Result<Vec<TopicPartitionError>, i16> {
-        // Verify the consumer group exists and generation is valid
+        let now = SystemTime::now();
+        let expire_timestamp = if retention_time_ms > 0 {
+            Some(now + Duration::from_millis(retention_time_ms as u64))
+        } else {
+            None
+        };
+
+        let mut topic_partition_errors = Vec::new();
+        // Collect offsets for async disk persistence after releasing lock
+        let mut offsets_for_disk: Vec<ConsumerOffset> = Vec::new();
+
+        // Hold the DashMap lock through validation AND in-memory insertion
+        // to prevent TOCTOU race between generation check and offset store
         {
             let group = self
                 .groups
@@ -1306,67 +1358,59 @@ impl ConsumerGroupCoordinator {
             if !group.value().members.contains_key(&consumer_id) {
                 return Err(error_codes::UNKNOWN_CONSUMER_ID);
             }
-        }
 
-        let now = SystemTime::now();
-        let expire_timestamp = if retention_time_ms > 0 {
-            Some(now + Duration::from_millis(retention_time_ms as u64))
-        } else {
-            None
-        };
+            // Insert offsets while still holding the group lock
+            for offset in offsets {
+                // Validate that the topic/partition exists
+                if self.topic_manager.get_topic(&offset.topic).is_none() {
+                    topic_partition_errors.push(TopicPartitionError {
+                        topic: offset.topic,
+                        partition: offset.partition,
+                        error_code: super::error_codes::UNKNOWN_CONSUMER_ID,
+                    });
+                    continue;
+                }
 
-        let mut topic_partition_errors = Vec::new();
+                if !self
+                    .topic_manager
+                    .partition_exists(&offset.topic, offset.partition)
+                {
+                    topic_partition_errors.push(TopicPartitionError {
+                        topic: offset.topic,
+                        partition: offset.partition,
+                        error_code: super::error_codes::UNKNOWN_CONSUMER_ID,
+                    });
+                    continue;
+                }
 
-        for offset in offsets {
-            // Validate that the topic/partition exists
-            if self.topic_manager.get_topic(&offset.topic).is_none() {
-                topic_partition_errors.push(TopicPartitionError {
-                    topic: offset.topic,
+                let key = (group_id.clone(), offset.topic.clone(), offset.partition);
+                let consumer_offset = ConsumerOffset {
+                    group_id: group_id.clone(),
+                    topic: offset.topic.clone(),
                     partition: offset.partition,
-                    error_code: super::error_codes::UNKNOWN_CONSUMER_ID, // Using closest match
-                });
-                continue;
+                    offset: offset.offset,
+                    metadata: offset.metadata,
+                    commit_timestamp: now,
+                    expire_timestamp,
+                };
+
+                let consumer_offset_for_disk = consumer_offset.clone();
+                self.offset_storage.insert(key, consumer_offset);
+                offsets_for_disk.push(consumer_offset_for_disk);
             }
+        } // group lock released here
 
-            if !self
-                .topic_manager
-                .partition_exists(&offset.topic, offset.partition)
-            {
-                topic_partition_errors.push(TopicPartitionError {
-                    topic: offset.topic,
-                    partition: offset.partition,
-                    error_code: super::error_codes::UNKNOWN_CONSUMER_ID, // Using closest match
-                });
-                continue;
-            }
-
-            // Store offset in memory
-            let key = (group_id.clone(), offset.topic.clone(), offset.partition);
-            let consumer_offset = ConsumerOffset {
-                group_id: group_id.clone(),
-                topic: offset.topic.clone(),
-                partition: offset.partition,
-                offset: offset.offset,
-                metadata: offset.metadata,
-                commit_timestamp: now,
-                expire_timestamp,
-            };
-
-            // Clone before moving for disk persistence
-            let consumer_offset_for_disk = consumer_offset.clone();
-            self.offset_storage.insert(key, consumer_offset);
-
-            // Persist to disk storage if available
-            if self.metadata_dir.is_some() {
+        // Persist to disk asynchronously (outside lock)
+        if self.metadata_dir.is_some() {
+            for consumer_offset in &offsets_for_disk {
                 if let Err(e) = self
-                    .persist_offset_to_disk(&group_id, &consumer_offset_for_disk)
+                    .persist_offset_to_disk(&group_id, consumer_offset)
                     .await
                 {
                     error!(
                         "Failed to persist offset to disk for group {}, topic {}, partition {}: {}",
-                        group_id, offset.topic, offset.partition, e
+                        group_id, consumer_offset.topic, consumer_offset.partition, e
                     );
-                    // Continue execution - disk persistence failure shouldn't block the operation
                 }
             }
         }
@@ -1645,6 +1689,7 @@ impl ConsumerGroupCoordinator {
                     assigned_partitions: serializable_member.assigned_partitions,
                     last_heartbeat: SystemTime::UNIX_EPOCH
                         + Duration::from_secs(serializable_member.last_heartbeat),
+                    last_heartbeat_monotonic: std::time::Instant::now(),
                     is_leader: serializable_member.is_leader,
                 };
                 (consumer_id, member)

@@ -6,8 +6,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-/// Log record format:
+/// Log record format (big-endian / Kafka convention):
 /// [length: 4 bytes][crc: 4 bytes][timestamp: 8 bytes][key_len: 4 bytes][key: key_len bytes][value: remaining bytes]
+///
+/// Note: This module uses **big-endian** encoding (Kafka convention).
+/// This differs from `performance::mmap_storage` which uses little-endian (native).
 const RECORD_HEADER_SIZE: usize = 20; // 4 + 4 + 8 + 4
 
 #[derive(Debug)]
@@ -45,10 +48,33 @@ impl LogEntry {
 
     /// Serialize this entry to bytes
     pub fn serialize(&self) -> Result<Vec<u8>> {
-        let key_len = self.key.as_ref().map_or(0, |k| k.len()) as u32;
-        let value_len = self.value.len() as u32;
-        // Total length is payload size (excluding the 4-byte length prefix itself)
-        let payload_len = 16 + key_len + value_len; // 4(crc) + 8(timestamp) + 4(key_len) + key + value
+        let key_len = self.key.as_ref().map_or(0, |k| k.len());
+        let value_len = self.value.len();
+
+        // Validate sizes fit in u32 (wire format constraint)
+        let key_len_u32 = u32::try_from(key_len).map_err(|_| {
+            FluxmqError::Storage(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Message key exceeds u32::MAX bytes",
+            ))
+        })?;
+        let value_len_u32 = u32::try_from(value_len).map_err(|_| {
+            FluxmqError::Storage(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Message value exceeds u32::MAX bytes",
+            ))
+        })?;
+
+        // Total length with overflow protection: 4(crc) + 8(timestamp) + 4(key_len) + key + value
+        let payload_len = 16u32
+            .checked_add(key_len_u32)
+            .and_then(|n| n.checked_add(value_len_u32))
+            .ok_or_else(|| {
+                FluxmqError::Storage(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Message payload size overflow",
+                ))
+            })?;
 
         let mut buf = Vec::with_capacity(payload_len as usize + 4); // +4 for length prefix
 
@@ -58,7 +84,7 @@ impl LogEntry {
         // Calculate CRC32 of the payload (everything after length and crc fields)
         let mut payload = Vec::new();
         payload.extend_from_slice(&self.timestamp.to_be_bytes());
-        payload.extend_from_slice(&key_len.to_be_bytes());
+        payload.extend_from_slice(&key_len_u32.to_be_bytes());
         if let Some(key) = &self.key {
             payload.extend_from_slice(key);
         }
@@ -305,11 +331,13 @@ impl Log {
         let mmap = unsafe { MmapOptions::new().map(&self.file)? };
         let mut pos = 0;
         let mut current_offset = self.base_offset;
+        let mut truncated = false;
 
         while pos < mmap.len() {
             if pos + 4 > mmap.len() {
                 // Incomplete record at end of file, truncate
                 self.file.set_len(pos as u64)?;
+                truncated = true;
                 break;
             }
 
@@ -320,6 +348,7 @@ impl Log {
             if pos + 4 + record_len > mmap.len() {
                 // Incomplete record, truncate
                 self.file.set_len(pos as u64)?;
+                truncated = true;
                 break;
             }
 
@@ -332,9 +361,18 @@ impl Log {
                 Err(_) => {
                     // Corrupted record, truncate from here
                     self.file.set_len(pos as u64)?;
+                    truncated = true;
                     break;
                 }
             }
+        }
+
+        // Drop mmap before syncing to avoid active mapping over truncated region
+        drop(mmap);
+
+        // Persist truncation to disk so corrupted data isn't re-read after crash
+        if truncated {
+            self.file.sync_all()?;
         }
 
         self.next_offset = current_offset;
@@ -356,6 +394,7 @@ impl Log {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use tempfile::tempdir;
 
     #[test]
@@ -455,5 +494,79 @@ mod tests {
         assert_eq!(entries[0].value, Bytes::from("message 2"));
         assert_eq!(entries[1].offset, 3);
         assert_eq!(entries[1].value, Bytes::from("message 3"));
+    }
+
+    // =========================================================================
+    // Property-based tests for serialization round-trip integrity
+    // =========================================================================
+
+    proptest! {
+        #[test]
+        fn prop_log_entry_roundtrip(
+            offset in any::<u64>(),
+            timestamp in any::<u64>(),
+            key in proptest::option::of(proptest::collection::vec(any::<u8>(), 0..512)),
+            value in proptest::collection::vec(any::<u8>(), 1..2048),
+        ) {
+            let entry = LogEntry {
+                offset,
+                timestamp,
+                key: key.map(Bytes::from),
+                value: Bytes::from(value.clone()),
+            };
+
+            let serialized = entry.serialize().unwrap();
+            let deserialized = LogEntry::deserialize(&serialized, offset).unwrap();
+
+            prop_assert_eq!(deserialized.offset, offset);
+            prop_assert_eq!(deserialized.timestamp, timestamp);
+            prop_assert_eq!(&deserialized.value[..], &value[..]);
+
+            // Note: log.rs treats empty key (Some([])) the same as no key (None),
+            // which matches Kafka semantics where empty key == no key.
+            let orig_key_bytes = entry.key.as_ref().filter(|k| !k.is_empty());
+            let deser_key_bytes = deserialized.key.as_ref().filter(|k| !k.is_empty());
+            match (orig_key_bytes, deser_key_bytes) {
+                (Some(orig), Some(deser)) => prop_assert_eq!(&orig[..], &deser[..]),
+                (None, None) => {}
+                _ => prop_assert!(false, "Key mismatch"),
+            }
+        }
+
+        #[test]
+        fn prop_log_file_roundtrip(
+            batch_size in 1usize..10,
+            value_len in 1usize..256,
+        ) {
+            let temp_dir = tempdir().unwrap();
+            let log_path = temp_dir.path().join("prop_test.log");
+
+            let messages: Vec<crate::protocol::Message> = (0..batch_size)
+                .map(|i| {
+                    let value_bytes = Bytes::from(vec![b'v'; value_len]);
+                    let mut msg = crate::protocol::Message {
+                        key: None,
+                        value: value_bytes,
+                        timestamp: 0,
+                        headers: std::collections::HashMap::new(),
+                    };
+                    if i % 2 == 0 {
+                        msg.key = Some(Bytes::from(format!("key_{}", i)));
+                    }
+                    msg
+                })
+                .collect();
+
+            let mut log = Log::create(&log_path, 0).unwrap();
+            log.append(&messages).unwrap();
+
+            let entries = log.read(0, 10 * 1024 * 1024).unwrap();
+            prop_assert_eq!(entries.len(), batch_size);
+
+            for (i, entry) in entries.iter().enumerate() {
+                prop_assert_eq!(entry.offset, i as u64);
+                prop_assert_eq!(entry.value.len(), value_len);
+            }
+        }
     }
 }

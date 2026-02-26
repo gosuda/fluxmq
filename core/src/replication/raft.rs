@@ -234,10 +234,10 @@ pub struct RaftNode {
     last_heartbeat: Arc<RwLock<Instant>>,
     /// Storage for state machine
     _storage: Arc<HybridStorage>,
-    /// Network sender for outgoing RPCs
-    rpc_sender: mpsc::UnboundedSender<(BrokerId, RaftMessage)>,
-    /// Channel for applying committed entries
-    apply_sender: mpsc::UnboundedSender<LogEntry>,
+    /// Network sender for outgoing RPCs (bounded to prevent OOM under network partitions)
+    rpc_sender: mpsc::Sender<(BrokerId, RaftMessage)>,
+    /// Channel for applying committed entries (bounded to provide backpressure)
+    apply_sender: mpsc::Sender<LogEntry>,
 }
 
 impl RaftNode {
@@ -246,8 +246,8 @@ impl RaftNode {
         peers: Vec<BrokerId>,
         storage: Arc<HybridStorage>,
         config: RaftConfig,
-        rpc_sender: mpsc::UnboundedSender<(BrokerId, RaftMessage)>,
-        apply_sender: mpsc::UnboundedSender<LogEntry>,
+        rpc_sender: mpsc::Sender<(BrokerId, RaftMessage)>,
+        apply_sender: mpsc::Sender<LogEntry>,
     ) -> Self {
         Self {
             node_id,
@@ -392,8 +392,14 @@ impl RaftNode {
                 last_log_term,
             };
 
-            if let Err(e) = self.rpc_sender.send((peer, request)) {
-                warn!("Failed to send vote request to peer {}: {}", peer, e);
+            match self.rpc_sender.try_send((peer, request)) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!("RPC channel full, dropping vote request to peer {}", peer);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    warn!("RPC channel closed for peer {}", peer);
+                }
             }
         }
 
@@ -509,8 +515,14 @@ impl RaftNode {
                 leader_commit: commit_index,
             };
 
-            if let Err(e) = self.rpc_sender.send((peer, heartbeat)) {
-                warn!("Failed to send heartbeat to peer {}: {}", peer, e);
+            match self.rpc_sender.try_send((peer, heartbeat)) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!("RPC channel full, dropping heartbeat to peer {}", peer);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    warn!("RPC channel closed for peer {}", peer);
+                }
             }
         }
 
@@ -825,10 +837,33 @@ impl RaftNode {
                 };
 
                 // Apply entries to state machine
+                // Fast path: try_send avoids timer allocation when channel has capacity.
+                // Slow path: fall back to timeout(send) only under backpressure.
                 for entry in entries_to_apply {
-                    if let Err(e) = self.apply_sender.send(entry) {
-                        error!("Failed to send entry to apply channel: {}", e);
-                        break;
+                    match self.apply_sender.try_send(entry) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(entry)) => {
+                            // Channel full — fall back to async send with timeout
+                            match timeout(Duration::from_secs(5), self.apply_sender.send(entry))
+                                .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    error!("Apply channel closed: {}", e);
+                                    break;
+                                }
+                                Err(_) => {
+                                    error!(
+                                        "Apply channel full for 5 seconds, possible apply loop stall"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            error!("Apply channel closed");
+                            break;
+                        }
                     }
                 }
 
@@ -900,8 +935,8 @@ mod tests {
     async fn test_raft_node_creation() {
         let temp_dir = std::env::temp_dir().join("raft_test");
         let storage = Arc::new(HybridStorage::new(temp_dir.to_str().unwrap()).unwrap());
-        let (rpc_tx, _rpc_rx) = mpsc::unbounded_channel();
-        let (apply_tx, _apply_rx) = mpsc::unbounded_channel();
+        let (rpc_tx, _rpc_rx) = mpsc::channel(100);
+        let (apply_tx, _apply_rx) = mpsc::channel(100);
 
         let node = RaftNode::new(
             1,

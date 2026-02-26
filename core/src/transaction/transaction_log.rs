@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex as TokioMutex;
 use tracing::{debug, info, warn};
 
 use super::{ProducerId, TopicPartition, TransactionMetadata, TransactionResult, TxnState};
@@ -73,6 +75,16 @@ pub enum TransactionLogEntry {
         new_producer_epoch: i16,
         timestamp: i64,
     },
+    /// Pending transaction markers to be written (persisted for crash recovery)
+    PendingMarkers {
+        transactional_id: String,
+        producer_id: ProducerId,
+        producer_epoch: i16,
+        commit: bool,
+        /// (topic_name, partition_ids)
+        marker_topics: Vec<(String, Vec<i32>)>,
+        timestamp: i64,
+    },
 }
 
 impl TransactionLogEntry {
@@ -86,6 +98,7 @@ impl TransactionLogEntry {
             Self::PrepareTransaction { timestamp, .. } => *timestamp,
             Self::CompleteTransaction { timestamp, .. } => *timestamp,
             Self::FenceProducer { timestamp, .. } => *timestamp,
+            Self::PendingMarkers { timestamp, .. } => *timestamp,
         }
     }
 
@@ -113,6 +126,9 @@ impl TransactionLogEntry {
             Self::FenceProducer {
                 transactional_id, ..
             } => transactional_id,
+            Self::PendingMarkers {
+                transactional_id, ..
+            } => transactional_id,
         }
     }
 
@@ -128,6 +144,7 @@ impl TransactionLogEntry {
             Self::FenceProducer {
                 old_producer_id, ..
             } => *old_producer_id,
+            Self::PendingMarkers { producer_id, .. } => *producer_id,
         }
     }
 }
@@ -143,6 +160,8 @@ pub struct TransactionLog {
     next_sequence_number: Arc<std::sync::atomic::AtomicU64>,
     /// Configuration
     config: TransactionLogConfig,
+    /// Persistent file handle (avoids re-opening on every write)
+    log_file: TokioMutex<tokio::fs::File>,
 }
 
 /// Transaction log configuration
@@ -180,11 +199,19 @@ impl TransactionLog {
 
         let log_path = config.log_dir.join("transaction.log");
 
+        // Open persistent file handle (create if not exists, append mode)
+        let log_file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .await?;
+
         let transaction_log = Self {
             log_path,
             transaction_states: Arc::new(RwLock::new(HashMap::new())),
             next_sequence_number: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             config,
+            log_file: TokioMutex::new(log_file),
         };
 
         // Load existing log entries
@@ -351,6 +378,90 @@ impl TransactionLog {
         Ok(())
     }
 
+    /// Log pending transaction markers (persisted for crash recovery)
+    pub async fn log_pending_markers(
+        &self,
+        transactional_id: &str,
+        producer_id: ProducerId,
+        producer_epoch: i16,
+        commit: bool,
+        marker_topics: Vec<(String, Vec<i32>)>,
+    ) -> TransactionResult<()> {
+        let entry = TransactionLogEntry::PendingMarkers {
+            transactional_id: transactional_id.to_string(),
+            producer_id,
+            producer_epoch,
+            commit,
+            marker_topics,
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        };
+
+        self.append_log_entry(entry).await?;
+
+        debug!(
+            transactional_id = transactional_id,
+            producer_id = producer_id,
+            commit = commit,
+            "Logged pending transaction markers"
+        );
+
+        Ok(())
+    }
+
+    /// Batch: log prepare transaction + pending markers in a single fsync.
+    /// Reduces 2 file opens + 2 fsyncs → 1 write + 1 fsync.
+    pub async fn log_prepare_and_pending_markers(
+        &self,
+        transactional_id: &str,
+        producer_id: ProducerId,
+        producer_epoch: i16,
+        commit: bool,
+        partitions: Vec<TopicPartition>,
+        marker_topics: Vec<(String, Vec<i32>)>,
+    ) -> TransactionResult<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let entries = vec![
+            TransactionLogEntry::PrepareTransaction {
+                transactional_id: transactional_id.to_string(),
+                producer_id,
+                producer_epoch,
+                commit,
+                partitions,
+                timestamp: now,
+            },
+            TransactionLogEntry::PendingMarkers {
+                transactional_id: transactional_id.to_string(),
+                producer_id,
+                producer_epoch,
+                commit,
+                marker_topics,
+                timestamp: now,
+            },
+        ];
+
+        self.append_log_entries_batch(entries).await?;
+
+        // Update in-memory state (same as log_prepare_transaction)
+        if let Some(metadata) = self.transaction_states.write().get_mut(transactional_id) {
+            metadata.state = if commit {
+                TxnState::PrepareCommit
+            } else {
+                TxnState::PrepareAbort
+            };
+            metadata.txn_last_update_timestamp = now;
+        }
+
+        debug!(
+            transactional_id = transactional_id,
+            producer_id = producer_id,
+            commit = commit,
+            "Logged prepare + pending markers (batched, single fsync)"
+        );
+
+        Ok(())
+    }
+
     /// Log complete transaction (commit or abort)
     pub async fn log_complete_transaction(
         &self,
@@ -410,6 +521,55 @@ impl TransactionLog {
             .collect()
     }
 
+    /// Get pending markers that need recovery (PrepareTransaction without CompleteTransaction)
+    pub async fn get_pending_markers_for_recovery(
+        &self,
+    ) -> TransactionResult<Vec<TransactionLogEntry>> {
+        if !self.log_path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let content = fs::read_to_string(&self.log_path).await?;
+        let mut pending_markers = Vec::new();
+        let mut completed_txns: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        // First pass: collect completed transaction IDs
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(record) = serde_json::from_str::<LogRecord>(line) {
+                if let TransactionLogEntry::CompleteTransaction {
+                    transactional_id, ..
+                } = &record.entry
+                {
+                    completed_txns.insert(transactional_id.clone());
+                }
+            }
+        }
+
+        // Second pass: collect PendingMarkers whose transaction hasn't completed
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(record) = serde_json::from_str::<LogRecord>(line) {
+                if let TransactionLogEntry::PendingMarkers {
+                    ref transactional_id,
+                    ..
+                } = record.entry
+                {
+                    if !completed_txns.contains(transactional_id) {
+                        pending_markers.push(record.entry);
+                    }
+                }
+            }
+        }
+
+        Ok(pending_markers)
+    }
+
     /// Remove completed transactions from memory
     pub async fn cleanup_completed_transactions(&self) -> usize {
         let mut states = self.transaction_states.write();
@@ -425,7 +585,7 @@ impl TransactionLog {
         cleaned_up
     }
 
-    /// Append log entry to persistent log
+    /// Append log entry to persistent log (uses persistent file handle)
     async fn append_log_entry(&self, entry: TransactionLogEntry) -> TransactionResult<()> {
         let sequence_number = self
             .next_sequence_number
@@ -439,13 +599,7 @@ impl TransactionLog {
         let serialized = serde_json::to_string(&log_record)?;
         let log_line = format!("{}\n", serialized);
 
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_path)
-            .await?;
-
-        use tokio::io::AsyncWriteExt;
+        let mut file = self.log_file.lock().await;
         file.write_all(log_line.as_bytes()).await?;
 
         if self.config.fsync_on_write {
@@ -456,6 +610,43 @@ impl TransactionLog {
             sequence_number = sequence_number,
             "Appended transaction log entry"
         );
+
+        Ok(())
+    }
+
+    /// Append multiple log entries with a single fsync (reduces I/O overhead)
+    async fn append_log_entries_batch(
+        &self,
+        entries: Vec<TransactionLogEntry>,
+    ) -> TransactionResult<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut buffer = String::new();
+        let count = entries.len();
+
+        for entry in entries {
+            let sequence_number = self
+                .next_sequence_number
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let log_record = LogRecord {
+                sequence_number,
+                entry,
+            };
+            let serialized = serde_json::to_string(&log_record)?;
+            buffer.push_str(&serialized);
+            buffer.push('\n');
+        }
+
+        let mut file = self.log_file.lock().await;
+        file.write_all(buffer.as_bytes()).await?;
+
+        if self.config.fsync_on_write {
+            file.sync_all().await?;
+        }
+
+        debug!(count = count, "Appended batch of transaction log entries");
 
         Ok(())
     }
@@ -605,8 +796,18 @@ impl TransactionLog {
                     metadata.txn_last_update_timestamp = timestamp;
                 }
             }
-            _ => {
-                // Handle other entry types as needed
+            TransactionLogEntry::AddOffsets {
+                transactional_id,
+                timestamp,
+                ..
+            } => {
+                if let Some(metadata) = states.get_mut(&transactional_id) {
+                    metadata.txn_last_update_timestamp = timestamp;
+                }
+            }
+            TransactionLogEntry::PendingMarkers { .. } => {
+                // PendingMarkers are recovered by the TransactionCoordinator,
+                // not by the log replay itself (they affect pending_markers, not transaction state)
             }
         }
     }

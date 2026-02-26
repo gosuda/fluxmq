@@ -68,6 +68,28 @@
 //! - **Go**: `sarama` and `confluent-kafka-go`
 //! - **Node.js**: `kafkajs` and `node-rdkafka`
 
+// =============================================================================
+// Lock Ordering (Deadlock Prevention)
+//
+// All locks MUST be acquired in the following order. Never hold a
+// lower-numbered lock while acquiring a higher-numbered one.
+//
+// 1. HybridStorage::segments (DashMap per-shard lock)
+// 2. HybridStorage::compression_engine (parking_lot::Mutex)
+// 3. MemoryMappedStorage::segments (parking_lot::RwLock)
+// 4. PartitionMMapSegment::current_segment (parking_lot::Mutex)
+// 5. TransactionLog::transaction_states (parking_lot::RwLock)
+// 6. TransactionCoordinator::transactions (parking_lot::RwLock)
+// 7. TransactionCoordinator::pending_markers (parking_lot::RwLock)
+// 8. MessageHandler::acl_manager (parking_lot::RwLock)
+//
+// Raft locks (tokio::sync::RwLock, never mixed with parking_lot):
+// R1. RaftNode::state
+// R2. RaftNode::persistent
+// R3. RaftNode::leader_state
+// R4. RaftNode::last_heartbeat
+// =============================================================================
+
 pub mod acl;
 pub mod broker;
 pub mod compression;

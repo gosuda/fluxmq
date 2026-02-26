@@ -595,7 +595,7 @@ impl KafkaCodec {
         let acks = cursor.get_i16();
         let timeout_ms = cursor.get_i32();
 
-        let topic_count = cursor.get_i32();
+        let topic_count = cursor.get_i32().max(0).min(10_000);
         #[cfg(debug_assertions)]
         debug!("Decoding produce request: topic_count={}", topic_count);
         let mut topic_data = Vec::with_capacity(topic_count as usize);
@@ -604,7 +604,7 @@ impl KafkaCodec {
             let topic = Self::decode_string(cursor)?;
             #[cfg(debug_assertions)]
             debug!("Decoded topic {}: '{}'", i, topic);
-            let partition_count = cursor.get_i32();
+            let partition_count = cursor.get_i32().max(0).min(100_000);
             #[cfg(debug_assertions)]
             debug!("Topic '{}' has {} partitions", topic, partition_count);
             let mut partition_data = Vec::with_capacity(partition_count as usize);
@@ -710,12 +710,12 @@ impl KafkaCodec {
         let session_id = cursor.get_i32();
         let session_epoch = cursor.get_i32();
 
-        let topic_count = cursor.get_i32();
+        let topic_count = cursor.get_i32().max(0).min(10_000);
         let mut topics = Vec::with_capacity(topic_count as usize);
 
         for _ in 0..topic_count {
             let topic = Self::decode_string(cursor)?;
-            let partition_count = cursor.get_i32();
+            let partition_count = cursor.get_i32().max(0).min(100_000);
             let mut partitions = Vec::with_capacity(partition_count as usize);
 
             for _ in 0..partition_count {
@@ -738,12 +738,12 @@ impl KafkaCodec {
         }
 
         // Decode forgotten topics (simplified for now)
-        let forgotten_topic_count = cursor.get_i32();
+        let forgotten_topic_count = cursor.get_i32().max(0).min(10_000);
         let mut forgotten_topics_data = Vec::with_capacity(forgotten_topic_count as usize);
 
         for _ in 0..forgotten_topic_count {
             let topic = Self::decode_string(cursor)?;
-            let partition_count = cursor.get_i32();
+            let partition_count = cursor.get_i32().max(0).min(100_000);
             let mut partitions = Vec::with_capacity(partition_count as usize);
 
             for _ in 0..partition_count {
@@ -917,6 +917,7 @@ impl KafkaCodec {
             cursor.get_i32()
         };
 
+        let topic_count = topic_count.max(0).min(10_000);
         let mut topics = Vec::with_capacity(topic_count as usize);
         for _ in 0..topic_count {
             // Topic name: compact string for flexible, regular string for non-flexible
@@ -933,6 +934,7 @@ impl KafkaCodec {
             } else {
                 cursor.get_i32()
             };
+            let partition_count = partition_count.max(0).min(100_000);
 
             let mut partitions = Vec::with_capacity(partition_count as usize);
             for _ in 0..partition_count {
@@ -1021,6 +1023,7 @@ impl KafkaCodec {
         } else {
             #[cfg(debug_assertions)]
             debug!("  Parsing {} topics...", topic_count);
+            let topic_count = topic_count.max(0).min(50_000);
             let mut topics = Vec::with_capacity(topic_count as usize);
             for i in 0..topic_count {
                 // Handle topic parsing for flexible vs non-flexible versions
@@ -1606,7 +1609,7 @@ impl KafkaCodec {
                 None => 0,
             }
         } else {
-            cursor.get_i32() as usize
+            Self::decode_array_count(cursor, "OffsetCommit topics")?
         };
 
         let mut topics = Vec::with_capacity(topic_count);
@@ -1626,7 +1629,7 @@ impl KafkaCodec {
                     None => 0,
                 }
             } else {
-                cursor.get_i32() as usize
+                Self::decode_array_count(cursor, "OffsetCommit partitions")?
             };
 
             let mut partitions = Vec::with_capacity(partition_count);
@@ -1775,11 +1778,12 @@ impl KafkaCodec {
         let topics = if topic_count == -1 {
             None // Fetch all topics
         } else {
+            let topic_count = topic_count.max(0).min(10_000);
             let mut topics = Vec::with_capacity(topic_count as usize);
 
             for _ in 0..topic_count {
                 let topic = Self::decode_string(cursor)?;
-                let partition_count = cursor.get_i32();
+                let partition_count = cursor.get_i32().max(0).min(100_000);
                 let mut partitions = Vec::with_capacity(partition_count as usize);
 
                 for _ in 0..partition_count {
@@ -1990,7 +1994,7 @@ impl KafkaCodec {
             states_filter
         } else {
             // Non-flexible version (v0-v2)
-            let states_filter_count = cursor.get_i32();
+            let states_filter_count = cursor.get_i32().max(0).min(100);
             let mut states_filter = Vec::with_capacity(states_filter_count as usize);
             for _ in 0..states_filter_count {
                 states_filter.push(Self::decode_string(cursor)?);
@@ -2174,7 +2178,7 @@ impl KafkaCodec {
         let group_id = Self::decode_string(cursor)?;
 
         // Defensive: check remaining bytes before reading i32
-        let remaining = cursor.get_ref().len() - cursor.position() as usize;
+        let remaining = cursor.get_ref().len().saturating_sub(cursor.position() as usize);
         if remaining < 4 {
             return Err(KafkaCodecError::InvalidFormat(format!(
                 "SyncGroup: insufficient bytes for generation_id: {} remaining",
@@ -2208,7 +2212,7 @@ impl KafkaCodec {
         };
 
         // Defensive: check remaining bytes before reading assignment_count
-        let remaining = cursor.get_ref().len() - cursor.position() as usize;
+        let remaining = cursor.get_ref().len().saturating_sub(cursor.position() as usize);
         if remaining < 4 {
             // No assignments - this is valid for a follower consumer
             return Ok(KafkaSyncGroupRequest {
@@ -2223,10 +2227,10 @@ impl KafkaCodec {
             });
         }
 
-        let assignment_count = cursor.get_i32();
-        let mut assignments = Vec::with_capacity(assignment_count.max(0) as usize);
+        let assignment_count = cursor.get_i32().max(0).min(1_000);
+        let mut assignments = Vec::with_capacity(assignment_count as usize);
 
-        for _ in 0..assignment_count.max(0) {
+        for _ in 0..assignment_count {
             let consumer_id = Self::decode_string(cursor)?;
             let assignment = Self::decode_bytes(cursor)?;
             assignments.push(KafkaSyncGroupAssignment {
@@ -2328,7 +2332,7 @@ impl KafkaCodec {
 
         let protocol_type = Self::decode_string(cursor)?;
 
-        let protocol_count = cursor.get_i32();
+        let protocol_count = cursor.get_i32().max(0).min(100);
         let mut protocols = Vec::with_capacity(protocol_count as usize);
 
         for _ in 0..protocol_count {
@@ -2881,6 +2885,35 @@ impl KafkaCodec {
     // PRIMITIVE ENCODING/DECODING HELPERS
     // ========================================================================
 
+    /// Decode an i32 array/count field from the wire, rejecting negative values.
+    /// Kafka uses -1 to mean "null array" in some contexts; callers should handle
+    /// that before calling this helper. A reasonable upper bound prevents
+    /// DoS via huge loop iteration counts from malformed requests.
+    fn decode_array_count(cursor: &mut Cursor<&[u8]>, context: &str) -> Result<usize> {
+        if cursor.remaining() < 4 {
+            return Err(KafkaCodecError::InvalidFormat(format!(
+                "{}: not enough bytes for array count",
+                context
+            )));
+        }
+        let raw = cursor.get_i32();
+        if raw < 0 {
+            return Err(KafkaCodecError::InvalidFormat(format!(
+                "{}: negative array count {}",
+                context, raw
+            )));
+        }
+        // Cap at 100_000 elements — no legitimate Kafka request has more.
+        let count = raw as usize;
+        if count > 100_000 {
+            return Err(KafkaCodecError::InvalidFormat(format!(
+                "{}: array count {} exceeds maximum 100000",
+                context, count
+            )));
+        }
+        Ok(count)
+    }
+
     fn decode_string(cursor: &mut Cursor<&[u8]>) -> Result<String> {
         let len = cursor.get_i16();
         #[cfg(debug_assertions)]
@@ -2901,7 +2934,7 @@ impl KafkaCodec {
         // No need for upper bound check since i16 max is 32767
 
         // Check if we have enough bytes remaining
-        let remaining = cursor.get_ref().len() - cursor.position() as usize;
+        let remaining = cursor.get_ref().len().saturating_sub(cursor.position() as usize);
         if len as usize > remaining {
             // DEFENSIVE: Log detailed information for debugging framing issues
             warn!("Buffer underrun in decode_string: requested {} bytes, only {} available at position {}. Buffer total length: {}",
@@ -2935,7 +2968,7 @@ impl KafkaCodec {
         // No need for upper bound check since i16 max is 32767
 
         // Check if we have enough bytes remaining
-        let remaining = cursor.get_ref().len() - cursor.position() as usize;
+        let remaining = cursor.get_ref().len().saturating_sub(cursor.position() as usize);
         if len as usize > remaining {
             // DEFENSIVE: If buffer underrun, return a graceful error instead of panic
             warn!("Buffer underrun in decode_nullable_string: requested {} bytes, only {} available at position {}. Buffer total length: {}",
@@ -2967,7 +3000,7 @@ impl KafkaCodec {
         }
 
         // Check if we have enough bytes remaining
-        let remaining = cursor.get_ref().len() - cursor.position() as usize;
+        let remaining = cursor.get_ref().len().saturating_sub(cursor.position() as usize);
         if len as usize > remaining {
             return Err(KafkaCodecError::InvalidFormat(format!(
                 "Bytes length {} exceeds remaining buffer size {}", len, remaining
@@ -2990,7 +3023,7 @@ impl KafkaCodec {
         }
 
         // Check if we have enough bytes remaining
-        let remaining = cursor.get_ref().len() - cursor.position() as usize;
+        let remaining = cursor.get_ref().len().saturating_sub(cursor.position() as usize);
         if len as usize > remaining {
             return Err(KafkaCodecError::InvalidFormat(format!(
                 "Nullable bytes length {} exceeds remaining buffer size {}", len, remaining
@@ -3040,7 +3073,7 @@ impl KafkaCodec {
         header: KafkaRequestHeader,
         cursor: &mut Cursor<&[u8]>,
     ) -> Result<KafkaCreateTopicsRequest> {
-        let topic_count = cursor.get_i32();
+        let topic_count = cursor.get_i32().max(0).min(1_000);
         let mut topics = Vec::with_capacity(topic_count as usize);
 
         for _ in 0..topic_count {
@@ -3049,17 +3082,17 @@ impl KafkaCodec {
             let replication_factor = cursor.get_i16();
 
             // Skip assignments (empty for simple case)
-            let assignment_count = cursor.get_i32();
+            let assignment_count = cursor.get_i32().max(0).min(10_000);
             for _ in 0..assignment_count {
                 let _partition_id = cursor.get_i32();
-                let replica_count = cursor.get_i32();
+                let replica_count = cursor.get_i32().max(0).min(1_000);
                 for _ in 0..replica_count {
                     let _broker_id = cursor.get_i32();
                 }
             }
 
             // Read configs
-            let config_count = cursor.get_i32();
+            let config_count = cursor.get_i32().max(0).min(1_000);
             let mut configs = Vec::new();
             for _ in 0..config_count {
                 let config_name = Self::decode_string(cursor)?;
@@ -3193,6 +3226,7 @@ impl KafkaCodec {
             cursor.get_i32()
         };
 
+        let topic_count = topic_count.max(0).min(10_000);
         let mut topic_names = Vec::with_capacity(topic_count as usize);
 
         for _ in 0..topic_count {
@@ -3401,6 +3435,7 @@ impl KafkaCodec {
             cursor.get_i32()
         };
 
+        let resources_length = resources_length.max(0).min(1_000);
         let mut resources = Vec::with_capacity(resources_length as usize);
 
         for _ in 0..resources_length {
@@ -3425,6 +3460,7 @@ impl KafkaCodec {
             let configuration_keys = if config_keys_length == -1 {
                 None
             } else {
+                let config_keys_length = config_keys_length.max(0).min(1_000);
                 let mut keys = Vec::with_capacity(config_keys_length as usize);
                 for _ in 0..config_keys_length {
                     let key = if is_flexible {
@@ -3639,6 +3675,7 @@ impl KafkaCodec {
             cursor.get_i32()
         };
 
+        let resources_length = resources_length.max(0).min(1_000);
         let mut resources = Vec::with_capacity(resources_length as usize);
 
         for _ in 0..resources_length {
@@ -3659,6 +3696,7 @@ impl KafkaCodec {
             } else {
                 cursor.get_i32()
             };
+            let configs_length = configs_length.max(0).min(1_000);
 
             let mut configs = Vec::with_capacity(configs_length as usize);
 
@@ -3793,6 +3831,7 @@ impl KafkaCodec {
             cursor.get_i32()
         };
 
+        let resources_length = resources_length.max(0).min(1_000);
         let mut resources = Vec::with_capacity(resources_length as usize);
 
         for _ in 0..resources_length {
@@ -3807,6 +3846,7 @@ impl KafkaCodec {
                 let varint = Self::decode_varint(cursor)? as i32;
                 if varint == 0 { 0 } else { varint - 1 }
             };
+            let configs_length = configs_length.max(0).min(1_000);
 
             let mut configs = Vec::with_capacity(configs_length as usize);
 
@@ -3963,6 +4003,13 @@ impl KafkaCodec {
         
         // Actual length is len - 1
         let actual_len = (len - 1) as usize;
+        // Guard against excessively large varint-decoded string lengths (max 10MB)
+        const MAX_COMPACT_STRING_LEN: usize = 10 * 1024 * 1024;
+        if actual_len > MAX_COMPACT_STRING_LEN {
+            return Err(KafkaCodecError::InvalidFormat(
+                format!("Compact string length {} exceeds limit {}", actual_len, MAX_COMPACT_STRING_LEN)
+            ));
+        }
         if cursor.remaining() < actual_len {
             return Err(KafkaCodecError::InvalidFormat(
                 "Not enough bytes for compact string".to_string()
@@ -4003,10 +4050,18 @@ impl KafkaCodec {
                 return Ok(());
             }
         };
-        
+
+        // Guard against excessively large tagged field count from untrusted varint
+        const MAX_TAGGED_FIELDS: u64 = 1_000;
+        if num_fields > MAX_TAGGED_FIELDS {
+            return Err(KafkaCodecError::InvalidFormat(
+                format!("Tagged field count {} exceeds limit {}", num_fields, MAX_TAGGED_FIELDS)
+            ));
+        }
+
         #[cfg(debug_assertions)]
         debug!("Decoding {} tagged fields", num_fields);
-        
+
         // For each tagged field, skip tag and data
         for i in 0..num_fields {
             #[cfg(debug_assertions)]
@@ -4916,7 +4971,9 @@ impl Decoder for KafkaFrameCodec {
             cursor.get_i32()
         };
 
-        if message_length < 0 || message_length > 100_000_000 {
+        // Kafka default max.request.size is ~1MB; 16MB is a generous upper bound
+        const MAX_FRAME_SIZE: i32 = 16 * 1024 * 1024; // 16MB
+        if message_length < 0 || message_length > MAX_FRAME_SIZE {
             return Err(KafkaCodecError::InvalidFormat(format!(
                 "Invalid message length: {}",
                 message_length
@@ -5305,17 +5362,12 @@ impl KafkaCodec {
                     "DeleteRecords: not enough bytes for topics count".to_string()
                 ));
             }
-            let num_topics = cursor.get_i32() as usize;
-            let mut topics = Vec::with_capacity(num_topics.min(1000));
+            let num_topics = Self::decode_array_count(cursor, "DeleteRecords topics")?;
+            let mut topics = Vec::with_capacity(num_topics);
             for _ in 0..num_topics {
                 let topic_name = Self::decode_string(cursor)?;
-                if cursor.remaining() < 4 {
-                    return Err(KafkaCodecError::InvalidFormat(
-                        "DeleteRecords: not enough bytes for partitions count".to_string()
-                    ));
-                }
-                let num_partitions = cursor.get_i32() as usize;
-                let mut partitions = Vec::with_capacity(num_partitions.min(1000));
+                let num_partitions = Self::decode_array_count(cursor, "DeleteRecords partitions")?;
+                let mut partitions = Vec::with_capacity(num_partitions);
                 for _ in 0..num_partitions {
                     if cursor.remaining() < 12 {
                         return Err(KafkaCodecError::InvalidFormat(
@@ -5418,7 +5470,7 @@ impl KafkaCodec {
                     "CreatePartitions: not enough bytes for topics count".to_string()
                 ));
             }
-            let num_topics = cursor.get_i32() as usize;
+            let num_topics = Self::decode_array_count(cursor, "CreatePartitions topics")?;
             let mut topics = Vec::with_capacity(num_topics.min(1000));
             for _ in 0..num_topics {
                 let name = Self::decode_string(cursor)?;
@@ -5438,7 +5490,7 @@ impl KafkaCodec {
                                 "CreatePartitions: not enough bytes for broker_ids count".to_string()
                             ));
                         }
-                        let num_broker_ids = cursor.get_i32() as usize;
+                        let num_broker_ids = Self::decode_array_count(cursor, "CreatePartitions broker_ids")?;
                         let mut broker_ids = Vec::with_capacity(num_broker_ids.min(100));
                         for _ in 0..num_broker_ids {
                             if cursor.remaining() < 4 {
@@ -5514,7 +5566,7 @@ impl KafkaCodec {
                     "DeleteGroups: not enough bytes for groups count".to_string()
                 ));
             }
-            let num_groups = cursor.get_i32() as usize;
+            let num_groups = Self::decode_array_count(cursor, "DeleteGroups groups")?;
             let mut groups = Vec::with_capacity(num_groups.min(1000));
             for _ in 0..num_groups {
                 groups.push(Self::decode_string(cursor)?);
@@ -5697,11 +5749,11 @@ impl KafkaCodec {
         // This API is NOT flexible (flexibleVersions: none)
         let group_id = Self::decode_string(cursor)?;
 
-        let topic_count = cursor.get_i32() as usize;
+        let topic_count = Self::decode_array_count(cursor, "OffsetDelete topics")?;
         let mut topics = Vec::with_capacity(topic_count.min(1000));
         for _ in 0..topic_count {
             let name = Self::decode_string(cursor)?;
-            let partition_count = cursor.get_i32() as usize;
+            let partition_count = Self::decode_array_count(cursor, "OffsetDelete partitions")?;
             let mut partitions = Vec::with_capacity(partition_count.min(10000));
             for _ in 0..partition_count {
                 partitions.push(KafkaOffsetDeleteRequestPartition {

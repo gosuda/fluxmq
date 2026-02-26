@@ -184,41 +184,36 @@ impl InMemoryStorage {
             return Ok(0);
         }
 
-        // OPTIMIZATION: Single String allocation for topic
-        let topic_owned = topic.to_string();
-        let key = (topic_owned.clone(), partition);
+        // Hot path: check existence first (fast read, no allocation on hit)
+        let key = (topic.to_string(), partition);
+        let is_new = !self.partitions.contains_key(&key);
 
-        // Check if this is a new partition - use get() to avoid redundant allocation
-        let is_new_partition = !self.partitions.contains_key(&key);
+        if is_new {
+            // Cold path: insert partition + track in topic_partitions
+            self.partitions
+                .entry(key.clone())
+                .or_insert_with(PartitionData::new);
+            self.topic_partitions
+                .entry(key.0.clone())
+                .or_insert_with(Vec::new)
+                .push(partition);
+        }
 
-        // Get or create partition data - DashMap handles concurrent access
-        let partition_data = self
-            .partitions
-            .entry(key)
-            .or_insert_with(PartitionData::new);
+        // Fast path: get() is guaranteed to succeed after contains_key/entry above
+        let partition_data = self.partitions.get(&key).unwrap();
 
         // Atomically reserve offset range
         let base_offset = partition_data
             .next_offset
             .fetch_add(message_count as u64, Ordering::Relaxed);
 
-        // ULTRA-FAST PATH: Direct extend with pre-reserved capacity, no intermediate collect
+        // Direct extend with pre-reserved capacity, no intermediate collect
         {
             let mut msgs = partition_data.messages.write();
-            // Reserve capacity in one shot
             msgs.reserve(message_count);
-            // Extend directly from iterator (no intermediate Vec allocation)
             for (i, msg) in messages.into_iter().enumerate() {
                 msgs.push((base_offset + i as u64, msg));
             }
-        }
-
-        // Update topic_partitions for new partitions (reuse topic_owned)
-        if is_new_partition {
-            self.topic_partitions
-                .entry(topic_owned)
-                .or_insert_with(Vec::new)
-                .push(partition);
         }
 
         Ok(base_offset)
@@ -427,6 +422,7 @@ impl HybridStorage {
             enable_direct_io: true,
             sync_on_write: false, // Async for performance
             preallocate_segments: true,
+            verify_crc_on_read: false, // Skip CRC on hot fetch path
         };
 
         // Initialize memory-mapped storage

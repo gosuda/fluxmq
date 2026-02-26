@@ -168,7 +168,7 @@ impl ProducerIdManager {
         current_producer_id: Option<ProducerId>,
         current_producer_epoch: Option<i16>,
     ) -> TransactionResult<(ProducerId, i16)> {
-        // Check if transactional ID already exists
+        // Fast path: check if transactional ID already exists (read lock only)
         let existing_producer_id = self
             .producers_by_txn_id
             .read()
@@ -207,6 +207,22 @@ impl ProducerIdManager {
             }
         }
 
+        // Slow path: new registration.
+        // Acquire both write locks (producers_by_id first — consistent with cleanup_expired_producers)
+        // to prevent TOCTOU race where two threads both see "not found" for the same txn_id.
+        let mut producers = self.producers_by_id.write();
+        let mut txn_ids = self.producers_by_txn_id.write();
+
+        // Double-check under write lock: another thread may have registered this txn_id
+        // between our read-lock check and this write-lock acquisition.
+        if let Some(&existing_pid) = txn_ids.get(transactional_id) {
+            if let Some(metadata) = producers.get_mut(&existing_pid) {
+                metadata.increment_epoch()?;
+                metadata.transaction_timeout_ms = transaction_timeout_ms;
+                return Ok((existing_pid, metadata.producer_epoch));
+            }
+        }
+
         // Allocate new producer ID for this transactional ID
         let producer_id = self.allocate_producer_id();
         let metadata = ProducerMetadata::new(
@@ -215,10 +231,8 @@ impl ProducerIdManager {
             transaction_timeout_ms,
         );
 
-        self.producers_by_id.write().insert(producer_id, metadata);
-        self.producers_by_txn_id
-            .write()
-            .insert(transactional_id.to_string(), producer_id);
+        producers.insert(producer_id, metadata);
+        txn_ids.insert(transactional_id.to_string(), producer_id);
 
         info!(
             producer_id = producer_id,
@@ -342,19 +356,33 @@ impl ProducerIdManager {
         }
     }
 
-    /// Allocate next available producer ID
+    /// Allocate next available producer ID with overflow protection
     fn allocate_producer_id(&self) -> ProducerId {
-        let producer_id = self.next_producer_id.fetch_add(1, Ordering::SeqCst);
-
-        if producer_id >= self.producer_id_range.1 {
-            warn!(
-                current_id = producer_id,
-                max_id = self.producer_id_range.1,
-                "Producer ID approaching maximum value"
-            );
+        loop {
+            let current = self.next_producer_id.load(Ordering::SeqCst);
+            if current >= self.producer_id_range.1 {
+                // Wrap around to start of range to prevent i64 overflow.
+                // This is a defensive measure for extremely long-running systems.
+                warn!(
+                    current_id = current,
+                    max_id = self.producer_id_range.1,
+                    "Producer ID reached maximum, wrapping to range start"
+                );
+                self.next_producer_id
+                    .store(self.producer_id_range.0, Ordering::SeqCst);
+                // Retry with the reset value
+                continue;
+            }
+            match self.next_producer_id.compare_exchange(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(id) => return id,
+                Err(_) => continue, // Another thread incremented, retry
+            }
         }
-
-        producer_id
     }
 }
 

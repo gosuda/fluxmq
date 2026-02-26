@@ -191,36 +191,53 @@ impl TopicManager {
         }
     }
 
-    /// Create a new topic with the specified configuration (lock-free)
+    /// Create a new topic with the specified configuration (lock-free, atomic)
     pub fn create_topic(&self, topic_name: &str, config: TopicConfig) -> Result<()> {
-        // Lock-free check and insert
-        if self.topics.contains_key(topic_name) {
-            return Ok(()); // Topic already exists, that's fine
+        // Validate configuration to prevent division-by-zero and invalid states
+        if config.num_partitions == 0 {
+            return Err(crate::FluxmqError::Config(
+                "num_partitions must be >= 1, got 0".to_string(),
+            ));
+        }
+        if config.segment_size == 0 {
+            return Err(crate::FluxmqError::Config(
+                "segment_size must be > 0".to_string(),
+            ));
         }
 
-        let partitions: Vec<PartitionInfo> = (0..config.num_partitions)
-            .map(|partition_id| PartitionInfo {
-                id: partition_id,
-                leader: Some(0), // Single broker setup
-                replicas: vec![0],
-                in_sync_replicas: vec![0],
-            })
-            .collect();
+        // Atomic check-and-insert using DashMap entry() API to prevent TOCTOU race
+        use dashmap::mapref::entry::Entry;
+        match self.topics.entry(topic_name.to_string()) {
+            Entry::Occupied(_) => {
+                // Topic already exists, that's fine
+                Ok(())
+            }
+            Entry::Vacant(entry) => {
+                let partitions: Vec<PartitionInfo> = (0..config.num_partitions)
+                    .map(|partition_id| PartitionInfo {
+                        id: partition_id,
+                        leader: Some(0), // Single broker setup
+                        replicas: vec![0],
+                        in_sync_replicas: vec![0],
+                    })
+                    .collect();
 
-        let metadata = TopicMetadata {
-            name: topic_name.to_string(),
-            num_partitions: config.num_partitions,
-            config: config.clone(),
-            partitions,
-        };
+                let metadata = TopicMetadata {
+                    name: topic_name.to_string(),
+                    num_partitions: config.num_partitions,
+                    config: config.clone(),
+                    partitions,
+                };
 
-        self.topics.insert(topic_name.to_string(), metadata);
-        info!(
-            "Created topic '{}' with {} partitions",
-            topic_name, config.num_partitions
-        );
+                entry.insert(metadata);
+                info!(
+                    "Created topic '{}' with {} partitions",
+                    topic_name, config.num_partitions
+                );
 
-        Ok(())
+                Ok(())
+            }
+        }
     }
 
     /// Get topic metadata (lock-free)

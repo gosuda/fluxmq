@@ -1,6 +1,10 @@
 use crate::protocol::{Message, Offset, PartitionId};
 use crate::Result;
 use memmap2::{MmapMut, MmapOptions};
+
+/// Fixed overhead per serialized message (excluding variable-length key/value):
+/// offset(8) + key_len(4) + value_len(4) + timestamp(8) = 24 bytes
+const MESSAGE_FIXED_OVERHEAD: usize = 24;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -13,6 +17,9 @@ use std::sync::Arc;
 ///
 /// Uses memory-mapped files to achieve true zero-copy I/O operations,
 /// eliminating the need for explicit read/write system calls.
+///
+/// Note: This module uses **little-endian** encoding (native for x86/ARM).
+/// This differs from `storage::log` which uses big-endian (Kafka convention).
 #[derive(Debug)]
 pub struct MemoryMappedStorage {
     // Storage configuration
@@ -40,6 +47,10 @@ pub struct MMapStorageConfig {
     pub enable_direct_io: bool,
     pub sync_on_write: bool,
     pub preallocate_segments: bool,
+    /// Verify CRC32 checksum on every read. When false (default), CRC is only
+    /// written but not verified on the hot fetch path — verification should be
+    /// enabled for recovery / integrity-audit scenarios.
+    pub verify_crc_on_read: bool,
 }
 
 impl Default for MMapStorageConfig {
@@ -51,6 +62,7 @@ impl Default for MMapStorageConfig {
             enable_direct_io: true,
             sync_on_write: false, // Async for performance
             preallocate_segments: true,
+            verify_crc_on_read: false, // Skip CRC on hot path; enable for recovery
         }
     }
 }
@@ -130,25 +142,42 @@ impl MemoryMappedStorage {
         let key = (topic.to_string(), partition);
         let message_count = messages.len() as u64;
 
-        // Get or create partition segment
+        // Get or create partition segment — read lock first, upgrade only on miss
         let partition_segment = {
-            let mut segments = self.segments.write();
-            if !segments.contains_key(&key) {
-                let segment = self.create_partition_segment(&key)?;
-                segments.insert(key.clone(), segment.clone());
-                segment
-            } else {
-                segments.get(&key).unwrap().clone()
+            let cached = self.segments.read().get(&key).cloned();
+            match cached {
+                Some(seg) => seg,
+                None => {
+                    let mut segments = self.segments.write();
+                    // Double-check after upgrade
+                    if let Some(seg) = segments.get(&key) {
+                        seg.clone()
+                    } else {
+                        let segment = self.create_partition_segment(&key)?;
+                        segments.insert(key.clone(), segment.clone());
+                        segment
+                    }
+                }
             }
         };
 
-        // Get base offset
+        // Get base offset — read lock first, upgrade only on miss
         let base_offset = {
-            let mut offsets = self.next_offsets.write();
-            let offset_counter = offsets
-                .entry(key.clone())
-                .or_insert_with(|| AtomicU64::new(0));
-            offset_counter.fetch_add(message_count, Ordering::SeqCst)
+            let existing = self
+                .next_offsets
+                .read()
+                .get(&key)
+                .map(|c| c.fetch_add(message_count, Ordering::Relaxed));
+            match existing {
+                Some(offset) => offset,
+                None => {
+                    let mut offsets = self.next_offsets.write();
+                    let counter = offsets
+                        .entry(key.clone())
+                        .or_insert_with(|| AtomicU64::new(0));
+                    counter.fetch_add(message_count, Ordering::Relaxed)
+                }
+            }
         };
 
         // Serialize messages to binary format
@@ -210,25 +239,41 @@ impl MemoryMappedStorage {
         let key = (topic.to_string(), partition);
         let message_count = messages_arc.len() as u64;
 
-        // Get or create partition segment
+        // Get or create partition segment — read lock first, upgrade only on miss
         let partition_segment = {
-            let mut segments = self.segments.write();
-            if !segments.contains_key(&key) {
-                let segment = self.create_partition_segment(&key)?;
-                segments.insert(key.clone(), segment.clone());
-                segment
-            } else {
-                segments.get(&key).unwrap().clone()
+            let cached = self.segments.read().get(&key).cloned();
+            match cached {
+                Some(seg) => seg,
+                None => {
+                    let mut segments = self.segments.write();
+                    if let Some(seg) = segments.get(&key) {
+                        seg.clone()
+                    } else {
+                        let segment = self.create_partition_segment(&key)?;
+                        segments.insert(key.clone(), segment.clone());
+                        segment
+                    }
+                }
             }
         };
 
-        // Get base offset
+        // Get base offset — read lock first, upgrade only on miss
         let base_offset = {
-            let mut offsets = self.next_offsets.write();
-            let offset_counter = offsets
-                .entry(key.clone())
-                .or_insert_with(|| AtomicU64::new(0));
-            offset_counter.fetch_add(message_count, Ordering::SeqCst)
+            let existing = self
+                .next_offsets
+                .read()
+                .get(&key)
+                .map(|c| c.fetch_add(message_count, Ordering::Relaxed));
+            match existing {
+                Some(offset) => offset,
+                None => {
+                    let mut offsets = self.next_offsets.write();
+                    let counter = offsets
+                        .entry(key.clone())
+                        .or_insert_with(|| AtomicU64::new(0));
+                    counter.fetch_add(message_count, Ordering::Relaxed)
+                }
+            }
         };
 
         // Serialize messages directly from Arc reference (no cloning!)
@@ -290,6 +335,19 @@ impl MemoryMappedStorage {
         // On macOS/BSD, accessing memory beyond file size causes SIGBUS
         file.set_len(size as u64)?;
 
+        // Verify file was actually extended (defensive check against FS errors)
+        let actual_size = file.metadata()?.len();
+        if (actual_size as usize) < size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "Mmap file size mismatch after set_len: expected {} bytes, got {} bytes",
+                    size, actual_size
+                ),
+            )
+            .into());
+        }
+
         // Pre-allocate file space for performance (optional)
         if self.config.preallocate_segments {
             // On macOS, we need to actually write zeros to allocate disk space
@@ -345,7 +403,8 @@ impl MemoryMappedStorage {
         messages: &[Message],
         base_offset: Offset,
     ) -> Result<Vec<u8>> {
-        let mut buffer = Vec::new();
+        // Pre-allocate: fixed overhead (24+4 CRC) per message + estimated 128 bytes payload
+        let mut buffer = Vec::with_capacity(messages.len() * (MESSAGE_FIXED_OVERHEAD + 4 + 128));
 
         for (i, message) in messages.iter().enumerate() {
             let offset = base_offset + i as u64;
@@ -366,9 +425,11 @@ impl MemoryMappedStorage {
             // Timestamp
             buffer.extend_from_slice(&message.timestamp.to_le_bytes());
 
-            // CRC32 checksum for integrity
-            let crc =
-                crc32fast::hash(&buffer[buffer.len() - key_bytes.len() - value_bytes.len() - 20..]);
+            // CRC32 checksum for integrity (covers entire message: offset through timestamp)
+            let crc = crc32fast::hash(
+                &buffer
+                    [buffer.len() - key_bytes.len() - value_bytes.len() - MESSAGE_FIXED_OVERHEAD..],
+            );
             buffer.extend_from_slice(&crc.to_le_bytes());
         }
 
@@ -381,7 +442,8 @@ impl MemoryMappedStorage {
         messages_arc: &Arc<Vec<Message>>,
         base_offset: Offset,
     ) -> Result<Vec<u8>> {
-        let mut buffer = Vec::new();
+        let mut buffer =
+            Vec::with_capacity(messages_arc.len() * (MESSAGE_FIXED_OVERHEAD + 4 + 128));
 
         for (i, message) in messages_arc.iter().enumerate() {
             let offset = base_offset + i as u64;
@@ -402,9 +464,11 @@ impl MemoryMappedStorage {
             // Timestamp
             buffer.extend_from_slice(&message.timestamp.to_le_bytes());
 
-            // CRC32 checksum for integrity
-            let crc =
-                crc32fast::hash(&buffer[buffer.len() - key_bytes.len() - value_bytes.len() - 20..]);
+            // CRC32 checksum for integrity (covers entire message: offset through timestamp)
+            let crc = crc32fast::hash(
+                &buffer
+                    [buffer.len() - key_bytes.len() - value_bytes.len() - MESSAGE_FIXED_OVERHEAD..],
+            );
             buffer.extend_from_slice(&crc.to_le_bytes());
         }
 
@@ -530,9 +594,11 @@ impl MemoryMappedStorage {
 
         // Scan memory-mapped region for messages
         while read_offset < segment.write_offset && bytes_read < max_bytes as usize {
-            if let Some((msg_offset, message, msg_size)) =
-                self.deserialize_message_at(&segment.mmap, read_offset)?
-            {
+            if let Some((msg_offset, message, msg_size)) = self.deserialize_message_at(
+                &segment.mmap,
+                read_offset,
+                self.config.verify_crc_on_read,
+            )? {
                 if msg_offset >= offset {
                     messages.push((msg_offset, message));
                     bytes_read += msg_size;
@@ -552,11 +618,14 @@ impl MemoryMappedStorage {
         Ok(messages)
     }
 
-    /// Deserialize message from memory-mapped data
+    /// Deserialize message from memory-mapped data.
+    /// When `verify_crc` is false, the CRC field is still read (to advance pos)
+    /// but the hash is not recomputed — eliminating per-message CPU overhead.
     fn deserialize_message_at(
         &self,
         mmap: &[u8],
         offset: usize,
+        verify_crc: bool,
     ) -> Result<Option<(Offset, Message, usize)>> {
         if offset + 8 > mmap.len() {
             return Ok(None);
@@ -624,13 +693,32 @@ impl MemoryMappedStorage {
         ]);
         pos += 8;
 
-        // Read and verify CRC
+        // Read CRC field (always advance pos to maintain correct message size)
         if pos + 4 > mmap.len() {
             return Ok(None);
         }
-        let _stored_crc =
+        let stored_crc =
             u32::from_le_bytes([mmap[pos], mmap[pos + 1], mmap[pos + 2], mmap[pos + 3]]);
         pos += 4;
+
+        // Only recompute and verify CRC when requested (recovery / integrity audit).
+        // On the hot fetch path this is skipped to avoid per-message hash overhead.
+        if verify_crc {
+            let crc_data_end = pos - 4; // everything before the CRC field
+            let computed_crc = crc32fast::hash(&mmap[offset..crc_data_end]);
+            if stored_crc != computed_crc {
+                tracing::warn!(
+                    "CRC mismatch at offset {}: stored={:#x}, computed={:#x}",
+                    msg_offset,
+                    stored_crc,
+                    computed_crc
+                );
+                return Err(crate::FluxmqError::Storage(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("CRC mismatch in mmap message at offset {}", msg_offset),
+                )));
+            }
+        }
 
         let message = Message {
             key,
@@ -838,6 +926,7 @@ impl MMapPerformanceStats {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use proptest::prelude::*;
     use tempfile::tempdir;
 
     #[test]
@@ -884,6 +973,7 @@ mod tests {
             enable_direct_io: false,
             sync_on_write: false,
             preallocate_segments: false,
+            verify_crc_on_read: true, // verify in tests
         };
 
         let storage = MemoryMappedStorage::with_config(config).unwrap();
@@ -975,5 +1065,127 @@ mod tests {
         assert_eq!(segment_stats.current_segment_id, 0);
         assert!(segment_stats.current_utilization_percent > 0.0);
         assert_eq!(segment_stats.total_messages, 10);
+    }
+
+    // =========================================================================
+    // Property-based tests for serialization round-trip integrity
+    // =========================================================================
+
+    proptest! {
+        #[test]
+        fn prop_mmap_roundtrip_single_message(
+            key in proptest::option::of(proptest::collection::vec(any::<u8>(), 0..512)),
+            value in proptest::collection::vec(any::<u8>(), 1..2048),
+            timestamp in any::<u64>(),
+        ) {
+            let temp_dir = tempdir().unwrap();
+            let config = MMapStorageConfig {
+                data_directory: temp_dir.path().to_path_buf(),
+                ..Default::default()
+            };
+            let storage = MemoryMappedStorage::with_config(config).unwrap();
+
+            let msg = Message {
+                key: key.map(Bytes::from),
+                value: Bytes::from(value.clone()),
+                timestamp,
+                headers: HashMap::new(),
+            };
+
+            storage
+                .append_messages_zero_copy("prop_topic", 0, vec![msg])
+                .unwrap();
+
+            let fetched = storage
+                .fetch_messages_zero_copy("prop_topic", 0, 0, u32::MAX)
+                .unwrap();
+
+            prop_assert_eq!(fetched.len(), 1);
+            prop_assert_eq!(&fetched[0].1.value[..], &value[..]);
+            prop_assert_eq!(fetched[0].1.timestamp, timestamp);
+            prop_assert_eq!(fetched[0].0, 0u64); // first offset
+        }
+
+        #[test]
+        fn prop_mmap_roundtrip_batch(
+            batch_size in 1usize..20,
+            value_len in 1usize..512,
+            timestamp in any::<u64>(),
+        ) {
+            let temp_dir = tempdir().unwrap();
+            let config = MMapStorageConfig {
+                data_directory: temp_dir.path().to_path_buf(),
+                ..Default::default()
+            };
+            let storage = MemoryMappedStorage::with_config(config).unwrap();
+
+            let value = vec![0xABu8; value_len];
+            let messages: Vec<Message> = (0..batch_size)
+                .map(|i| Message {
+                    key: Some(Bytes::from(format!("key_{}", i))),
+                    value: Bytes::from(value.clone()),
+                    timestamp: timestamp.wrapping_add(i as u64),
+                    headers: HashMap::new(),
+                })
+                .collect();
+
+            storage
+                .append_messages_zero_copy("prop_batch", 0, messages.clone())
+                .unwrap();
+
+            let fetched = storage
+                .fetch_messages_zero_copy("prop_batch", 0, 0, u32::MAX)
+                .unwrap();
+
+            prop_assert_eq!(fetched.len(), batch_size);
+            for (i, (offset, msg)) in fetched.iter().enumerate() {
+                prop_assert_eq!(*offset, i as u64);
+                prop_assert_eq!(&msg.value[..], &value[..]);
+                prop_assert_eq!(msg.timestamp, timestamp.wrapping_add(i as u64));
+            }
+        }
+
+        #[test]
+        fn prop_mmap_crc_detects_corruption(
+            value in proptest::collection::vec(any::<u8>(), 8..256),
+        ) {
+            let temp_dir = tempdir().unwrap();
+            let config = MMapStorageConfig {
+                data_directory: temp_dir.path().to_path_buf(),
+                preallocate_segments: true,
+                verify_crc_on_read: true, // must enable to detect corruption
+                ..Default::default()
+            };
+            let storage = MemoryMappedStorage::with_config(config).unwrap();
+
+            let msg = Message {
+                key: Some(Bytes::from("test_key")),
+                value: Bytes::from(value),
+                timestamp: 1234567890,
+                headers: HashMap::new(),
+            };
+
+            storage
+                .append_messages_zero_copy("corrupt_topic", 0, vec![msg])
+                .unwrap();
+
+            // Corrupt data in the mmap by flipping a byte in the value region
+            {
+                let segments = storage.segments.read();
+                let key = ("corrupt_topic".to_string(), 0u32);
+                if let Some(partition_segment) = segments.get(&key) {
+                    let mut segment = partition_segment.current_segment.lock();
+                    if segment.write_offset > 20 {
+                        // Flip a byte in the middle of the written data
+                        let corrupt_pos = 16; // inside the key/value area
+                        segment.mmap[corrupt_pos] ^= 0xFF;
+                    }
+                }
+            }
+
+            // Read should detect CRC mismatch
+            let result = storage.fetch_messages_zero_copy("corrupt_topic", 0, 0, u32::MAX);
+            prop_assert!(result.is_err(), "Expected CRC mismatch error after corruption");
+        }
     }
 }

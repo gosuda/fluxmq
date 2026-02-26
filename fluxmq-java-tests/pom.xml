@@ -64,6 +64,60 @@
         </dependency>
     </dependencies>
 
+    <!-- Maven Profiles for different test configurations -->
+    <profiles>
+        <!-- Default profile: MultiThreadBenchmark -->
+        <profile>
+            <id>multithread</id>
+            <activation>
+                <activeByDefault>true</activeByDefault>
+            </activation>
+            <properties>
+                <exec.mainClass>com.fluxmq.tests.MultiThreadBenchmark</exec.mainClass>
+            </properties>
+        </profile>
+
+        <!-- Consumer Group Test -->
+        <profile>
+            <id>consumer-group</id>
+            <properties>
+                <exec.mainClass>com.fluxmq.tests.ConsumerGroupTest</exec.mainClass>
+            </properties>
+        </profile>
+
+        <!-- CDC Performance Test -->
+        <profile>
+            <id>cdc</id>
+            <properties>
+                <exec.mainClass>com.fluxmq.tests.CdcPerformanceTest</exec.mainClass>
+            </properties>
+        </profile>
+
+        <!-- FluxMQ Benchmark -->
+        <profile>
+            <id>benchmark</id>
+            <properties>
+                <exec.mainClass>com.fluxmq.tests.FluxMQBenchmark</exec.mainClass>
+            </properties>
+        </profile>
+
+        <!-- Minimal Producer Test -->
+        <profile>
+            <id>minimal</id>
+            <properties>
+                <exec.mainClass>com.fluxmq.tests.MinimalProducerTest</exec.mainClass>
+            </properties>
+        </profile>
+
+        <!-- Admin API Test -->
+        <profile>
+            <id>admin</id>
+            <properties>
+                <exec.mainClass>com.fluxmq.tests.AdminApiTest</exec.mainClass>
+            </properties>
+        </profile>
+    </profiles>
+
     <build>
         <plugins>
             <!-- Maven Compiler Plugin -->
@@ -87,7 +141,7 @@
                 <artifactId>exec-maven-plugin</artifactId>
                 <version>3.1.1</version>
                 <configuration>
-                    <mainClass>com.fluxmq.tests.MultiThreadBenchmark</mainClass>
+                    <mainClass>${exec.mainClass}</mainClass>
                     <options>
                         <option>-server</option>
                         <option>-Xmx2g</option>

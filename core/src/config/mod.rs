@@ -105,4 +105,18 @@ impl BrokerConfig {
         self.allow_everyone = false;
         self
     }
+
+    /// Validate configuration bounds to prevent division-by-zero and resource exhaustion
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.max_connections == 0 {
+            return Err("max_connections must be > 0".to_string());
+        }
+        if self.buffer_size == 0 {
+            return Err("buffer_size must be > 0".to_string());
+        }
+        if self.segment_size == 0 {
+            return Err("segment_size must be > 0".to_string());
+        }
+        Ok(())
+    }
 }

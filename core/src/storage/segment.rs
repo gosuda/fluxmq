@@ -3,6 +3,7 @@ use crate::storage::log::{Log, LogEntry};
 use crate::{FluxmqError, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use tracing::warn;
 
 /// Configuration for segment management
 #[derive(Debug, Clone)]
@@ -176,11 +177,21 @@ impl SegmentManager {
             .collect();
 
         for offset in offsets_to_remove {
-            if let Some(segment) = self.segments.remove(&offset) {
-                // Remove the file
-                std::fs::remove_file(&segment.path)?;
-                removed_offsets.push(offset);
+            // Get path before removing from map — if file deletion fails,
+            // the map entry remains so cleanup can be retried next cycle.
+            let path = match self.segments.get(&offset) {
+                Some(segment) => segment.path.clone(),
+                None => continue,
+            };
+            if let Err(e) = std::fs::remove_file(&path) {
+                warn!(
+                    "Failed to remove segment file {:?}: {}, will retry on next cleanup",
+                    path, e
+                );
+                continue;
             }
+            self.segments.remove(&offset);
+            removed_offsets.push(offset);
         }
 
         Ok(removed_offsets)
