@@ -46,7 +46,6 @@ use crate::{FluxmqError, Result};
 use crossbeam::channel;
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -120,43 +119,24 @@ pub struct InMemoryStorage {
     topic_partitions: Arc<DashMap<TopicName, Vec<PartitionId>>>,
 }
 
-/// Partition data with atomic offset counter for lock-free updates
+/// Partition data with RwLock for concurrent read/write access
 ///
-/// High-performance partition data with lock-free append optimization
-///
-/// OPTIMIZATION: Messages stored directly without Arc wrapper to eliminate
-/// per-message Arc allocation overhead. Arc is created on-demand during fetch.
+/// Uses parking_lot::RwLock which provides ~10ns uncontended reads.
+/// Writers hold the lock briefly for O(1) amortized push.
+/// Readers hold a read lock during fetch — multiple concurrent readers allowed.
 #[derive(Debug)]
 pub struct PartitionData {
-    /// Messages stored directly for fast append (no Arc allocation per message)
-    messages: parking_lot::RwLock<Vec<(Offset, Message)>>,
+    messages: RwLock<Vec<(Offset, Message)>>,
     next_offset: AtomicU64,
-    /// Pre-allocated capacity hint for batch operations
-    capacity_hint: AtomicU64,
 }
 
 impl PartitionData {
     fn new() -> Self {
         Self {
-            messages: parking_lot::RwLock::new(Vec::with_capacity(10000)),
+            messages: RwLock::new(Vec::with_capacity(10000)),
             next_offset: AtomicU64::new(0),
-            capacity_hint: AtomicU64::new(10000),
         }
     }
-}
-
-// Legacy types for backward compatibility (used by HybridStorage internals)
-#[allow(dead_code)]
-#[derive(Debug)]
-pub struct Topic {
-    partitions: HashMap<PartitionId, Partition>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug)]
-pub struct Partition {
-    messages: Vec<(Offset, Message)>,
-    next_offset: Offset,
 }
 
 impl InMemoryStorage {
@@ -207,7 +187,7 @@ impl InMemoryStorage {
             .next_offset
             .fetch_add(message_count as u64, Ordering::Relaxed);
 
-        // Direct extend with pre-reserved capacity, no intermediate collect
+        // Direct push: O(1) amortized, minimal lock hold time
         {
             let mut msgs = partition_data.messages.write();
             msgs.reserve(message_count);
@@ -219,10 +199,10 @@ impl InMemoryStorage {
         Ok(base_offset)
     }
 
-    /// Fetch messages with Arc wrapping for consumer sharing
+    /// Fetch messages wrapped in Arc for consumer sharing
     ///
-    /// Note: Arc is created on-demand during fetch. This trades slightly
-    /// slower fetch for much faster append (no Arc allocation per message).
+    /// Arc is created on-demand during fetch. This trades slightly slower
+    /// fetch for much faster append (no Arc allocation per message).
     pub fn fetch_messages_arc(
         &self,
         topic: &str,
@@ -254,7 +234,6 @@ impl InMemoryStorage {
         let mut total_bytes = 0usize;
         let max_bytes = max_bytes as usize;
 
-        // Wrap in Arc on fetch (trade-off: slower fetch, much faster append)
         for (msg_offset, message) in &msgs[start_idx..] {
             let message_size =
                 message.value.len() + message.key.as_ref().map(|k| k.len()).unwrap_or(0);
@@ -274,10 +253,7 @@ impl InMemoryStorage {
         Ok(result)
     }
 
-    /// Legacy fetch_messages for backward compatibility
-    ///
-    /// Note: For better performance, prefer fetch_messages_arc() which
-    /// avoids cloning message data.
+    /// Fetch messages as owned copies
     pub fn fetch_messages(
         &self,
         topic: &str,
@@ -285,16 +261,46 @@ impl InMemoryStorage {
         offset: Offset,
         max_bytes: u32,
     ) -> Result<Vec<(Offset, Message)>> {
-        // Use the Arc version and unwrap for backward compatibility
-        let arc_results = self.fetch_messages_arc(topic, partition, offset, max_bytes)?;
+        let key = (topic.to_string(), partition);
 
-        // Convert Arc<Message> to Message
-        // Optimization: Skip try_unwrap overhead since Arc is typically shared
-        // Direct clone is more predictable and branch-predictor friendly
-        Ok(arc_results
-            .into_iter()
-            .map(|(offset, arc_msg)| (offset, (*arc_msg).clone()))
-            .collect())
+        let partition_data = match self.partitions.get(&key) {
+            Some(p) => p,
+            None => {
+                return Ok(vec![]);
+            }
+        };
+
+        let msgs = partition_data.messages.read();
+
+        let start_idx = msgs
+            .binary_search_by_key(&offset, |(msg_offset, _)| *msg_offset)
+            .unwrap_or_else(|idx| idx);
+
+        if start_idx >= msgs.len() {
+            return Ok(vec![]);
+        }
+
+        let mut result = Vec::with_capacity(std::cmp::min(1024, msgs.len() - start_idx));
+        let mut total_bytes = 0usize;
+        let max_bytes = max_bytes as usize;
+
+        for (msg_offset, message) in &msgs[start_idx..] {
+            let message_size =
+                message.value.len() + message.key.as_ref().map(|k| k.len()).unwrap_or(0);
+
+            if total_bytes + message_size > max_bytes && !result.is_empty() {
+                break;
+            }
+
+            result.push((*msg_offset, message.clone()));
+            total_bytes += message_size;
+
+            if result.len() >= 10000 {
+                break;
+            }
+        }
+
+        Ok(result)
     }
 
     pub fn get_topics(&self) -> Vec<TopicName> {
@@ -338,7 +344,6 @@ impl InMemoryStorage {
         }
 
         // If no message found with timestamp >= target, return latest offset
-        // Relaxed is sufficient for reading monotonically increasing counter
         Some(partition_data.next_offset.load(Ordering::Relaxed))
     }
 
@@ -350,25 +355,6 @@ impl InMemoryStorage {
 
         // Return the offset of the first message, or 0 if no messages
         msgs.first().map(|(offset, _)| *offset).or(Some(0))
-    }
-}
-
-#[allow(dead_code)]
-impl Topic {
-    fn new() -> Self {
-        Self {
-            partitions: HashMap::new(),
-        }
-    }
-}
-
-#[allow(dead_code)]
-impl Partition {
-    fn new() -> Self {
-        Self {
-            messages: Vec::new(),
-            next_offset: 0,
-        }
     }
 }
 

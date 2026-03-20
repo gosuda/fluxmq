@@ -18,8 +18,8 @@ use std::sync::Arc;
 /// Uses memory-mapped files to achieve true zero-copy I/O operations,
 /// eliminating the need for explicit read/write system calls.
 ///
-/// Note: This module uses **little-endian** encoding (native for x86/ARM).
-/// This differs from `storage::log` which uses big-endian (Kafka convention).
+/// Note: This module uses **big-endian** encoding (Kafka convention / network byte order),
+/// consistent with `storage::log` for cross-tier data compatibility.
 #[derive(Debug)]
 pub struct MemoryMappedStorage {
     // Storage configuration
@@ -410,27 +410,27 @@ impl MemoryMappedStorage {
             let offset = base_offset + i as u64;
 
             // Message format: [offset:8][key_len:4][key][value_len:4][value][timestamp:8][crc:4]
-            buffer.extend_from_slice(&offset.to_le_bytes());
+            buffer.extend_from_slice(&offset.to_be_bytes());
 
             // Key
             let key_bytes = message.key.as_ref().map(|k| k.as_ref()).unwrap_or(&[]);
-            buffer.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
+            buffer.extend_from_slice(&(key_bytes.len() as u32).to_be_bytes());
             buffer.extend_from_slice(key_bytes);
 
             // Value
             let value_bytes = message.value.as_ref();
-            buffer.extend_from_slice(&(value_bytes.len() as u32).to_le_bytes());
+            buffer.extend_from_slice(&(value_bytes.len() as u32).to_be_bytes());
             buffer.extend_from_slice(value_bytes);
 
             // Timestamp
-            buffer.extend_from_slice(&message.timestamp.to_le_bytes());
+            buffer.extend_from_slice(&message.timestamp.to_be_bytes());
 
             // CRC32 checksum for integrity (covers entire message: offset through timestamp)
             let crc = crc32fast::hash(
                 &buffer
                     [buffer.len() - key_bytes.len() - value_bytes.len() - MESSAGE_FIXED_OVERHEAD..],
             );
-            buffer.extend_from_slice(&crc.to_le_bytes());
+            buffer.extend_from_slice(&crc.to_be_bytes());
         }
 
         Ok(buffer)
@@ -449,27 +449,27 @@ impl MemoryMappedStorage {
             let offset = base_offset + i as u64;
 
             // Message format: [offset:8][key_len:4][key][value_len:4][value][timestamp:8][crc:4]
-            buffer.extend_from_slice(&offset.to_le_bytes());
+            buffer.extend_from_slice(&offset.to_be_bytes());
 
             // Key
             let key_bytes = message.key.as_ref().map(|k| k.as_ref()).unwrap_or(&[]);
-            buffer.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
+            buffer.extend_from_slice(&(key_bytes.len() as u32).to_be_bytes());
             buffer.extend_from_slice(key_bytes);
 
             // Value
             let value_bytes = message.value.as_ref();
-            buffer.extend_from_slice(&(value_bytes.len() as u32).to_le_bytes());
+            buffer.extend_from_slice(&(value_bytes.len() as u32).to_be_bytes());
             buffer.extend_from_slice(value_bytes);
 
             // Timestamp
-            buffer.extend_from_slice(&message.timestamp.to_le_bytes());
+            buffer.extend_from_slice(&message.timestamp.to_be_bytes());
 
             // CRC32 checksum for integrity (covers entire message: offset through timestamp)
             let crc = crc32fast::hash(
                 &buffer
                     [buffer.len() - key_bytes.len() - value_bytes.len() - MESSAGE_FIXED_OVERHEAD..],
             );
-            buffer.extend_from_slice(&crc.to_le_bytes());
+            buffer.extend_from_slice(&crc.to_be_bytes());
         }
 
         Ok(buffer)
@@ -632,7 +632,7 @@ impl MemoryMappedStorage {
         }
 
         // Read offset
-        let msg_offset = u64::from_le_bytes([
+        let msg_offset = u64::from_be_bytes([
             mmap[offset],
             mmap[offset + 1],
             mmap[offset + 2],
@@ -650,7 +650,7 @@ impl MemoryMappedStorage {
             return Ok(None);
         }
         let key_len =
-            u32::from_le_bytes([mmap[pos], mmap[pos + 1], mmap[pos + 2], mmap[pos + 3]]) as usize;
+            u32::from_be_bytes([mmap[pos], mmap[pos + 1], mmap[pos + 2], mmap[pos + 3]]) as usize;
         pos += 4;
 
         if pos + key_len > mmap.len() {
@@ -668,7 +668,7 @@ impl MemoryMappedStorage {
             return Ok(None);
         }
         let value_len =
-            u32::from_le_bytes([mmap[pos], mmap[pos + 1], mmap[pos + 2], mmap[pos + 3]]) as usize;
+            u32::from_be_bytes([mmap[pos], mmap[pos + 1], mmap[pos + 2], mmap[pos + 3]]) as usize;
         pos += 4;
 
         if pos + value_len > mmap.len() {
@@ -681,7 +681,7 @@ impl MemoryMappedStorage {
         if pos + 8 > mmap.len() {
             return Ok(None);
         }
-        let timestamp = u64::from_le_bytes([
+        let timestamp = u64::from_be_bytes([
             mmap[pos],
             mmap[pos + 1],
             mmap[pos + 2],
@@ -698,7 +698,7 @@ impl MemoryMappedStorage {
             return Ok(None);
         }
         let stored_crc =
-            u32::from_le_bytes([mmap[pos], mmap[pos + 1], mmap[pos + 2], mmap[pos + 3]]);
+            u32::from_be_bytes([mmap[pos], mmap[pos + 1], mmap[pos + 2], mmap[pos + 3]]);
         pos += 4;
 
         // Only recompute and verify CRC when requested (recovery / integrity audit).

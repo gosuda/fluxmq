@@ -40,14 +40,24 @@ impl CpuTopology {
         let total_cpus = num_cpus::get();
         let physical_cores = num_cpus::get_physical();
         let logical_cores = total_cpus;
-        let numa_nodes = (total_cpus / 4).max(1); // Simplified NUMA detection
+        // Derive NUMA node count from physical core count (most systems: 1 node)
+        let numa_nodes = if physical_cores > 8 { (physical_cores / 8).max(1) } else { 1 };
 
+        let has_hyperthreading = total_cpus > physical_cores;
         let mut cpu_info = Vec::new();
 
         for cpu_id in 0..total_cpus {
-            let numa_node = cpu_id / (total_cpus / numa_nodes);
-            let physical_core = cpu_id / (total_cpus / physical_cores);
-            let is_hyperthread = total_cpus > physical_cores && (cpu_id % 2 == 1);
+            let numa_node = if numa_nodes > 1 {
+                cpu_id * numa_nodes / total_cpus
+            } else {
+                0
+            };
+            let physical_core = if has_hyperthreading {
+                cpu_id % physical_cores
+            } else {
+                cpu_id
+            };
+            let is_hyperthread = has_hyperthreading && cpu_id >= physical_cores;
 
             cpu_info.push(CpuInfo {
                 id: cpu_id,
@@ -72,8 +82,15 @@ impl CpuTopology {
     }
 
     fn get_current_cpu() -> Option<usize> {
-        // Simplified: in real implementation would use OS-specific calls
-        Some(0)
+        #[cfg(target_os = "linux")]
+        {
+            let cpu = unsafe { libc::sched_getcpu() };
+            if cpu >= 0 {
+                return Some(cpu as usize);
+            }
+        }
+        // macOS/Windows: kernel manages scheduling, no direct query available
+        None
     }
 
     pub fn get_numa_cpus(&self, numa_node: usize) -> Vec<usize> {

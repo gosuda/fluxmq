@@ -18,7 +18,7 @@ description = "High-performance message broker and streaming platform inspired b
 # Shared dependencies across workspace members
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.49.0", features = ["full"] }
+tokio = { version = "1.50.0", features = ["full"] }
 tokio-util = { version = "0.7.18", features = ["codec"] }
 tokio-stream = "0.1.18"
 futures = "0.3.32"
@@ -39,6 +39,7 @@ crc32c = "0.6.8"
 # Concurrency
 crossbeam = "0.8.4"
 parking_lot = "0.12.5"
+arc-swap = "1.8.2"
 
 # Low-level networking
 socket2 = "0.6.2"

@@ -30,23 +30,55 @@ pub struct NumaNode {
 
 impl NumaTopology {
     pub fn detect() -> Self {
-        // Simulate NUMA detection (in real implementation would use hwloc or similar)
-        let cpu_count = num_cpus::get();
-        let numa_node_count = (cpu_count / 4).max(1); // Assume 4 CPUs per NUMA node
+        // Try real NUMA detection on Linux via sysfs; fallback for other platforms
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(topology) = Self::detect_linux_sysfs() {
+                return topology;
+            }
+        }
+
+        // Fallback: single NUMA node with all CPUs (correct for macOS, most desktops)
+        Self::detect_fallback()
+    }
+
+    /// Linux: Detect actual NUMA topology from /sys/devices/system/node/
+    #[cfg(target_os = "linux")]
+    fn detect_linux_sysfs() -> Option<Self> {
+        use std::fs;
+        use std::path::Path;
+
+        let node_base = Path::new("/sys/devices/system/node");
+        if !node_base.exists() {
+            return None;
+        }
 
         let mut numa_nodes = Vec::new();
         let mut cpu_to_node = HashMap::new();
+        let mut node_id = 0usize;
 
-        for node_id in 0..numa_node_count {
-            let cpus_per_node = cpu_count / numa_node_count;
-            let start_cpu = node_id * cpus_per_node;
-            let end_cpu = if node_id == numa_node_count - 1 {
-                cpu_count
+        // Iterate node0, node1, ... directories
+        loop {
+            let node_dir = node_base.join(format!("node{}", node_id));
+            if !node_dir.exists() {
+                break;
+            }
+
+            // Parse cpulist from /sys/devices/system/node/nodeN/cpulist
+            let cpulist_path = node_dir.join("cpulist");
+            let cpus = if let Ok(content) = fs::read_to_string(&cpulist_path) {
+                Self::parse_cpulist(content.trim())
             } else {
-                start_cpu + cpus_per_node
+                Vec::new()
             };
 
-            let cpus: Vec<usize> = (start_cpu..end_cpu).collect();
+            // Parse memory info from /sys/devices/system/node/nodeN/meminfo
+            let meminfo_path = node_dir.join("meminfo");
+            let memory_kb = if let Ok(content) = fs::read_to_string(&meminfo_path) {
+                Self::parse_node_memtotal(&content)
+            } else {
+                0
+            };
 
             for &cpu in &cpus {
                 cpu_to_node.insert(cpu, node_id);
@@ -55,23 +87,95 @@ impl NumaTopology {
             numa_nodes.push(NumaNode {
                 id: node_id,
                 cpus,
-                memory_gb: 8,                             // Assume 8GB per node
-                available_memory: 8 * 1024 * 1024 * 1024, // 8GB in bytes
+                memory_gb: (memory_kb / (1024 * 1024)).max(1) as usize,
+                available_memory: memory_kb * 1024,
             });
+
+            node_id += 1;
         }
 
-        // Detect current NUMA node based on thread affinity
-        let current_node = Self::get_current_numa_node(&cpu_to_node);
+        if numa_nodes.is_empty() {
+            return None;
+        }
 
-        Self {
+        let current_node = Self::get_current_numa_node(&cpu_to_node);
+        Some(Self {
             numa_nodes,
             cpu_to_node,
             current_node,
+        })
+    }
+
+    /// Parse a Linux cpulist string like "0-3,8-11" into Vec<usize>
+    #[cfg(target_os = "linux")]
+    fn parse_cpulist(s: &str) -> Vec<usize> {
+        let mut cpus = Vec::new();
+        for part in s.split(',') {
+            let part = part.trim();
+            if let Some((start_s, end_s)) = part.split_once('-') {
+                if let (Ok(start), Ok(end)) = (start_s.parse::<usize>(), end_s.parse::<usize>()) {
+                    cpus.extend(start..=end);
+                }
+            } else if let Ok(cpu) = part.parse::<usize>() {
+                cpus.push(cpu);
+            }
+        }
+        cpus
+    }
+
+    /// Parse MemTotal from a NUMA node meminfo file (value in KB)
+    #[cfg(target_os = "linux")]
+    fn parse_node_memtotal(content: &str) -> usize {
+        for line in content.lines() {
+            if line.contains("MemTotal") {
+                // Format: "Node N MemTotal:    12345678 kB"
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 4 {
+                    if let Ok(kb) = parts[3].parse::<usize>() {
+                        return kb;
+                    }
+                }
+            }
+        }
+        0
+    }
+
+    /// Fallback: Single NUMA node containing all CPUs
+    fn detect_fallback() -> Self {
+        let cpu_count = num_cpus::get();
+        let cpus: Vec<usize> = (0..cpu_count).collect();
+        let mut cpu_to_node = HashMap::new();
+        for &cpu in &cpus {
+            cpu_to_node.insert(cpu, 0);
+        }
+
+        Self {
+            numa_nodes: vec![NumaNode {
+                id: 0,
+                cpus,
+                memory_gb: 0, // Unknown on non-Linux
+                available_memory: 0,
+            }],
+            cpu_to_node,
+            current_node: 0,
         }
     }
 
-    fn get_current_numa_node(_cpu_to_node: &HashMap<usize, usize>) -> usize {
-        // Simplified: assume we're on node 0, real implementation would check thread affinity
+    fn get_current_numa_node(cpu_to_node: &HashMap<usize, usize>) -> usize {
+        // On Linux, try to detect current CPU's NUMA node
+        #[cfg(target_os = "linux")]
+        {
+            // Read /proc/self/status for Cpus_allowed or use getcpu
+            // Simplified: use libc::sched_getcpu if available
+            let cpu = unsafe { libc::sched_getcpu() };
+            if cpu >= 0 {
+                if let Some(&node) = cpu_to_node.get(&(cpu as usize)) {
+                    return node;
+                }
+            }
+        }
+
+        let _ = cpu_to_node; // suppress unused warning on non-Linux
         0
     }
 

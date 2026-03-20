@@ -3,7 +3,7 @@ use crate::storage::HybridStorage;
 use crate::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
@@ -238,6 +238,8 @@ pub struct RaftNode {
     rpc_sender: mpsc::Sender<(BrokerId, RaftMessage)>,
     /// Channel for applying committed entries (bounded to provide backpressure)
     apply_sender: mpsc::Sender<LogEntry>,
+    /// Vote count for current election (only meaningful when state == Candidate)
+    election_votes: AtomicU32,
 }
 
 impl RaftNode {
@@ -261,6 +263,7 @@ impl RaftNode {
             _storage: storage,
             rpc_sender,
             apply_sender,
+            election_votes: AtomicU32::new(0),
         }
     }
 
@@ -295,20 +298,18 @@ impl RaftNode {
     }
 
     /// Main Raft loop
+    ///
+    /// Uses a single timer at heartbeat granularity. Leaders send heartbeats
+    /// on each tick; followers/candidates check election timeout on each tick.
+    /// This gives finer timeout detection than the election timeout minimum.
     async fn main_loop(&self) {
-        let mut election_timer = interval(Duration::from_millis(self.config.election_timeout_ms.0));
-        let mut heartbeat_timer =
-            interval(Duration::from_millis(self.config.heartbeat_interval_ms));
+        let check_interval = Duration::from_millis(self.config.heartbeat_interval_ms);
+        let mut timer = interval(check_interval);
 
         loop {
-            tokio::select! {
-                _ = election_timer.tick() => {
-                    self.handle_election_timeout().await;
-                }
-                _ = heartbeat_timer.tick() => {
-                    self.handle_heartbeat_timer().await;
-                }
-            }
+            timer.tick().await;
+            self.handle_heartbeat_timer().await;
+            self.handle_election_timeout().await;
         }
     }
 
@@ -316,9 +317,9 @@ impl RaftNode {
     async fn handle_election_timeout(&self) {
         let state = *self.state.read().await;
         let last_heartbeat = *self.last_heartbeat.read().await;
-        // Simple random timeout between min and max
+        // Deterministic per-node timeout based on node_id to prevent split votes
         let timeout_range = self.config.election_timeout_ms.1 - self.config.election_timeout_ms.0;
-        let random_offset = (std::ptr::addr_of!(self) as usize % timeout_range as usize) as u64;
+        let random_offset = (self.node_id as u64 * 37) % timeout_range;
         let election_timeout =
             Duration::from_millis(self.config.election_timeout_ms.0 + random_offset);
 
@@ -374,16 +375,17 @@ impl RaftNode {
             *last_heartbeat = Instant::now();
         }
 
+        // Reset vote counter (1 = self-vote)
+        self.election_votes.store(1, Ordering::Release);
+
+        // Special case: single-node cluster
+        if self.peers.is_empty() {
+            info!("Single-node cluster, becoming leader immediately");
+            self.become_leader(current_term).await;
+            return;
+        }
+
         // Send RequestVote RPCs to all peers
-        let mut votes_received = 1; // Vote for self
-        let mut responses_received = 0;
-        let total_nodes = self.peers.len() + 1; // Including self
-        let majority = (total_nodes / 2) + 1;
-
-        // Create a channel to collect vote responses
-        let (_vote_tx, mut vote_rx) = mpsc::unbounded_channel();
-
-        // Send vote requests
         for &peer in &self.peers {
             let request = RaftMessage::RequestVote {
                 term: current_term,
@@ -403,54 +405,9 @@ impl RaftNode {
             }
         }
 
-        // Special case: single-node cluster
-        if self.peers.is_empty() {
-            // Only one node in cluster, automatically become leader
-            info!("Single-node cluster, becoming leader immediately");
-            self.become_leader(current_term).await;
-            return;
-        }
-
-        // Collect responses with timeout
-        let election_timeout = Duration::from_millis(self.config.election_timeout_ms.1);
-        let deadline = tokio::time::Instant::now() + election_timeout;
-
-        while responses_received < self.peers.len() {
-            match timeout(deadline - tokio::time::Instant::now(), vote_rx.recv()).await {
-                Ok(Some(granted)) => {
-                    responses_received += 1;
-                    if granted {
-                        votes_received += 1;
-                    }
-
-                    // Check if we have majority
-                    if votes_received >= majority {
-                        self.become_leader(current_term).await;
-                        return;
-                    }
-
-                    // Check if we can't possibly win
-                    let remaining_votes = self.peers.len() - responses_received;
-                    if votes_received + remaining_votes < majority {
-                        break;
-                    }
-                }
-                Ok(None) => break, // Channel closed
-                Err(_) => break,   // Timeout
-            }
-        }
-
-        // Election failed or timed out
-        info!(
-            "Election failed for node {} in term {}",
-            self.node_id, current_term
-        );
-
-        // Revert to follower
-        {
-            let mut state = self.state.write().await;
-            *state = RaftState::Follower;
-        }
+        // Vote responses are processed asynchronously via handle_vote_response(),
+        // which calls become_leader() when a majority is reached.
+        // If the election times out, handle_election_timeout() starts a new one.
     }
 
     /// Become leader after winning election
@@ -729,24 +686,49 @@ impl RaftNode {
     }
 
     /// Handle vote response
-    async fn handle_vote_response(&self, term: u64, vote_granted: bool, _voter_id: BrokerId) {
+    async fn handle_vote_response(&self, term: u64, vote_granted: bool, voter_id: BrokerId) {
         let current_term = {
             let persistent = self.persistent.read().await;
             persistent.current_term
         };
+
+        // Step down if we see a higher term
+        if term > current_term {
+            let mut persistent = self.persistent.write().await;
+            persistent.current_term = term;
+            persistent.voted_for = None;
+            let mut state = self.state.write().await;
+            *state = RaftState::Follower;
+            return;
+        }
 
         // Ignore stale responses
         if term != current_term {
             return;
         }
 
-        debug!(
-            "Received vote response from {}: granted={}",
-            _voter_id, vote_granted
-        );
+        // Only count votes while we are still a candidate
+        let state = *self.state.read().await;
+        if state != RaftState::Candidate {
+            return;
+        }
 
-        // In a full implementation, this would be coordinated with the election process
-        // For now, we just log it
+        if vote_granted {
+            let votes = self.election_votes.fetch_add(1, Ordering::AcqRel) + 1;
+            let majority = (self.peers.len() + 1) / 2 + 1;
+            debug!(
+                "Node {} received vote from {}: {}/{} votes (need {})",
+                self.node_id,
+                voter_id,
+                votes,
+                self.peers.len() + 1,
+                majority
+            );
+
+            if votes as usize >= majority {
+                self.become_leader(current_term).await;
+            }
+        }
     }
 
     /// Handle append entries response

@@ -391,16 +391,23 @@ impl BrokerServer {
                     let handler = Arc::clone(&self.handler);
                     let connection_pool = Arc::clone(&self.connection_pool);
                     let buffer_manager = Arc::clone(&self.buffer_manager);
+                    let thread_affinity = self.thread_affinity.clone();
 
                     tokio::spawn(async move {
-                        // ✅ OPTION A: Using single-task sequential architecture
-                        // Simple, predictable, no race conditions, guaranteed ordering
+                        // Pin this worker thread to a CPU for cache locality
+                        // (best-effort: no-op on macOS, actual pinning on Linux)
+                        if let Some(ref affinity) = thread_affinity {
+                            let _ = affinity.assign_thread_affinity(
+                                &format!("client-{}", peer_addr),
+                                crate::performance::thread_affinity::ThreadType::NetworkIO,
+                            );
+                        }
+
                         if let Err(e) = Self::handle_client_with_buffer_pool(stream, handler, buffer_manager).await {
                             error!("Error handling client {}: {}", peer_addr, e);
                         } else {
                             info!("Client {} disconnected", peer_addr);
                         }
-                        // 🚀 ULTRA-PERFORMANCE: Track connection closure
                         connection_pool.connection_closed();
                     });
                 }
@@ -588,17 +595,6 @@ impl BrokerServer {
                             correlation_id,
                             message_bytes.len()
                         );
-
-                        // 🚀 BUFFER_POOL: Get pooled buffer for response encoding
-                        // Estimate response size based on request type
-                        let estimated_response_size = match api_key {
-                            18 => 360,  // ApiVersions - fixed size
-                            3 => 1024,  // Metadata - medium
-                            0 => 256,   // Produce - small
-                            1 => 16384, // Fetch - can be large
-                            _ => 1024,  // Default
-                        };
-                        let _pooled_buf = buffer_manager.get_buffer(estimated_response_size);
 
                         match Self::process_kafka_message_pipelined(
                             &handler,

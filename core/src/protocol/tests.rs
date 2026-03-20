@@ -104,3 +104,75 @@ mod tests {
     // the comprehensive Java client compatibility tests in fluxmq-java-tests/
     // These tests validate actual Kafka protocol compliance with real clients.
 }
+
+/// Property-based fuzzing tests for the Kafka protocol codec.
+///
+/// These tests feed arbitrary byte sequences into the decoder to verify it
+/// never panics, and validate round-trip consistency for well-formed requests.
+#[cfg(test)]
+mod fuzz_tests {
+    use crate::protocol::kafka::codec::KafkaCodec;
+    use bytes::Bytes;
+    use proptest::prelude::*;
+
+    // Fuzz: arbitrary bytes should never panic the decoder
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        #[test]
+        fn decode_request_never_panics(data in proptest::collection::vec(any::<u8>(), 0..4096)) {
+            let mut bytes = Bytes::from(data);
+            // Should return Ok or Err, never panic
+            let _ = KafkaCodec::decode_request(&mut bytes);
+        }
+
+        #[test]
+        fn decode_with_valid_header_never_panics(
+            api_key in 0i16..100,
+            api_version in 0i16..20,
+            correlation_id in any::<i32>(),
+            client_id_len in 0u16..256,
+            payload in proptest::collection::vec(any::<u8>(), 0..2048),
+        ) {
+            // Construct a minimal valid Kafka request header + arbitrary payload
+            let mut data = Vec::with_capacity(10 + client_id_len as usize + payload.len());
+            data.extend_from_slice(&api_key.to_be_bytes());
+            data.extend_from_slice(&api_version.to_be_bytes());
+            data.extend_from_slice(&correlation_id.to_be_bytes());
+            // client_id as nullable string (length-prefixed)
+            data.extend_from_slice(&client_id_len.to_be_bytes());
+            data.extend(std::iter::repeat(b'a').take(client_id_len as usize));
+            data.extend_from_slice(&payload);
+
+            let mut bytes = Bytes::from(data);
+            let _ = KafkaCodec::decode_request(&mut bytes);
+        }
+
+        #[test]
+        fn decode_apiversions_request_never_panics(
+            api_version in 0i16..5,
+            correlation_id in any::<i32>(),
+            extra in proptest::collection::vec(any::<u8>(), 0..512),
+        ) {
+            // ApiVersions (key=18) is the first request any client sends
+            let mut data = Vec::with_capacity(20 + extra.len());
+            data.extend_from_slice(&18i16.to_be_bytes());  // api_key = ApiVersions
+            data.extend_from_slice(&api_version.to_be_bytes());
+            data.extend_from_slice(&correlation_id.to_be_bytes());
+            // Empty client_id
+            data.extend_from_slice(&0i16.to_be_bytes());
+            data.extend_from_slice(&extra);
+
+            let mut bytes = Bytes::from(data);
+            let _ = KafkaCodec::decode_request(&mut bytes);
+        }
+
+        #[test]
+        fn decode_truncated_header_is_error(len in 0usize..8) {
+            let data = vec![0u8; len];
+            let mut bytes = Bytes::from(data);
+            let result = KafkaCodec::decode_request(&mut bytes);
+            prop_assert!(result.is_err(), "Truncated data should be an error");
+        }
+    }
+}
