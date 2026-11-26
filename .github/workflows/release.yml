@@ -23,7 +23,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             name: fluxmq-windows-x64.exe
 
-          - os: macos-latest
+          - os: depot-macos-latest
             target: x86_64-apple-darwin
             name: fluxmq-macos-x64
 
