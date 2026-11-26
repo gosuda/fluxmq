@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ${{ matrix.os }}
@@ -15,15 +19,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: depot-ubuntu-24.04
             target: x86_64-unknown-linux-musl
             name: fluxmq-linux-x64
 
-          - os: windows-latest
+          - os: depot-windows-2025-4
             target: x86_64-pc-windows-msvc
             name: fluxmq-windows-x64.exe
 
-          - os: macos-latest
+          - os: depot-macos-latest
             target: x86_64-apple-darwin
             name: fluxmq-macos-x64
 
@@ -41,18 +45,26 @@ jobs:
         with:
           workspaces: core
 
-      - name: 🏗️ Build
-        uses: actions-rs/cargo@v1
-        with:
-          use-cross: true
-          command: build
-          args: --release --target ${{ matrix.target }} --manifest-path core/Cargo.toml
+      - name: Install Linux musl toolchain
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build Linux musl artifact
+        if: runner.os == 'Linux'
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --release --target ${{ matrix.target }} --manifest-path core/Cargo.toml
+
+      - name: Build macOS and Windows artifacts
+        if: runner.os != 'Linux'
+        run: cargo build --release --target ${{ matrix.target }} --manifest-path core/Cargo.toml
 
       - name: 📦 Package
         shell: bash
         run: |
           cd core
-          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+          if [[ "${{ matrix.os }}" == "depot-windows-2025-4" ]]; then
             cp target/${{ matrix.target }}/release/fluxmq.exe ../${{ matrix.name }}
           else
             cp target/${{ matrix.target }}/release/fluxmq ../${{ matrix.name }}
@@ -69,7 +81,7 @@ jobs:
           fi
 
       - name: 🎉 Upload to release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             ${{ matrix.name }}
